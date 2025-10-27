@@ -1,0 +1,16 @@
+# --- Core runtime ---
+fastapi
+uvicorn[standard]>=0.30
+pydantic>=2.7
+
+# --- Embedding & vector search (CPU) ---
+sentence-transformers>=2.2.2
+faiss-cpu #windows+python 3.8 cannot install faiss from pip
+
+# --- For request bodies / uploads (optional, handy for later steps) ---
+python-multipart>=0.0.9
+
+# --- (Optional: install later when扩展到对应阶段) ---
+# rank-bm25>=0.2.2          # Step 3: keyword/BM25 retrieval
+# jinja2>=3.1.4             # Step 8: templated HTML report
+# python-dotenv>=1.0.1      # If you want .env files to load env vars
