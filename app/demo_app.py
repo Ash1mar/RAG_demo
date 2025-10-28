@@ -16,6 +16,9 @@ EMBEDDER = Embedder(model_name=os.getenv("MODEL_NAME", "sentence-transformers/al
                     dim=int(os.getenv("EMB_DIM", "384")))
 VSTORE = FaissVectorStore(dim=EMBEDDER.dim)
 
+# 新增从环境变量读取 DATA_DIR（可选），默认 data/
+VSTORE = FaissVectorStore(dim=EMBEDDER.dim, data_dir=os.getenv("DATA_DIR", "data"))
+
 # ---- Schemas ----
 class IngestReq(BaseModel):
     doc_id: str

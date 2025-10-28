@@ -1,108 +1,120 @@
 # Minimal RAG Demo (FastAPI + FAISS, Mock Embedding)
 
-A minimal retrieval backend — no model required.
- You can ingest text, perform vector-based “semantic” search, and reset memory through FastAPI.
+A minimal Retrieval-Augmented Generation (RAG) demo — using mock embeddings and FAISS vector search.  
+You can ingest text, search similar chunks, and reset memory — all within FastAPI.
 
-------
+---
 
 ## 1) Overview
 
-**What works now**
+**Current stage:** FAISS + Mock Embedding (no real model, in-memory retrieval).  
+Implements ingestion → chunking → mock embedding → FAISS search → reset.
 
-- Ingest → Chunk → Mock-Embed → FAISS Index
-- Search (Top-K similar chunks)
-- Reset index
-- Runs 100 % offline (no model download)
+---
 
-------
-
-## 2) Main Components
-
-| Layer        | File                              | Purpose                                                    |
-| ------------ | --------------------------------- | ---------------------------------------------------------- |
-| API          | `app/demo_app.py`                 | Defines `/health`, `/ingest`, `/search`, `/reset`          |
-| Embedding    | `app/services/embeddings.py`      | `Embedder` class; default uses Mock mode (`use_mock=True`) |
-| Chunking     | `app/services/chunking.py`        | Splits text into paragraph-sized chunks                    |
-| Vector Store | `app/vector_store/faiss_store.py` | In-memory FAISS index (add/search/reset)                   |
-| Interface    | `app/vector_store/base.py`        | Defines `VectorStore` API for future replacements          |
-
-------
-
-## 3) Run the Demo
+## 2) Project Structure
 
 ```
+rag-minimal/
+├─ app/
+│  ├─ __init__.py
+│  ├─ demo_app.py               # FastAPI main entry (MVP)
+│  ├─ services/
+│  │  ├─ embeddings.py          # Embedder class (mock/real switch)
+│  │  └─ chunking.py            # Text chunking logic
+│  └─ vector_store/
+│     ├─ base.py                # VectorStore interface
+│     └─ faiss_store.py         # FAISS implementation (default)
+├─ data/                        # index.faiss, meta.json (if persistence added)
+├─ requirements.txt
+├─ run.sh
+├─ README.md
+└─ .gitignore
+```
+
+---
+
+## 3) Setup & Run
+
+### Environment
+
+- Python >= 3.10
+- FastAPI, FAISS, sentence-transformers (installed via requirements.txt)
+
+### Steps
+
+```bash
+# Create virtual environment
 python -m venv venv
-source venv/bin/activate  # macOS/Linux
-# or .\venv\Scripts\activate # Windows
+source venv/bin/activate      # macOS/Linux
+# or .\venv\Scripts\activate  # Windows
+
+# Install dependencies
 pip install -r requirements.txt
-uvicorn app.demo_app:app --reload
+
+# Run server
+uvicorn app.demo_app:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-Open → http://127.0.0.1:8000/docs
+Visit: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
 
-------
+---
 
-## 4) Endpoints
+## 4) API Endpoints
 
-| Path      | Method | Description                              |
-| --------- | ------ | ---------------------------------------- |
-| `/health` | GET    | Shows status and embedding mode (`mock`) |
-| `/ingest` | POST   | Add text to index                        |
-| `/search` | GET    | Retrieve top-K similar chunks            |
-| `/reset`  | POST   | Clear index                              |
+| Endpoint | Method | Description |
+|-----------|---------|-------------|
+| `/health` | GET | Health check, embedding mode |
+| `/ingest` | POST | Ingest and index text |
+| `/search` | GET | Search similar chunks |
+| `/reset` | POST | Clear in-memory data |
 
-**Example**
+### Example Usage
 
-```
-curl -X POST "http://127.0.0.1:8000/ingest" \
- -H "Content-Type: application/json" \
- -d '{"doc_id":"demo1","text":"RAG 利用外部知识增强生成。\n\n本系统支持中文与英文检索。"}'
+```bash
+# Ingest text
+curl -X POST "http://127.0.0.1:8000/ingest"   -H "Content-Type: application/json"   -d '{"doc_id":"demo1","text":"RAG 利用外部知识增强生成。\n\n本系统支持中文与英文检索。"}'
+
+# Search
 curl "http://127.0.0.1:8000/search?q=外部知识&k=3"
+
+# Reset
+curl -X POST "http://127.0.0.1:8000/reset"
 ```
 
-------
+---
 
-## 5) Testing / Demo Flow
+## 5) How to Test
 
-1. Run server
-2. Visit `/docs` (Swagger UI)
-3. Try `/ingest` → `/search` → `/reset`
-4. Observe scores and texts returned
+1. Start server (`uvicorn ...`)
+2. Open Swagger UI → [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
+3. Try `/ingest`, then `/search`, and finally `/reset`.
+4. Observe Top-K results and scores.
 
-------
+---
 
 ## 6) Current Limitations
 
-| Item                 | Status | Note                             |
-| -------------------- | ------ | -------------------------------- |
-| Real embedding model | 🚫      | Mock hash-based vector only      |
-| Persistence          | 🚫      | FAISS in-memory, lost on restart |
-| Keyword /BM25        | 🔜      | Next step                        |
-| Hybrid search        | 🔜      | Vector + Keyword                 |
-| Answer generation    | 🔜      | Concatenate top chunks           |
-| UI page              | 🔜      | Simple HTML front end            |
+- No real embedding model (mock vectors only)
+- FAISS in-memory index (no persistence yet)
+- No keyword or hybrid retrieval
+- No frontend UI
 
-------
+---
 
-## 7) Next Steps (Roadmap)
+## 7) Next Steps
 
-| Step | Feature          | Goal                               |
-| ---- | ---------------- | ---------------------------------- |
-| 1    | `/ingest_bulk`   | Batch ingest                       |
-| 2    | `/search_kw`     | Keyword retrieval                  |
-| 3    | `/search_hybrid` | Hybrid search                      |
-| 4    | `/answer`        | Minimal QA (no LLM)                |
-| 5    | `/report`        | Render HTML report                 |
-| 6    | `/`              | Static UI                          |
-| 7    | Swap VectorStore | Milvus/Weaviate                    |
-| 8    | Add real model   | Sentence-BERT or OpenAI Embeddings |
+| Step | Feature | Goal |
+|------|----------|------|
+| 1 | Persistence | Save/load FAISS + metadata |
+| 2 | `/ingest_bulk` | Batch ingestion |
+| 3 | `/search_kw` | Keyword retrieval (BM25) |
+| 4 | `/search_hybrid` | Hybrid search |
+| 5 | `/answer` | Minimal QA (concatenate top chunks) |
+| 6 | `/report` | HTML report rendering |
+| 7 | `/` | Static UI |
+| 8 | Vector DB | Milvus/Weaviate adapter |
 
-------
+---
 
-**Why Mock Embedding?**
-
-- Deterministic and offline; proves the retrieval logic without GPU or weights.
-
-**Why FAISS?**
-
-- Zero infra dependency; fast CPU index sufficient for early prototype.
+© 2025 Minimal RAG Demo Template — Mock Embedding Edition
