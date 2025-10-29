@@ -10,6 +10,8 @@ faiss-cpu #windows+python 3.8 cannot install faiss from pip
 # --- For request bodies / uploads (optional, handy for later steps) ---
 python-multipart>=0.0.9
 
+#keyword/BM25
+rank-bm25>=0.2.2
 # --- (Optional: install later when扩展到对应阶段) ---
 # rank-bm25>=0.2.2          # Step 3: keyword/BM25 retrieval
 # jinja2>=3.1.4             # Step 8: templated HTML report

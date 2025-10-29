@@ -1,0 +1,5 @@
+[
+  {"doc_id": "doc1", "text": "RAG（Retrieval-Augmented Generation）是一种结合外部知识库的生成方法。通过检索相关文档，模型可以回答更准确的问题。"},
+  {"doc_id": "doc2", "text": "BM25 是一种传统的基于关键词的检索算法。相比语义搜索，它依赖词频与逆文档频率（TF-IDF）计算相关性。"},
+  {"doc_id": "doc3", "text": "混合检索（Hybrid Retrieval）结合了向量搜索与关键词搜索的优势，可在相关性和召回率之间取得平衡。"}
+]
