@@ -6,6 +6,7 @@ pydantic>=2.7
 # --- Embedding & vector search (CPU) ---
 sentence-transformers>=2.2.2
 faiss-cpu #windows+python 3.8 cannot install faiss from pip
+pymilvus==2.4.3
 
 # --- For request bodies / uploads (optional, handy for later steps) ---
 python-multipart>=0.0.9

@@ -51,7 +51,13 @@ class FaissVectorStore(VectorStore):
     # -------------------------
     # Public API
     # -------------------------
-    def add_texts(self, doc_id: str, chunks: List[str], embeddings: np.ndarray) -> None:
+    def add_texts(
+        self,
+        doc_id: str,
+        chunks: List[str],
+        embeddings: np.ndarray,
+        metadata: Dict[str, Any] | None = None,
+    ) -> None:
         if embeddings.ndim != 2 or embeddings.shape[1] != self.dim:
             raise ValueError(f"embeddings shape {embeddings.shape} != (N, {self.dim})")
 
@@ -67,16 +73,32 @@ class FaissVectorStore(VectorStore):
         self.index.add_with_ids(embs, ids)
 
         # 写入元数据
+        metadata = metadata or {}
+        ts_val = metadata.get("ts")
+        source_val = metadata.get("source")
         for local_i, c in enumerate(chunks):
             mid = int(ids[local_i])
-            rec = {"_id": mid, "doc_id": doc_id, "text": c}
+            rec = {
+                "_id": mid,
+                "doc_id": doc_id,
+                "text": c,
+            }
+            if source_val is not None:
+                rec["source"] = source_val
+            if ts_val is not None:
+                rec["ts"] = ts_val
             self.meta.append(rec)
             self._meta_by_id[mid] = rec
 
         # 每次写入后持久化（小体量 demo 简化做法）
         self._persist()
 
-    def search(self, query_emb: np.ndarray, top_k: int = 5) -> List[Dict[str, Any]]:
+    def search(
+        self,
+        query_emb: np.ndarray,
+        top_k: int = 5,
+        filters: Dict[str, Any] | None = None,
+    ) -> List[Dict[str, Any]]:
         if self.index.ntotal == 0:
             return []
 
@@ -84,19 +106,49 @@ class FaissVectorStore(VectorStore):
         faiss.normalize_L2(q)
 
         k = max(1, min(top_k, self.index.ntotal))
-        D, I = self.index.search(q, k)  # I 是返回的向量 ID（非行号）
+        # 为了在存在过滤时获取更多候选，这里适度放大搜索规模
+        search_k = min(self.index.ntotal, max(k * 5, k))
+        D, I = self.index.search(q, search_k)  # I 是返回的向量 ID（非行号）
         scores = D[0]
         ids = I[0]
 
         results: List[Dict[str, Any]] = []
+        filters = filters or {}
         for s, mid in zip(scores, ids):
             meta = self._meta_by_id.get(int(mid))
             if meta is None:
                 # 理论上不应发生；为兼容性做兜底
                 # 可选策略：跳过或返回最小信息
                 continue
+            if not self._match_filters(meta, filters):
+                continue
             results.append({"score": float(s), **meta})
+            if len(results) >= k:
+                break
         return results
+
+    @staticmethod
+    def _match_filters(meta: Dict[str, Any], filters: Dict[str, Any]) -> bool:
+        doc_id = filters.get("doc_id")
+        if doc_id and meta.get("doc_id") != doc_id:
+            return False
+        source = filters.get("source")
+        if source and meta.get("source") != source:
+            return False
+
+        date_from = filters.get("date_from")
+        date_to = filters.get("date_to")
+        if date_from is None and date_to is None:
+            return True
+
+        ts_val = meta.get("ts")
+        if ts_val is None:
+            return False
+        if date_from is not None and ts_val < date_from:
+            return False
+        if date_to is not None and ts_val > date_to:
+            return False
+        return True
 
     def reset(self) -> None:
         self.index.reset()
