@@ -31,11 +31,17 @@ class KeywordIndex:
         self._docs_meta: List[Dict[str, Any]] = []
         self._bm25: BM25Okapi | None = None
 
-    def add(self, doc_id: str, chunks: List[str]) -> None:
+    def add(self, doc_id: str, chunks: List[str], metadata: Dict[str, Any] | None = None) -> None:
+        metadata = metadata or {}
         for c in chunks:
             toks = tokenize(c)
             self._docs_tokens.append(toks)
-            self._docs_meta.append({"doc_id": doc_id, "text": c})
+            meta = {"doc_id": doc_id, "text": c}
+            if metadata.get("source") is not None:
+                meta["source"] = metadata.get("source")
+            if metadata.get("ts") is not None:
+                meta["ts"] = metadata.get("ts")
+            self._docs_meta.append(meta)
 
         if BM25Okapi is None:
             # 没装 rank-bm25 时，仅保留语料，检索返回空
