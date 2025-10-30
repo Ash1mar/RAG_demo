@@ -2,6 +2,8 @@
 
 This project started as a mock-embedding demo with a local FAISS index. It now ships with a **pluggable vector store interface** so you can stay on FAISS or switch to a managed Milvus backend for metadata filtering, shared access, and higher concurrency.
 
+For a full start-and-test walkthrough (Windows PowerShell + Bash), see docs/START_AND_TEST.md.
+
 ---
 
 ## 1. Project Structure
