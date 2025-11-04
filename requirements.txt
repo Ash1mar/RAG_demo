@@ -14,6 +14,8 @@ python-multipart>=0.0.9
 
 #keyword/BM25
 rank-bm25>=0.2.2
+# --- Local tasks store (SQLite) ---
+# Uses Python stdlib `sqlite3`; no extra package required
 # --- (Optional: install later when扩展到对应阶段) ---
 # rank-bm25>=0.2.2          # Step 3: keyword/BM25 retrieval
 # jinja2>=3.1.4             # Step 8: templated HTML report

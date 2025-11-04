@@ -13,6 +13,9 @@ from app.services.embeddings import Embedder
 from app.services.hybrid import merge_scores
 from app.services.keyword import KeywordIndex
 from app.vector_store.faiss_store import FaissVectorStore
+from app.services.task_query import TaskQueryEngine
+from app.tasks_store.base import TasksStore
+from app.tasks_store.sqlite_store import SQLiteTasksStore, SQLiteTasksConfig
 
 
 app = FastAPI(title="Minimal RAG Demo", version="0.1.0")
@@ -44,6 +47,18 @@ else:
 
 KW_INDEX = KeywordIndex()
 
+# ---- Tasks store (read-only) ----
+tasks_backend = getenv("TASKS_BACKEND", "sqlite").lower()
+TASKS: TasksStore
+if tasks_backend == "sqlite":
+    TASKS = SQLiteTasksStore(SQLiteTasksConfig(db_path=getenv("TASKS_DB", "data/tasks.db")))
+else:
+    # Placeholder for future backends (e.g., KG). Keep API stable.
+    TASKS = SQLiteTasksStore(SQLiteTasksConfig(db_path=getenv("TASKS_DB", "data/tasks.db")))
+
+# Non-LLM task status query engine
+TQ_ENGINE = TaskQueryEngine(tasks_store=TASKS, embedder=EMBEDDER)
+
 
 # ---- Schemas ----
 class IngestReq(BaseModel):
@@ -68,6 +83,8 @@ def health() -> Dict[str, Any]:
         "embedder": "mock" if EMBEDDER.use_mock else "sbert",
         "dim": EMBEDDER.dim,
         "vector_store": store_type,
+        "tasks_store": tasks_backend,
+        "tasks_ready": TASKS.ready(),
     }
 
 
@@ -108,6 +125,51 @@ def reset() -> Dict[str, str]:
     VSTORE.reset()
     KW_INDEX.reset()
     return {"status": "reset"}
+
+
+# ---- Minimal API for tasks status (connectivity test) ----
+@app.get("/tasks/status")
+def task_status(person: str, task: str) -> Dict[str, Any]:
+    """Return latest status for a given person+task.
+
+    Example queries (for local sample DB):
+    - 张三, 提交9月周报  -> DONE
+    - 张三, E3D接口联调  -> TODO
+    - 李四, 整理工艺包V2 -> DONE
+    """
+    person = person.strip()
+    task = task.strip()
+    if not person or not task:
+        raise HTTPException(400, "person and task are required")
+    rec = TASKS.get_latest_status(person, task)
+    if not rec:
+        return {"found": False, "person": person, "task": task}
+    return {
+        "found": True,
+        "person": rec["person"],
+        "task": rec["task"],
+        "status": rec["status"],
+        "ts": rec["ts"],
+        "id": rec["id"],
+    }
+
+
+@app.get("/tasks/ask")
+def tasks_ask(q: str, topk: int = 3, thresh: float = 0.58) -> Dict[str, Any]:
+    """无模型问数：解析人名/任务名 -> 查询 SQLite 最新状态 -> 生成中文回答。
+
+    调试输出包含：候选与分数、SQL 模板、解析出的 person/task。
+    """
+    if not q.strip():
+        raise HTTPException(400, "empty query")
+    payload = TQ_ENGINE.answer(q, topk=topk, thresh=thresh)
+    return payload
+
+
+@app.post("/tasks/reload")
+def tasks_reload() -> Dict[str, Any]:
+    """重建实体解析索引（从数据库重新加载候选）。"""
+    return {"reloaded": True, **TQ_ENGINE.reload()}
 
 
 @app.get("/answer")

@@ -104,6 +104,72 @@ Swagger UI: http://127.0.0.1:8000/docs
 
 ---
 
+## 3.1. SQLite Tasks Store (Step 1)
+
+Windows-friendly, read-only task data source using SQLite. This powers a minimal connectivity API to answer questions like “某人某任务是否完成/现在什么状态”.
+
+Setup sample data:
+
+```bash
+python scripts/init_tasks_sqlite.py   # creates data/tasks.db with sample rows
+```
+
+Config (env vars):
+
+- `TASKS_BACKEND` = `sqlite` (default; keep for now, future backends can plug in)
+- `TASKS_DB` = path to SQLite file (default `data/tasks.db`)
+
+Sample dataset inserted by the init script:
+
+- 张三｜提交9月周报｜TODO → DONE（以最新为准）
+- 张三｜E3D接口联调｜TODO
+- 李四｜整理工艺包V2｜DONE
+
+Quick checks:
+
+```bash
+curl "http://127.0.0.1:8000/tasks/status?person=张三&task=提交9月周报"    # DONE
+curl "http://127.0.0.1:8000/tasks/status?person=张三&task=E3D接口联调"  # TODO
+curl "http://127.0.0.1:8000/tasks/status?person=李四&task=整理工艺包V2"  # DONE
+```
+
+This API is intentionally minimal and will be swapped with real logic later; we keep abstraction slots to integrate with FAISS / Milvus / KG without changing upper-level call style.
+
+---
+
+## 3.2. 无模型问数（Step 2）
+
+目标：不依赖大语言模型，仅用规则 + FAISS 相似度做实体解析（人名/任务名），从本地 SQLite 读取任务最新状态，并生成中文回答。保留后续切换 Milvus / KG 的接口位。
+
+新端点：
+
+- `GET /tasks/ask?q=...&topk=3&thresh=0.58`
+  - 返回字段：`answer`、`status`、`person`、`task`、`ts`、`sql`、`candidates`（含打分，调试用）
+  - 识别“状态查询”意图的关键词：完成/未完成/状态/进度/是否完成/搞定/结束
+  - 实体解析：从 DB 导出候选（distinct person/task），用 Embedder + FAISS 近邻并与关键词重叠分数融合
+
+示例（确保先初始化样例 DB）：
+
+```bash
+python scripts/init_tasks_sqlite.py
+uvicorn app.demo_app:app --host 0.0.0.0 --port 8000 --reload
+
+curl "http://127.0.0.1:8000/tasks/ask?q=张三的提交9月周报完成了吗？"
+curl "http://127.0.0.1:8000/tasks/ask?q=张三的E3D接口联调现在什么状态？"
+curl "http://127.0.0.1:8000/tasks/ask?q=李四的整理工艺包V2是否已完成？"
+curl "http://127.0.0.1:8000/tasks/ask?q=老张九月报搞定了没？"
+```
+
+如果识别置信度低，会返回 Top-k 候选和分数，便于人工确认或迭代词表/别名（内置示例别名：老张→张三）。
+
+可选：当样本或库有更新时，可重建实体索引：
+
+```bash
+curl -X POST "http://127.0.0.1:8000/tasks/reload"
+```
+
+---
+
 ## 4. API Summary
 
 | Endpoint | Method | Notes |
@@ -115,6 +181,8 @@ Swagger UI: http://127.0.0.1:8000/docs
 | `/search_hybrid` | GET | Combines vector + keyword (alpha in [0,1]) and respects the same filters. |
 | `/answer` | GET | Builds a simple answer from top-k vector hits (no filters yet). |
 | `/reset` | POST | Clears vector + keyword indices (drops Milvus collection when using the adapter). |
+| `/tasks/status` | GET | Minimal connectivity: latest status for `person` + `task`. |
+| `/tasks/ask` | GET | 无模型问数：解析 + 查询 + 中文应答（含 SQL 与候选打分）。 |
 
 ### Example Requests
 
