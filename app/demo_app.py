@@ -13,7 +13,6 @@ from app.services.embeddings import Embedder
 from app.services.hybrid import merge_scores
 from app.services.keyword import KeywordIndex
 from app.vector_store.faiss_store import FaissVectorStore
-from app.vector_store.milvus_store import MilvusVectorStore
 
 
 app = FastAPI(title="Minimal RAG Demo", version="0.1.0")
@@ -27,6 +26,13 @@ EMBEDDER = Embedder(
 
 store_type = getenv("STORE", "faiss").lower()
 if store_type == "milvus":
+    try:
+        # Lazy import so pymilvus is only required when using Milvus backend
+        from app.vector_store.milvus_store import MilvusVectorStore  # type: ignore
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError(
+            "Milvus backend requested but unavailable. Install pymilvus (Linux/WSL recommended) or set STORE=faiss."
+        ) from exc
     VSTORE = MilvusVectorStore(
         dim=EMBEDDER.dim,
         host=getenv("MILVUS_HOST", "localhost"),

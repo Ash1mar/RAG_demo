@@ -2,7 +2,7 @@
 
 This project started as a mock-embedding demo with a local FAISS index. It now ships with a **pluggable vector store interface** so you can stay on FAISS or switch to a managed Milvus backend for metadata filtering, shared access, and higher concurrency.
 
-For a full start-and-test walkthrough (Windows PowerShell + Bash), see docs/START_AND_TEST.md.
+For a full start-and-test walkthrough (Windows PowerShell + Bash), see `docs/START_AND_TEST.md`.
 
 ---
 
@@ -41,6 +41,10 @@ python -m venv venv
 source venv/bin/activate        # or .\venv\Scripts\activate on Windows
 pip install -r requirements.txt
 ```
+
+Windows note:
+- On Windows, `requirements.txt` skips installing Milvus client packages by default. FAISS mode works out of the box.
+- If you later want Milvus on Windows, install Milvus client packages manually (e.g., `pymilvus==2.4.3` with compatible dependencies) and set `STORE=milvus`.
 
 Key packages:
 
