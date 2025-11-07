@@ -1,0 +1,39 @@
+FROM python:3.11-slim
+
+ARG TORCH_CUDA=cpu
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    curl \
+    libgomp1 \
+  && rm -rf /var/lib/apt/lists/*
+
+# Install PyTorch matching desired backend
+RUN if [ "$TORCH_CUDA" = "cpu" ]; then \
+      pip install --upgrade pip && pip install torch --index-url https://download.pytorch.org/whl/cpu ; \
+    elif [ "$TORCH_CUDA" = "cu121" ]; then \
+      pip install --upgrade pip && pip install torch --index-url https://download.pytorch.org/whl/cu121 ; \
+    else \
+      echo "Unsupported TORCH_CUDA=$TORCH_CUDA" && exit 1 ; \
+    fi
+
+# Core deps
+RUN pip install fastapi uvicorn sentence-transformers numpy
+
+COPY embedder_server ./embedder_server
+
+EXPOSE 8080
+
+ENV MODEL_NAME=BAAI/bge-small-zh-v1.5 \
+    EMBED_PORT=8080 \
+    EMBED_DEVICE=auto \
+    EMBED_BATCH=32
+
+CMD ["uvicorn", "embedder_server.server:app", "--host", "0.0.0.0", "--port", "8080"]
+

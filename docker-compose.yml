@@ -1,9 +1,26 @@
 version: "3.9"
 
 services:
+  embedder:
+    build:
+      context: .
+      dockerfile: Dockerfile.embedder
+      args:
+        TORCH_CUDA: ${TORCH_CUDA:-cpu}
+    image: rag-embedder:latest
+    environment:
+      - MODEL_NAME=${MODEL_NAME:-BAAI/bge-small-zh-v1.5}
+      - EMBED_DEVICE=${EMBED_DEVICE:-auto}
+      - EMBED_BATCH=${EMBED_BATCH:-32}
+      - EMBED_PORT=8080
+    ports:
+      - "${EMBED_PORT:-8080}:8080"
+    restart: unless-stopped
+
   etcd:
     image: quay.io/coreos/etcd:v3.5.12
     container_name: milvus-etcd
+    profiles: [milvus]
     environment:
       - ETCD_AUTO_COMPACTION_MODE=revision
       - ETCD_AUTO_COMPACTION_RETENTION=1000
@@ -20,6 +37,7 @@ services:
   minio:
     image: minio/minio:RELEASE.2024-05-28T17-19-04Z
     container_name: milvus-minio
+    profiles: [milvus]
     environment:
       - MINIO_ACCESS_KEY=minioadmin
       - MINIO_SECRET_KEY=minioadmin
@@ -38,6 +56,7 @@ services:
   milvus:
     image: milvusdb/milvus:v2.4.3
     container_name: milvus-standalone
+    profiles: [milvus]
     depends_on:
       etcd:
         condition: service_healthy

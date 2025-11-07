@@ -1,0 +1,9 @@
+记得：
+更新readme相关内容在README_minimal_rag_demo；
+更新requirement；
+更新详尽的说明书相关内容在docs下的INSTRUCTIONS_TASKS；
+更新启动和测试相关步骤与说明在docs下的START_AND_TEST；
+
+README_minimal_rag_demo.md：聚焦概览、结构、特性、环境变量、开发模式，指向详细与全流程文档。
+docs/INSTRUCTIONS_TASKS.md：专注 Step 2（无模型问数）说明书：模式、参数、返回字段、自测与调参、故障排查。
+docs/START_AND_TEST.md：从零到可用的完整初始化、启动、测试全流程（包含仅起 embedder 容器 + 本机 API、FAISS-only 流程、可选 Milvus profile）。

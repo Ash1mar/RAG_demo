@@ -12,6 +12,7 @@ from app.tasks_store.base import TasksStore
 @dataclass
 class SQLiteTasksConfig:
     db_path: str = "data/tasks.db"  # default location under project data/
+    timeout_sec: float = 2.0         # read-only connect timeout
 
 
 class SQLiteTasksStore(TasksStore):
@@ -28,6 +29,7 @@ class SQLiteTasksStore(TasksStore):
     def __init__(self, config: Optional[SQLiteTasksConfig] = None) -> None:
         cfg = config or SQLiteTasksConfig()
         self._db_path = Path(cfg.db_path)
+        self._timeout = float(getattr(cfg, "timeout_sec", 2.0))
         self._conn: Optional[sqlite3.Connection] = None
 
     # --- internal helpers ---
@@ -38,7 +40,7 @@ class SQLiteTasksStore(TasksStore):
         # Convert to forward-slashes to be URI-friendly across OSes
         abs_path = self._db_path.resolve()
         uri = f"file:{abs_path.as_posix()}?mode=ro"
-        self._conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+        self._conn = sqlite3.connect(uri, uri=True, check_same_thread=False, timeout=self._timeout)
         self._conn.row_factory = sqlite3.Row
         return self._conn
 

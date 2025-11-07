@@ -14,14 +14,21 @@ from app.tasks_store.base import TasksStore
 
 def _norm_text(s: str) -> str:
     s = s.strip()
-    # remove common punctuation/spaces
     s = re.sub(r"[\s\t\n\r]+", "", s)
-    s = re.sub(r"[，。！？、,.!?()（）:：;；\-_/]", "", s)
+    s = re.sub(r"[，。！？,.!?()（）:：；\-_/]", "", s)
     return s
 
 
 INTENT_STATUS_KWS = [
-    "完成", "未完成", "是否完成", "状态", "进度", "搞定", "结束", "done", "todo",
+    "完成",
+    "未完成",
+    "是否完成",
+    "状态",
+    "进度",
+    "搞定",
+    "结束",
+    "done",
+    "todo",
 ]
 
 
@@ -30,6 +37,7 @@ class ResolverConfig:
     topk: int = 3
     alpha_vec: float = 0.65  # weight for vector score in fusion
     thresh: float = 0.58     # acceptance threshold after fusion
+    mode: str = "hybrid"      # one of: "rules" | "embeddings" | "hybrid"
 
 
 @dataclass
@@ -51,13 +59,9 @@ class EntityResolver:
     })
 
     def build(self) -> None:
-        # build normalized text lists
-        p_norm = [p for p in self.persons]
-        t_norm = [t for t in self.tasks]
-
-        p_vecs = self.embedder.encode(p_norm).astype(np.float32)
-        t_vecs = self.embedder.encode(t_norm).astype(np.float32)
-        # L2 normalization for cosine via inner product
+        # Use original strings (keep case/punct for embeddings), normalization is only for rules
+        p_vecs = self.embedder.encode(self.persons).astype(np.float32) if self.persons else np.zeros((0, self.embedder.dim), dtype=np.float32)
+        t_vecs = self.embedder.encode(self.tasks).astype(np.float32) if self.tasks else np.zeros((0, self.embedder.dim), dtype=np.float32)
         if p_vecs.size:
             faiss.normalize_L2(p_vecs)
         if t_vecs.size:
@@ -66,9 +70,9 @@ class EntityResolver:
         self._task_vecs = t_vecs
         self._idx_person = faiss.IndexFlatIP(p_vecs.shape[1]) if p_vecs.size else None
         self._idx_task = faiss.IndexFlatIP(t_vecs.shape[1]) if t_vecs.size else None
-        if self._idx_person is not None:
+        if self._idx_person is not None and p_vecs.shape[0] > 0:
             self._idx_person.add(p_vecs)
-        if self._idx_task is not None:
+        if self._idx_task is not None and t_vecs.shape[0] > 0:
             self._idx_task.add(t_vecs)
 
     def _kw_score(self, query: str, cand: str) -> float:
@@ -80,19 +84,18 @@ class EntityResolver:
             return 1.0
         if qn in cn or cn in qn:
             return 0.8
-        # rough character overlap score
         qset = set(qn)
         cset = set(cn)
         inter = len(qset & cset)
         union = len(qset | cset) or 1
         return inter / union
 
-    def _search(self, idx: Optional[faiss.Index], vecs: Optional[np.ndarray], cands: List[str], query: str) -> List[Tuple[str, float]]:
+    def _search(self, idx: Optional[faiss.Index], vecs: Optional[np.ndarray], cands: List[str], query: str, *, k: Optional[int] = None) -> List[Tuple[str, float]]:
         if idx is None or vecs is None or not cands:
             return []
         qv = self.embedder.encode([query]).astype(np.float32)
         faiss.normalize_L2(qv)
-        topk = min(self.cfg.topk, len(cands))
+        topk = min(self.cfg.topk if k is None else k, len(cands))
         D, I = idx.search(qv, topk)
         scores = D[0]
         ids = I[0]
@@ -103,30 +106,61 @@ class EntityResolver:
             out.append((cands[i], float(s)))
         return out
 
+    def _rule_rank(self, cands: List[str], query: str, *, k: Optional[int] = None) -> List[Tuple[str, float]]:
+        items: List[Tuple[str, float]] = []
+        for cand in cands:
+            items.append((cand, float(self._kw_score(query, cand))))
+        items.sort(key=lambda x: x[1], reverse=True)
+        kk = self.cfg.topk if k is None else k
+        return items[:kk]
+
     def resolve_person(self, query: str) -> List[Tuple[str, float]]:
         # alias substitution first
         q = query
         for alias, real in self.alias_map.items():
             if alias in q:
                 q = q.replace(alias, real)
-        vec_hits = self._search(self._idx_person, self._pers_vecs, self.persons, q)
+        mode = (self.cfg.mode or "hybrid").lower()
+        if mode == "rules":
+            return self._rule_rank(self.persons, q)
+        if mode == "embeddings":
+            return self._search(self._idx_person, self._pers_vecs, self.persons, q)
+        # hybrid: collect wider candidates then fuse
+        vec_hits = self._search(self._idx_person, self._pers_vecs, self.persons, q, k=max(self.cfg.topk * 2, 10))
+        rule_hits = self._rule_rank(self.persons, q, k=max(self.cfg.topk * 2, 10))
+        table: Dict[str, Tuple[float, float]] = {}
+        for cand, vs in vec_hits:
+            table[cand] = (float(vs), float(table.get(cand, (0.0, 0.0))[1]))
+        for cand, ks in rule_hits:
+            cur = table.get(cand, (0.0, 0.0))
+            table[cand] = (float(cur[0]), float(ks))
         fused: List[Tuple[str, float]] = []
-        for cand, vscore in vec_hits:
-            kscore = self._kw_score(q, cand)
-            score = self.cfg.alpha_vec * vscore + (1 - self.cfg.alpha_vec) * kscore
-            fused.append((cand, float(score)))
+        a = float(self.cfg.alpha_vec)
+        for cand, (vs, ks) in table.items():
+            fused.append((cand, a * vs + (1 - a) * ks))
         fused.sort(key=lambda x: x[1], reverse=True)
-        return fused
+        return fused[: self.cfg.topk]
 
     def resolve_task(self, query: str) -> List[Tuple[str, float]]:
-        vec_hits = self._search(self._idx_task, self._task_vecs, self.tasks, query)
+        mode = (self.cfg.mode or "hybrid").lower()
+        if mode == "rules":
+            return self._rule_rank(self.tasks, query)
+        if mode == "embeddings":
+            return self._search(self._idx_task, self._task_vecs, self.tasks, query)
+        vec_hits = self._search(self._idx_task, self._task_vecs, self.tasks, query, k=max(self.cfg.topk * 2, 10))
+        rule_hits = self._rule_rank(self.tasks, query, k=max(self.cfg.topk * 2, 10))
+        table: Dict[str, Tuple[float, float]] = {}
+        for cand, vs in vec_hits:
+            table[cand] = (float(vs), float(table.get(cand, (0.0, 0.0))[1]))
+        for cand, ks in rule_hits:
+            cur = table.get(cand, (0.0, 0.0))
+            table[cand] = (float(cur[0]), float(ks))
         fused: List[Tuple[str, float]] = []
-        for cand, vscore in vec_hits:
-            kscore = self._kw_score(query, cand)
-            score = self.cfg.alpha_vec * vscore + (1 - self.cfg.alpha_vec) * kscore
-            fused.append((cand, float(score)))
+        a = float(self.cfg.alpha_vec)
+        for cand, (vs, ks) in table.items():
+            fused.append((cand, a * vs + (1 - a) * ks))
         fused.sort(key=lambda x: x[1], reverse=True)
-        return fused
+        return fused[: self.cfg.topk]
 
 
 def is_status_intent(q: str) -> bool:
@@ -147,24 +181,39 @@ class TaskQueryEngine:
     tasks_store: TasksStore
     embedder: Embedder
     resolver: Optional[EntityResolver] = None
+    resolver_mode: str = "hybrid"
 
     def ensure_built(self) -> None:
         if self.resolver is not None:
             return
         persons = self.tasks_store.list_persons()
         tasks = self.tasks_store.list_tasks()
-        res = EntityResolver(embedder=self.embedder, persons=persons, tasks=tasks)
+        res = EntityResolver(
+            embedder=self.embedder,
+            persons=persons,
+            tasks=tasks,
+            cfg=ResolverConfig(mode=self.resolver_mode),
+        )
         res.build()
         self.resolver = res
 
     def reload(self) -> Dict[str, Any]:
         self.resolver = None
         self.ensure_built()
-        return {"persons": len(self.resolver.persons if self.resolver else []), "tasks": len(self.resolver.tasks if self.resolver else [])}
+        return {
+            "persons": len(self.resolver.persons if self.resolver else []),
+            "tasks": len(self.resolver.tasks if self.resolver else []),
+        }
 
     def answer(self, q: str, topk: int = 3, thresh: float = 0.58) -> Dict[str, Any]:
         self.ensure_built()
         assert self.resolver is not None
+
+        # runtime overrides
+        if topk != self.resolver.cfg.topk:
+            self.resolver.cfg.topk = int(topk)
+        if abs(thresh - self.resolver.cfg.thresh) > 1e-9:
+            self.resolver.cfg.thresh = float(thresh)
 
         intent = "status_query" if is_status_intent(q) else "unknown"
         person_hits = self.resolver.resolve_person(q)[:topk]
@@ -172,6 +221,9 @@ class TaskQueryEngine:
 
         payload: Dict[str, Any] = {
             "intent": intent,
+            "resolver_mode": self.resolver.cfg.mode,
+            "alpha_vec": round(float(self.resolver.cfg.alpha_vec), 4),
+            "thresh": round(float(self.resolver.cfg.thresh), 4),
             "candidates": {
                 "persons": [{"value": v, "score": round(float(s), 4)} for v, s in person_hits],
                 "tasks": [{"value": v, "score": round(float(s), 4)} for v, s in task_hits],
@@ -182,18 +234,18 @@ class TaskQueryEngine:
         best_p = person_hits[0] if person_hits else None
         best_t = task_hits[0] if task_hits else None
         if not best_p or not best_t:
-            payload["answer"] = "未识别出人员或任务，请从候选中选择。"
+            payload["answer"] = "未识别出人员或任务，请从候选中选择"
             return payload
 
-        if best_p[1] < thresh or best_t[1] < thresh:
-            payload["answer"] = "识别置信度不足，请确认候选是否正确。"
+        if best_p[1] < self.resolver.cfg.thresh or best_t[1] < self.resolver.cfg.thresh:
+            payload["answer"] = "识别置信度不足，请确认候选是否正确"
             return payload
 
         person = best_p[0]
         task = best_t[0]
         rec = self.tasks_store.get_latest_status(person, task)
         if not rec:
-            payload["answer"] = "未在任务库中找到对应记录。"
+            payload["answer"] = "未在任务库中找到对应记录"
             payload["person"] = person
             payload["task"] = task
             return payload
@@ -203,7 +255,7 @@ class TaskQueryEngine:
         ts_str = ts_to_str(ts) if ts >= 0 else "未知时间"
 
         zh_status = "已完成" if status == "DONE" else "未完成/待办"
-        answer = f"{person} 的「{task}」{zh_status}（最近更新时间：{ts_str}）。"
+        answer = f"{person} 的「{task}」{zh_status}（最近更新时间：{ts_str}）"
 
         payload.update({
             "answer": answer,

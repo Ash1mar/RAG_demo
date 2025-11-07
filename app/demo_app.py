@@ -57,7 +57,8 @@ else:
     TASKS = SQLiteTasksStore(SQLiteTasksConfig(db_path=getenv("TASKS_DB", "data/tasks.db")))
 
 # Non-LLM task status query engine
-TQ_ENGINE = TaskQueryEngine(tasks_store=TASKS, embedder=EMBEDDER)
+resolver_mode = getenv("RESOLVER", "hybrid").lower()  # rules | embeddings | hybrid
+TQ_ENGINE = TaskQueryEngine(tasks_store=TASKS, embedder=EMBEDDER, resolver_mode=resolver_mode)
 
 
 # ---- Schemas ----
@@ -85,6 +86,7 @@ def health() -> Dict[str, Any]:
         "vector_store": store_type,
         "tasks_store": tasks_backend,
         "tasks_ready": TASKS.ready(),
+        "resolver_mode": resolver_mode,
     }
 
 

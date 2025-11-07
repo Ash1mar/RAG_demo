@@ -2,7 +2,10 @@ import os
 from typing import List
 import math
 import re
+import json
+from urllib.parse import urlparse
 import numpy as np
+import requests
 
 class Embedder:
     """
@@ -13,7 +16,10 @@ class Embedder:
         self.use_mock = use_mock
         self.dim = dim
         self._model = None
-        if not self.use_mock:
+        # Optional remote embedding service endpoint
+        self._emb_url = os.getenv("EMB_URL")
+        self._emb_timeout = float(os.getenv("EMB_TIMEOUT", "12"))
+        if not self.use_mock and not self._emb_url:
             from sentence_transformers import SentenceTransformer
             self._model = SentenceTransformer(model_name)
 
@@ -36,5 +42,18 @@ class Embedder:
     def encode(self, texts: List[str]) -> np.ndarray:
         if self.use_mock:
             return self._mock_encode(texts)
+        # Prefer remote embedder when EMB_URL is configured
+        if self._emb_url:
+            payload = {"inputs": list(texts), "normalize": True}
+            try:
+                resp = requests.post(self._emb_url, json=payload, timeout=self._emb_timeout)
+                resp.raise_for_status()
+                data = resp.json()
+                arr = np.asarray(data.get("embeddings") or data, dtype=np.float32)
+                return arr
+            except Exception as exc:
+                # Fallback to local model if available
+                if self._model is None:
+                    raise
         embs = self._model.encode(texts, normalize_embeddings=True)
         return np.asarray(embs, dtype=np.float32)
