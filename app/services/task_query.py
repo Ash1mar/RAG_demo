@@ -114,6 +114,37 @@ class EntityResolver:
         kk = self.cfg.topk if k is None else k
         return items[:kk]
 
+    def _vector_rank_with_focus(
+        self,
+        vecs: Optional[np.ndarray],
+        cands: List[str],
+        query: str,
+        focus: List[str],
+        *,
+        k: Optional[int] = None,
+    ) -> List[Tuple[str, float]]:
+        """
+        embeddings-only 的“聚焦查询”实现：
+        1) 对整句 query 编码；
+        2) 若存在规则法高置信候选（>=0.8），则将这些候选文本也编码；
+        3) 用 [query] + focus 的多路向量与候选向量矩阵计算相似度，逐候选取最大值；
+        4) 返回 Top‑k。
+        说明：build() 已对库向量做 L2 归一化，此处对查询向量再次归一化。
+        """
+        if vecs is None or vecs.size == 0 or not cands:
+            return []
+        queries: List[str] = [query]
+        if focus:
+            queries.extend(focus)
+        embs = self.embedder.encode(queries).astype(np.float32)
+        faiss.normalize_L2(embs)
+        # 余弦相似（已归一化）→ 点积
+        sims = embs @ vecs.T  # (m, N)
+        best = sims.max(axis=0)  # (N,)
+        topk = min(self.cfg.topk if k is None else k, len(cands))
+        order = np.argsort(-best)[:topk]
+        return [(cands[int(i)], float(best[int(i)])) for i in order]
+
     def resolve_person(self, query: str) -> List[Tuple[str, float]]:
         # alias substitution first
         q = query
@@ -124,7 +155,9 @@ class EntityResolver:
         if mode == "rules":
             return self._rule_rank(self.persons, q)
         if mode == "embeddings":
-            return self._search(self._idx_person, self._pers_vecs, self.persons, q)
+            # 规则粗提（>=0.8）作为聚焦词，提升短实体名对齐的分数稳定性
+            focus = [cand for cand in self.persons if self._kw_score(q, cand) >= 0.8]
+            return self._vector_rank_with_focus(self._pers_vecs, self.persons, q, focus)
         # hybrid: collect wider candidates then fuse
         vec_hits = self._search(self._idx_person, self._pers_vecs, self.persons, q, k=max(self.cfg.topk * 2, 10))
         rule_hits = self._rule_rank(self.persons, q, k=max(self.cfg.topk * 2, 10))
@@ -146,7 +179,8 @@ class EntityResolver:
         if mode == "rules":
             return self._rule_rank(self.tasks, query)
         if mode == "embeddings":
-            return self._search(self._idx_task, self._task_vecs, self.tasks, query)
+            focus = [cand for cand in self.tasks if self._kw_score(query, cand) >= 0.8]
+            return self._vector_rank_with_focus(self._task_vecs, self.tasks, query, focus)
         vec_hits = self._search(self._idx_task, self._task_vecs, self.tasks, query, k=max(self.cfg.topk * 2, 10))
         rule_hits = self._rule_rank(self.tasks, query, k=max(self.cfg.topk * 2, 10))
         table: Dict[str, Tuple[float, float]] = {}
@@ -188,11 +222,22 @@ class TaskQueryEngine:
             return
         persons = self.tasks_store.list_persons()
         tasks = self.tasks_store.list_tasks()
+        # 模式自适应阈值（可被运行时 thresh 覆盖）
+        mode = self.resolver_mode
+        def _default_thresh(m: str) -> float:
+            m = (m or "hybrid").lower()
+            if m == "rules":
+                return 0.8
+            if m == "embeddings":
+                return 0.45
+            return 0.58  # hybrid
+
+        cfg = ResolverConfig(mode=mode, thresh=_default_thresh(mode))
         res = EntityResolver(
             embedder=self.embedder,
             persons=persons,
             tasks=tasks,
-            cfg=ResolverConfig(mode=self.resolver_mode),
+            cfg=cfg,
         )
         res.build()
         self.resolver = res
@@ -205,14 +250,14 @@ class TaskQueryEngine:
             "tasks": len(self.resolver.tasks if self.resolver else []),
         }
 
-    def answer(self, q: str, topk: int = 3, thresh: float = 0.58) -> Dict[str, Any]:
+    def answer(self, q: str, topk: int = 3, thresh: Optional[float] = None) -> Dict[str, Any]:
         self.ensure_built()
         assert self.resolver is not None
 
         # runtime overrides
         if topk != self.resolver.cfg.topk:
             self.resolver.cfg.topk = int(topk)
-        if abs(thresh - self.resolver.cfg.thresh) > 1e-9:
+        if thresh is not None and abs(float(thresh) - self.resolver.cfg.thresh) > 1e-9:
             self.resolver.cfg.thresh = float(thresh)
 
         intent = "status_query" if is_status_intent(q) else "unknown"
@@ -265,4 +310,3 @@ class TaskQueryEngine:
             "ts": ts,
         })
         return payload
-

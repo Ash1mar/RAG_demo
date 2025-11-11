@@ -93,3 +93,13 @@ See `.env.example` for a reference layout.
 - End‑to‑end steps: `docs/START_AND_TEST.md`
 - Task Q&A details (Step 2): `docs/INSTRUCTIONS_TASKS.md`
 
+---
+
+## What’s New
+
+- Embeddings‑only Focus Query: when `RESOLVER=embeddings`, the resolver first extracts rule‑high candidates (>=0.8) and uses them as focused queries alongside the full sentence. Scores take the max over these queries, improving alignment for short entity names.
+- Mode‑adaptive thresholds (used when `thresh` is omitted in `/tasks/ask`):
+  - rules: 0.8
+  - embeddings: 0.45
+  - hybrid: 0.58
+  You can still provide `thresh` explicitly to override.

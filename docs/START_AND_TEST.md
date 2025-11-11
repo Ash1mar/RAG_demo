@@ -263,3 +263,13 @@ Expected outcome:
 
 ## 8) Troubleshooting
 
+---
+
+Notes (New in Focus Query + Adaptive Thresholds)
+
+- When running embeddings-only (`$env:RESOLVER='embeddings'`), the API applies Focus Query: it first extracts high-confidence rule candidates (>=0.8) and sends them alongside the full sentence to the embedder; the final score per candidate is the max similarity across these queries.
+- Thresholds when `thresh` is omitted in `/tasks/ask`:
+  - rules: 0.8
+  - embeddings: 0.45
+  - hybrid: 0.58
+  You can still override by explicitly passing `&thresh=...`.

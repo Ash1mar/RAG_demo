@@ -157,7 +157,7 @@ def task_status(person: str, task: str) -> Dict[str, Any]:
 
 
 @app.get("/tasks/ask")
-def tasks_ask(q: str, topk: int = 3, thresh: float = 0.58) -> Dict[str, Any]:
+def tasks_ask(q: str, topk: int = 3, thresh: Optional[float] = None) -> Dict[str, Any]:
     """无模型问数：解析人名/任务名 -> 查询 SQLite 最新状态 -> 生成中文回答。
 
     调试输出包含：候选与分数、SQL 模板、解析出的 person/task。

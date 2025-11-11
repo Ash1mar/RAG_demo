@@ -122,3 +122,18 @@ python scripts/init_tasks_sqlite.py
 - 容器嵌入不可达：检查 `docker compose up -d embedder`、端口与 `EMB_URL`
 - 下载过慢：先用 `MOCK_EMB=1` 跑通流程
 
+# 更新与调参建议（新增）
+
+本页补充 Step 2（无模型问数）的两项改进：
+
+- 聚焦查询（embeddings-only）：
+  - 先用规则法粗提候选（≥0.8），将这些候选与整句并行编码，逐候选取最大相似度；
+  - 解决“整句问句对齐短实体名”导致余弦分数偏低的问题，改善 embeddings-only 的稳定性；
+  - 与原有 FAISS Top‑k 检索兼容，不影响 rules/hybrid 逻辑。
+
+- 模式自适应阈值：
+  - 当未显式传 `thresh` 时，系统按模式取默认值：rules=0.8，embeddings=0.45，hybrid=0.58；
+  - 仍可在请求中通过 `&thresh=...` 覆盖；
+  - 若切换模型/语料特性发生变化，建议先用默认阈值观测候选分布，再按需微调。
+
+提示：使用 `BAAI/bge-small-zh-v1.5` 时，维度为 512；若本地直载，请确保 `EMB_DIM=512`；切换模型/维度后请执行 `/reset`（文档索引）与 `/tasks/reload`（实体索引）。
