@@ -1,9 +1,9 @@
 # Minimal RAG Demo (FAISS first, Milvus optional)
 
-Minimal retrieval and “non‑LLM task status ask” demo with:
+Minimal retrieval and non‑LLM task status ask demo with:
 - Pluggable vector stores: FAISS (default) and Milvus (optional)
 - Local API (FastAPI) for development; optional containerized deployment
-- Non‑LLM entity resolution (rules / embeddings / hybrid) for task status Q&A
+- Non‑LLM entity resolution (rules / embeddings / hybrid / hybrid_plus_rules) for task status Q&A
 - Optional containerized embedding server (bge-small-zh) consumed by local API
 
 For a complete hands‑on from init → start → test, see `docs/START_AND_TEST.md`.
@@ -22,7 +22,9 @@ RAG_demo/
 │  │  ├─ answer.py                # Build answer from top-k hits
 │  │  ├─ keyword.py               # Keyword/BM25 index
 │  │  ├─ hybrid.py                # Score fusion helper
-│  │  └─ task_query.py            # Non‑LLM task ask engine (Step 2)
+│  │  ├─ task_query.py            # Non‑LLM task ask engine (Step 2)
+│  │  ├─ nl2sql_engine.py         # NL→JSON task query semantic IR
+│  │  └─ sql_compiler.py          # JSON/IR→SQL compiler for tasks table
 │  ├─ vector_store/
 │  │  ├─ base.py                  # VectorStore ABC
 │  │  ├─ faiss_store.py           # FAISS implementation
@@ -48,11 +50,14 @@ RAG_demo/
 
 ## Key Features
 
-- Vector search (FAISS default), keyword search; hybrid (vector-only for task resolver via FAISS focus)
+- Vector search (FAISS default), keyword search; hybrid (vector-only for task resolver via FAISS focus).
 - Non‑LLM task ask (`/tasks/ask`) with:
-  - Intent detection by keywords (完成/未完成/状态/进度/是否完成/搞定/结束)
-  - Entity resolution: rules / embeddings / hybrid (configurable; hybrid = vector-only via FAISS Focus Query, no rule fusion)
-  - SQLite read‑only task store; returns answer + SQL + candidates with scores
+  - Intent detection by keywords (完成 / 未完成 / 状态 / 进度 / 是否完成 / 搞定 / 结束)
+  - Entity resolution: `rules` / `embeddings` / `hybrid` / `hybrid_plus_rules`
+  - SQLite read‑only task store; returns answer + SQL + candidates with scores + lightweight NL IR (`nl_ir`)
+- Experimental NL→JSON→SQL DB ask (`/db/ask`) for the `tasks` table:
+  - Uses `parse_task_query_nl` to build a semantic IR, `compile_tasks_sql` to compile read‑only SQL, and `SQLiteTasksStore.query` to return raw rows.
+  - Designed as a debugging/inspection endpoint; it does not generate natural language answers and does not affect `/tasks/ask`.
 - Embeddings options:
   - Mock (no downloads) for quick start
   - Local SBERT (e.g., MiniLM or bge-small-zh)
@@ -64,7 +69,7 @@ RAG_demo/
 ## Configuration (Env Vars)
 
 - Vector store: `STORE=faiss|milvus` (default `faiss`)
-- Resolver: `RESOLVER=rules|embeddings|hybrid` (default `hybrid`)
+- Resolver: `RESOLVER=rules|embeddings|hybrid|hybrid_plus_rules` (default `hybrid`)
 - Embeddings:
   - `MOCK_EMB=1|0` (mock on/off)
   - `MODEL_NAME` (e.g., `BAAI/bge-small-zh-v1.5`, `sentence-transformers/all-MiniLM-L6-v2`)
@@ -97,10 +102,18 @@ See `.env.example` for a reference layout.
 
 ## What’s New
 
-- Embeddings‑only Focus Query: when `RESOLVER=embeddings`, the resolver first extracts rule‑high candidates (>=0.8) and uses them as focused queries alongside the full sentence. Scores take the max over these queries, improving alignment for short entity names.
+- Embeddings‑only Focus Query: when `RESOLVER=embeddings`, the resolver first extracts high‑confidence rule candidates (>=0.8) and uses them as focused queries alongside the full sentence. Scores take the max over these queries, improving alignment for short entity names.
 - Hybrid redefined for Task Q&A: `RESOLVER=hybrid` is now vector‑only and applies the same Focus Query behavior via FAISS (no rule fusion).
+- `hybrid_plus_rules` mode: `RESOLVER=hybrid_plus_rules` keeps vector‑only ranking but lets high‑agreement rules provide a small assist for task ranking and gating (better robustness on terms like “接口”“联调”), while still using Focus Query.
 - Mode‑adaptive thresholds (used when `thresh` is omitted in `/tasks/ask`):
-  - rules: 0.8
-  - embeddings: 0.45
-  - hybrid: 0.45
+  - `rules`: 0.8
+  - `embeddings`: 0.45
+  - `hybrid`: 0.45
+  - `hybrid_plus_rules`: 0.45 (with internal split thresholds and margin logic)
   You can still provide `thresh` explicitly to override.
+
+In addition, `/tasks/ask` now exposes a lightweight NL→JSON semantic IR:
+- Module `app/services/nl2sql_engine.py` defines `TaskQuerySpec` (intent / person / task / status / time_range / order_by / limit) and the function:
+  - `parse_task_query_nl(q: str) -> TaskQuerySpec`
+- The FastAPI endpoint `/tasks/ask` still uses `TaskQueryEngine` for actual resolution and SQLite queries, but now adds an `nl_ir` field in the JSON response to show the parsed semantic structure. This module and the companion `sql_compiler.py` are the entry points for NL→SQL refactoring, which is exercised end‑to‑end via `/db/ask`.
+

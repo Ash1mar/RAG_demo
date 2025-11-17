@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import sqlite3
 
@@ -106,3 +106,30 @@ class SQLiteTasksStore(TasksStore):
         conn = self._connect_ro()
         rows = conn.execute("SELECT DISTINCT task FROM tasks").fetchall()
         return [str(r[0]) for r in rows]
+
+    # --- generic read‑only query helper for NL→SQL ---
+    def query(self, sql: str, params: Tuple[Any, ...]) -> List[Dict[str, Any]]:
+        """Execute a read‑only SELECT on the tasks DB.
+
+        This helper is intended for use with the NL→SQL compiler, which should
+        only emit queries of the form `SELECT ... FROM tasks ...` using `?` placeholders.
+        """
+        s = (sql or "").strip().lower()
+        if not s.startswith("select"):
+            raise ValueError("only SELECT statements are allowed in SQLiteTasksStore.query")
+        if " from tasks" not in s:
+            raise ValueError("query must target the tasks table")
+
+        conn = self._connect_ro()
+        cur = conn.execute(sql, params)
+        rows = cur.fetchall()
+        return [
+            {
+                "id": int(r["id"]),
+                "person": r["person"],
+                "task": r["task"],
+                "status": r["status"],
+                "ts": int(r["ts"]),
+            }
+            for r in rows
+        ]

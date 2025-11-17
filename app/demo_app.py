@@ -14,6 +14,8 @@ from app.services.hybrid import merge_scores
 from app.services.keyword import KeywordIndex
 from app.vector_store.faiss_store import FaissVectorStore
 from app.services.task_query import TaskQueryEngine
+from app.services.nl2sql_engine import parse_task_query_nl
+from app.services.sql_compiler import compile_tasks_sql, TaskSqlCompileError
 from app.tasks_store.base import TasksStore
 from app.tasks_store.sqlite_store import SQLiteTasksStore, SQLiteTasksConfig
 
@@ -164,8 +166,67 @@ def tasks_ask(q: str, topk: int = 3, thresh: Optional[float] = None) -> Dict[str
     """
     if not q.strip():
         raise HTTPException(400, "empty query")
+    # NL -> 任务查询语义 IR（中间表示），仅做结构化解析，不访问数据库/不生成 SQL
+    ir = parse_task_query_nl(q)
     payload = TQ_ENGINE.answer(q, topk=topk, thresh=thresh)
+    try:
+        payload["nl_ir"] = ir.dict()
+    except Exception:
+        payload["nl_ir"] = {"raw_query": q, "error": "failed_to_serialize_ir"}
     return payload
+
+
+@app.get("/db/ask")
+def db_ask(q: str = Query(..., description="Natural language task query for direct NL→JSON→SQL experiment")) -> Dict[str, Any]:
+    """NL→JSON→SQL 闭环实验端点：直接以 tasks 表为目标的只读查询。
+
+    流程：
+    1. 调用 parse_task_query_nl(q) 得到 TaskQuerySpec 语义 IR；
+    2. 调用 compile_tasks_sql(spec) 生成只读 SQL 和参数；
+    3. 使用 SQLiteTasksStore.query(sql, params) 执行查询；
+    4. 返回结构化 JSON，包含原始 query、IR、SQL 和 rows，用于调试 NL→SQL 链路。
+
+    注意：本端点不会生成自然语言回答，也不会替代 /tasks/ask 的逻辑。
+    """
+    text = (q or "").strip()
+    if not text:
+        raise HTTPException(400, "empty query")
+
+    # 1) NL -> IR
+    spec = parse_task_query_nl(text)
+
+    # 2) IR -> SQL（只读、tasks 单表）
+    try:
+        compiled = compile_tasks_sql(spec)
+    except TaskSqlCompileError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "cannot_compile_sql",
+                "reason": str(exc),
+            },
+        )
+
+    # 3) 执行 SQL（只读查询）
+    try:
+        rows = TASKS.query(compiled.sql, compiled.params)
+    except Exception as exc:  # pragma: no cover - defensive
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "db_query_failed",
+                "reason": str(exc),
+            },
+        )
+
+    # 4) 汇总调试信息
+    return {
+        "query": text,
+        "ir": spec.dict(),
+        "sql": compiled.sql,
+        "params": compiled.params,
+        "rows": rows,
+    }
 
 
 @app.post("/tasks/reload")
