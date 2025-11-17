@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
@@ -15,18 +15,18 @@ from app.tasks_store.base import TasksStore
 def _norm_text(s: str) -> str:
     s = s.strip()
     s = re.sub(r"[\s\t\n\r]+", "", s)
-    s = re.sub(r"[，。！？,.!?()（）:：；\-_/]", "", s)
+    s = re.sub(r"[锛屻€傦紒锛?.!?()锛堬級:锛氾紱\-_/]", "", s)
     return s
 
 
 INTENT_STATUS_KWS = [
-    "完成",
-    "未完成",
-    "是否完成",
-    "状态",
-    "进度",
-    "搞定",
-    "结束",
+    "瀹屾垚",
+    "鏈畬鎴?,
+    "鏄惁瀹屾垚",
+    "鐘舵€?,
+    "杩涘害",
+    "鎼炲畾",
+    "缁撴潫",
     "done",
     "todo",
 ]
@@ -61,7 +61,7 @@ class EntityResolver:
 
     # simple alias dictionary for people (extendable)
     alias_map: Dict[str, str] = field(default_factory=lambda: {
-        "老张": "张三",
+        "鑰佸紶": "寮犱笁",
     })
 
     def build(self) -> None:
@@ -130,13 +130,9 @@ class EntityResolver:
         k: Optional[int] = None,
     ) -> List[Tuple[str, float]]:
         """
-        embeddings-only 的“聚焦查询”实现：
-        1) 对整句 query 编码；
-        2) 若存在规则法高置信候选（>=0.8），则将这些候选文本也编码；
-        3) 用 [query] + focus 的多路向量与候选向量矩阵计算相似度，逐候选取最大值；
-        4) 返回 Top‑k。
-        说明：build() 已对库向量做 L2 归一化，此处对查询向量再次归一化。
-        """
+        embeddings-only 鐨勨€滆仛鐒︽煡璇⑩€濆疄鐜帮細
+        1) 瀵规暣鍙?query 缂栫爜锛?        2) 鑻ュ瓨鍦ㄨ鍒欐硶楂樼疆淇″€欓€夛紙>=0.8锛夛紝鍒欏皢杩欎簺鍊欓€夋枃鏈篃缂栫爜锛?        3) 鐢?[query] + focus 鐨勫璺悜閲忎笌鍊欓€夊悜閲忕煩闃佃绠楃浉浼煎害锛岄€愬€欓€夊彇鏈€澶у€硷紱
+        4) 杩斿洖 Top鈥慿銆?        璇存槑锛歜uild() 宸插搴撳悜閲忓仛 L2 褰掍竴鍖栵紝姝ゅ瀵规煡璇㈠悜閲忓啀娆″綊涓€鍖栥€?        """
         if vecs is None or vecs.size == 0 or not cands:
             return []
         queries: List[str] = [query]
@@ -144,7 +140,7 @@ class EntityResolver:
             queries.extend(focus)
         embs = self.embedder.encode(queries).astype(np.float32)
         faiss.normalize_L2(embs)
-        # 余弦相似（已归一化）→ 点积
+        # 浣欏鸡鐩镐技锛堝凡褰掍竴鍖栵級鈫?鐐圭Н
         sims = embs @ vecs.T  # (m, N)
         best = sims.max(axis=0)  # (N,)
         topk = min(self.cfg.topk if k is None else k, len(cands))
@@ -162,13 +158,10 @@ class EntityResolver:
         k: Optional[int] = None,
     ) -> List[Tuple[str, float]]:
         """
-        FAISS 版本的“聚焦查询”：
-        - 将 [query] + focus 编码并归一化；
-        - 对每一路查询向量用 FAISS 在候选索引上检索 K_all=len(cands)；
-        - 对同一候选取多路分数的最大值；
-        - 返回 Top‑k。
-        说明：IndexFlatIP + 归一化 = 余弦相似，和 _vector_rank_with_focus 的度量保持一致。
-        """
+        FAISS 鐗堟湰鐨勨€滆仛鐒︽煡璇⑩€濓細
+        - 灏?[query] + focus 缂栫爜骞跺綊涓€鍖栵紱
+        - 瀵规瘡涓€璺煡璇㈠悜閲忕敤 FAISS 鍦ㄥ€欓€夌储寮曚笂妫€绱?K_all=len(cands)锛?        - 瀵瑰悓涓€鍊欓€夊彇澶氳矾鍒嗘暟鐨勬渶澶у€硷紱
+        - 杩斿洖 Top鈥慿銆?        璇存槑锛欼ndexFlatIP + 褰掍竴鍖?= 浣欏鸡鐩镐技锛屽拰 _vector_rank_with_focus 鐨勫害閲忎繚鎸佷竴鑷淬€?        """
         if idx is None or vecs is None or not cands:
             return []
         queries: List[str] = [query]
@@ -177,10 +170,8 @@ class EntityResolver:
         embs = self.embedder.encode(queries).astype(np.float32)
         faiss.normalize_L2(embs)
         n = len(cands)
-        # 初始化为极小值，便于逐路取最大
-        best = np.full(n, -1.0, dtype=np.float32)
-        K_all = n  # 小规模集合取全量，避免截断导致的漏召回
-        for i in range(embs.shape[0]):
+        # 鍒濆鍖栦负鏋佸皬鍊硷紝渚夸簬閫愯矾鍙栨渶澶?        best = np.full(n, -1.0, dtype=np.float32)
+        K_all = n  # 灏忚妯￠泦鍚堝彇鍏ㄩ噺锛岄伩鍏嶆埅鏂鑷寸殑婕忓彫鍥?        for i in range(embs.shape[0]):
             D, I = idx.search(embs[i:i+1], K_all)
             scores = D[0]
             ids = I[0]
@@ -201,11 +192,9 @@ class EntityResolver:
         if mode == "rules":
             return self._rule_rank(self.persons, q)
         if mode == "embeddings":
-            # 规则粗提（>=0.8）作为聚焦词，提升短实体名对齐的分数稳定性
-            focus = [cand for cand in self.persons if self._kw_score(q, cand) >= 0.8]
+            # 瑙勫垯绮楁彁锛?=0.8锛変綔涓鸿仛鐒﹁瘝锛屾彁鍗囩煭瀹炰綋鍚嶅榻愮殑鍒嗘暟绋冲畾鎬?            focus = [cand for cand in self.persons if self._kw_score(q, cand) >= 0.8]
             return self._vector_rank_with_focus(self._pers_vecs, self.persons, q, focus)
-        # hybrid（向量-only）：采用 FAISS 的“聚焦查询”与 embeddings 行为保持一致
-        focus = [cand for cand in self.persons if self._kw_score(q, cand) >= 0.8]
+        # hybrid锛堝悜閲?only锛夛細閲囩敤 FAISS 鐨勨€滆仛鐒︽煡璇⑩€濅笌 embeddings 琛屼负淇濇寔涓€鑷?        focus = [cand for cand in self.persons if self._kw_score(q, cand) >= 0.8]
         return self._faiss_rank_with_focus(self._idx_person, self._pers_vecs, self.persons, q, focus, k=self.cfg.topk)
 
     def resolve_task(self, query: str) -> List[Tuple[str, float]]:
@@ -215,8 +204,7 @@ class EntityResolver:
         if mode == "embeddings":
             focus = [cand for cand in self.tasks if self._kw_score(query, cand) >= 0.8]
             return self._vector_rank_with_focus(self._task_vecs, self.tasks, query, focus)
-        # hybrid（向量-only）：采用 FAISS 的“聚焦查询”与 embeddings 行为保持一致
-        focus = [cand for cand in self.tasks if self._kw_score(query, cand) >= 0.8]
+        # hybrid锛堝悜閲?only锛夛細閲囩敤 FAISS 鐨勨€滆仛鐒︽煡璇⑩€濅笌 embeddings 琛屼负淇濇寔涓€鑷?        focus = [cand for cand in self.tasks if self._kw_score(query, cand) >= 0.8]
         return self._faiss_rank_with_focus(self._idx_task, self._task_vecs, self.tasks, query, focus, k=self.cfg.topk)
 
 
@@ -245,8 +233,7 @@ class TaskQueryEngine:
             return
         persons = self.tasks_store.list_persons()
         tasks = self.tasks_store.list_tasks()
-        # 模式自适应阈值（可被运行时 thresh 覆盖）
-        mode = self.resolver_mode
+        # 妯″紡鑷€傚簲闃堝€硷紙鍙杩愯鏃?thresh 瑕嗙洊锛?        mode = self.resolver_mode
         def _default_thresh(m: str) -> float:
             m = (m or "hybrid").lower()
             if m == "rules":
@@ -305,25 +292,6 @@ class TaskQueryEngine:
         person_hits = self.resolver.resolve_person(q)[:topk]
         task_hits = self.resolver.resolve_task(q)[:topk]
 
-        # In hybrid_plus_rules, let rules lightly influence task ranking (vector still dominates)
-        mode_decide_rank = (self.resolver.cfg.mode or "hybrid").lower()
-        if mode_decide_rank == "hybrid_plus_rules" and task_hits:
-            lambda_rule = 0.15  # small weight for rule score
-            kw_tokens = ["接口", "联调"]
-            enriched: List[Tuple[str, float, float]] = []
-            for idx, (val, score_vec) in enumerate(task_hits):
-                rule_s = float(self.resolver._kw_score(q, val))
-                kw_bonus = 0.0
-                if any(tok in q and tok in val for tok in kw_tokens):
-                    kw_bonus = 0.05
-                score_final = float(score_vec) + lambda_rule * rule_s + kw_bonus
-                # strong rule priority: if very high rule score and currently in Top2/Top3, give extra boost
-                if rule_s >= 0.8 and idx in (1, 2):
-                    score_final += 0.2
-                enriched.append((val, float(score_vec), score_final))
-            enriched.sort(key=lambda x: x[2], reverse=True)
-            task_hits = [(v, sv) for (v, sv, _) in enriched]
-
         payload: Dict[str, Any] = {
             "intent": intent,
             "resolver_mode": self.resolver.cfg.mode,
@@ -339,7 +307,7 @@ class TaskQueryEngine:
         best_p = person_hits[0] if person_hits else None
         best_t = task_hits[0] if task_hits else None
         if not best_p or not best_t:
-            payload["answer"] = "未识别出人员或任务，请从候选中选择"
+            payload["answer"] = "鏈瘑鍒嚭浜哄憳鎴栦换鍔★紝璇蜂粠鍊欓€変腑閫夋嫨"
             return payload
 
         # New acceptance logic for vector-only modes (hybrid, hybrid_plus_rules)
@@ -367,30 +335,30 @@ class TaskQueryEngine:
                         low_conf = True
 
             if not p_ok or not t_ok:
-                payload["answer"] = "识别置信度不足，请确认候选是否正确"
+                payload["answer"] = "璇嗗埆缃俊搴︿笉瓒筹紝璇风‘璁ゅ€欓€夋槸鍚︽纭?
                 return payload
             # prevent legacy single-threshold check below from blocking
             self.resolver.cfg.thresh = 0.0
 
         if best_p[1] < self.resolver.cfg.thresh or best_t[1] < self.resolver.cfg.thresh:
-            payload["answer"] = "识别置信度不足，请确认候选是否正确"
+            payload["answer"] = "璇嗗埆缃俊搴︿笉瓒筹紝璇风‘璁ゅ€欓€夋槸鍚︽纭?
             return payload
 
         person = best_p[0]
         task = best_t[0]
         rec = self.tasks_store.get_latest_status(person, task)
         if not rec:
-            payload["answer"] = "未在任务库中找到对应记录"
+            payload["answer"] = "鏈湪浠诲姟搴撲腑鎵惧埌瀵瑰簲璁板綍"
             payload["person"] = person
             payload["task"] = task
             return payload
 
         status = str(rec.get("status", "")).upper()
         ts = int(rec.get("ts", -1))
-        ts_str = ts_to_str(ts) if ts >= 0 else "未知时间"
+        ts_str = ts_to_str(ts) if ts >= 0 else "鏈煡鏃堕棿"
 
-        zh_status = "已完成" if status == "DONE" else "未完成/待办"
-        answer = f"{person} 的「{task}」{zh_status}（最近更新时间：{ts_str}）"
+        zh_status = "宸插畬鎴? if status == "DONE" else "鏈畬鎴?寰呭姙"
+        answer = f"{person} 鐨勩€寋task}銆峽zh_status}锛堟渶杩戞洿鏂版椂闂达細{ts_str}锛?
 
         payload.update({
             "answer": answer,
@@ -402,7 +370,7 @@ class TaskQueryEngine:
         # annotate low confidence if accepted via weak rules
         try:
             if 'low_conf' in locals() and low_conf:
-                payload["answer"] = str(payload.get("answer", "")) + "，低置信度"
+                payload["answer"] = str(payload.get("answer", "")) + "锛屼綆缃俊搴?
         except Exception:
             pass
         return payload
