@@ -35,9 +35,15 @@ INTENT_STATUS_KWS = [
 @dataclass
 class ResolverConfig:
     topk: int = 3
-    alpha_vec: float = 1.0   # hybrid redefined as vector-only; keep 1.0
-    thresh: float = 0.58     # default; per-mode override below
+    alpha_vec: float = 1.0   # default; may be tuned per mode
+    thresh: float = 0.58     # default; may be overridden per mode
     mode: str = "hybrid"      # one of: "rules" | "embeddings" | "hybrid"
+    # Fine-grained controls (hybrid/hybrid_plus_rules)
+    thresh_person: Optional[float] = None
+    thresh_task: Optional[float] = None
+    delta_min: Optional[float] = None        # Top1-Top2 margin for weak accept
+    weak_task_min: Optional[float] = None    # low bar for weak accept
+    rules_assist_min: Optional[float] = None # relaxed low bar when rules strongly agree
 
 
 @dataclass
@@ -258,6 +264,23 @@ class TaskQueryEngine:
             cfg=cfg,
         )
         res.build()
+        # Per-mode defaults
+        m = (mode or "hybrid").lower()
+        if m == "hybrid":
+            # vector-only with FAISS focus; split thresholds and delta logic
+            res.cfg.thresh_person = 0.45
+            res.cfg.thresh_task = 0.40
+            res.cfg.delta_min = 0.09
+            res.cfg.weak_task_min = 0.40
+            res.cfg.alpha_vec = 1.0
+        elif m == "hybrid_plus_rules":
+            # vector-only ranking + rules-assisted gating (no linear fusion)
+            res.cfg.thresh_person = 0.45
+            res.cfg.thresh_task = 0.40
+            res.cfg.delta_min = 0.09
+            res.cfg.weak_task_min = 0.40
+            res.cfg.rules_assist_min = 0.37
+            res.cfg.alpha_vec = 0.9
         self.resolver = res
 
     def reload(self) -> Dict[str, Any]:
@@ -300,6 +323,36 @@ class TaskQueryEngine:
             payload["answer"] = "未识别出人员或任务，请从候选中选择"
             return payload
 
+        # New acceptance logic for vector-only modes (hybrid, hybrid_plus_rules)
+        low_conf = False
+        mode_decide = (self.resolver.cfg.mode or "hybrid").lower()
+        if mode_decide in ("hybrid", "hybrid_plus_rules"):
+            tp = 0.45 if getattr(self.resolver.cfg, "thresh_person", None) is None else float(self.resolver.cfg.thresh_person)
+            tt = 0.40 if getattr(self.resolver.cfg, "thresh_task", None) is None else float(self.resolver.cfg.thresh_task)
+            delta_min = 0.09 if getattr(self.resolver.cfg, "delta_min", None) is None else float(self.resolver.cfg.delta_min)
+            weak_min = (tt if getattr(self.resolver.cfg, "weak_task_min", None) is None else float(self.resolver.cfg.weak_task_min))
+
+            p_ok = best_p[1] >= tp
+            t_ok = best_t[1] >= tt
+            if not t_ok:
+                second_t = task_hits[1][1] if len(task_hits) > 1 else -1.0
+                if best_t[1] >= weak_min and (second_t >= 0) and (best_t[1] - second_t) >= delta_min:
+                    t_ok = True
+                    low_conf = True
+                elif mode_decide == "hybrid_plus_rules":
+                    # rules-assisted gating: strong rule agreement slightly relaxes the low bar
+                    rule_s = float(self.resolver._kw_score(q, best_t[0]))
+                    assist_min = (weak_min if getattr(self.resolver.cfg, "rules_assist_min", None) is None else float(self.resolver.cfg.rules_assist_min))
+                    if rule_s >= 0.8 and best_t[1] >= assist_min:
+                        t_ok = True
+                        low_conf = True
+
+            if not p_ok or not t_ok:
+                payload["answer"] = "识别置信度不足，请确认候选是否正确"
+                return payload
+            # prevent legacy single-threshold check below from blocking
+            self.resolver.cfg.thresh = 0.0
+
         if best_p[1] < self.resolver.cfg.thresh or best_t[1] < self.resolver.cfg.thresh:
             payload["answer"] = "识别置信度不足，请确认候选是否正确"
             return payload
@@ -327,4 +380,10 @@ class TaskQueryEngine:
             "status": status,
             "ts": ts,
         })
+        # annotate low confidence if accepted via weak rules
+        try:
+            if 'low_conf' in locals() and low_conf:
+                payload["answer"] = str(payload.get("answer", "")) + "，低置信度"
+        except Exception:
+            pass
         return payload
