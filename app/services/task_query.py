@@ -35,8 +35,8 @@ INTENT_STATUS_KWS = [
 @dataclass
 class ResolverConfig:
     topk: int = 3
-    alpha_vec: float = 0.65  # weight for vector score in fusion
-    thresh: float = 0.58     # acceptance threshold after fusion
+    alpha_vec: float = 1.0   # hybrid redefined as vector-only; keep 1.0
+    thresh: float = 0.58     # default; per-mode override below
     mode: str = "hybrid"      # one of: "rules" | "embeddings" | "hybrid"
 
 
@@ -145,6 +145,46 @@ class EntityResolver:
         order = np.argsort(-best)[:topk]
         return [(cands[int(i)], float(best[int(i)])) for i in order]
 
+    def _faiss_rank_with_focus(
+        self,
+        idx: Optional[faiss.Index],
+        vecs: Optional[np.ndarray],
+        cands: List[str],
+        query: str,
+        focus: List[str],
+        *,
+        k: Optional[int] = None,
+    ) -> List[Tuple[str, float]]:
+        """
+        FAISS 版本的“聚焦查询”：
+        - 将 [query] + focus 编码并归一化；
+        - 对每一路查询向量用 FAISS 在候选索引上检索 K_all=len(cands)；
+        - 对同一候选取多路分数的最大值；
+        - 返回 Top‑k。
+        说明：IndexFlatIP + 归一化 = 余弦相似，和 _vector_rank_with_focus 的度量保持一致。
+        """
+        if idx is None or vecs is None or not cands:
+            return []
+        queries: List[str] = [query]
+        if focus:
+            queries.extend(focus)
+        embs = self.embedder.encode(queries).astype(np.float32)
+        faiss.normalize_L2(embs)
+        n = len(cands)
+        # 初始化为极小值，便于逐路取最大
+        best = np.full(n, -1.0, dtype=np.float32)
+        K_all = n  # 小规模集合取全量，避免截断导致的漏召回
+        for i in range(embs.shape[0]):
+            D, I = idx.search(embs[i:i+1], K_all)
+            scores = D[0]
+            ids = I[0]
+            for s, j in zip(scores, ids):
+                if 0 <= j < n and s > best[j]:
+                    best[j] = float(s)
+        topk = min(self.cfg.topk if k is None else k, n)
+        order = np.argsort(-best)[:topk]
+        return [(cands[int(i)], float(best[int(i)])) for i in order]
+
     def resolve_person(self, query: str) -> List[Tuple[str, float]]:
         # alias substitution first
         q = query
@@ -158,21 +198,9 @@ class EntityResolver:
             # 规则粗提（>=0.8）作为聚焦词，提升短实体名对齐的分数稳定性
             focus = [cand for cand in self.persons if self._kw_score(q, cand) >= 0.8]
             return self._vector_rank_with_focus(self._pers_vecs, self.persons, q, focus)
-        # hybrid: collect wider candidates then fuse
-        vec_hits = self._search(self._idx_person, self._pers_vecs, self.persons, q, k=max(self.cfg.topk * 2, 10))
-        rule_hits = self._rule_rank(self.persons, q, k=max(self.cfg.topk * 2, 10))
-        table: Dict[str, Tuple[float, float]] = {}
-        for cand, vs in vec_hits:
-            table[cand] = (float(vs), float(table.get(cand, (0.0, 0.0))[1]))
-        for cand, ks in rule_hits:
-            cur = table.get(cand, (0.0, 0.0))
-            table[cand] = (float(cur[0]), float(ks))
-        fused: List[Tuple[str, float]] = []
-        a = float(self.cfg.alpha_vec)
-        for cand, (vs, ks) in table.items():
-            fused.append((cand, a * vs + (1 - a) * ks))
-        fused.sort(key=lambda x: x[1], reverse=True)
-        return fused[: self.cfg.topk]
+        # hybrid（向量-only）：采用 FAISS 的“聚焦查询”与 embeddings 行为保持一致
+        focus = [cand for cand in self.persons if self._kw_score(q, cand) >= 0.8]
+        return self._faiss_rank_with_focus(self._idx_person, self._pers_vecs, self.persons, q, focus, k=self.cfg.topk)
 
     def resolve_task(self, query: str) -> List[Tuple[str, float]]:
         mode = (self.cfg.mode or "hybrid").lower()
@@ -181,20 +209,9 @@ class EntityResolver:
         if mode == "embeddings":
             focus = [cand for cand in self.tasks if self._kw_score(query, cand) >= 0.8]
             return self._vector_rank_with_focus(self._task_vecs, self.tasks, query, focus)
-        vec_hits = self._search(self._idx_task, self._task_vecs, self.tasks, query, k=max(self.cfg.topk * 2, 10))
-        rule_hits = self._rule_rank(self.tasks, query, k=max(self.cfg.topk * 2, 10))
-        table: Dict[str, Tuple[float, float]] = {}
-        for cand, vs in vec_hits:
-            table[cand] = (float(vs), float(table.get(cand, (0.0, 0.0))[1]))
-        for cand, ks in rule_hits:
-            cur = table.get(cand, (0.0, 0.0))
-            table[cand] = (float(cur[0]), float(ks))
-        fused: List[Tuple[str, float]] = []
-        a = float(self.cfg.alpha_vec)
-        for cand, (vs, ks) in table.items():
-            fused.append((cand, a * vs + (1 - a) * ks))
-        fused.sort(key=lambda x: x[1], reverse=True)
-        return fused[: self.cfg.topk]
+        # hybrid（向量-only）：采用 FAISS 的“聚焦查询”与 embeddings 行为保持一致
+        focus = [cand for cand in self.tasks if self._kw_score(query, cand) >= 0.8]
+        return self._faiss_rank_with_focus(self._idx_task, self._task_vecs, self.tasks, query, focus, k=self.cfg.topk)
 
 
 def is_status_intent(q: str) -> bool:
@@ -230,7 +247,8 @@ class TaskQueryEngine:
                 return 0.8
             if m == "embeddings":
                 return 0.45
-            return 0.58  # hybrid
+            # hybrid redefined as vector-only; align threshold with embeddings
+            return 0.45  # hybrid
 
         cfg = ResolverConfig(mode=mode, thresh=_default_thresh(mode))
         res = EntityResolver(

@@ -9,7 +9,7 @@
 - 意图识别：关键词匹配（完成/未完成/状态/进度/是否完成/搞定/结束）
 - 实体解析（可切换三种模式）：
   - rules：规则/关键词/模糊匹配（字符归一化 + 等值/包含/字符重叠率）
-  - embeddings：中文句向量检索（bge-small-zh 等）+ FAISS Top‑k
+  - embeddings：中文句向量检索 + 矩阵法“聚焦查询”（[query]+focus 编码，逐候选取最大相似度）
   - hybrid：向量分与规则分加权融合（`alpha_vec`，默认 0.65）
 - 数据源：SQLite 只读任务库（`tasks` 表），取该人该任务的最新一条记录
 - 应答：中文结论（DONE→已完成；TODO→未完成/待办）+ 最近更新时间；置信度不足时返回候选而非报错
@@ -19,7 +19,7 @@
 
 ## 运行配置（与 API）
 
-- 端点：`GET /tasks/ask?q=...&topk=3&thresh=0.58`
+- 端点：`GET /tasks/ask?q=...&topk=3&thresh=0.45`
 - 主要环境变量：
   - `RESOLVER=rules|embeddings|hybrid`（默认 `hybrid`）
   - `MOCK_EMB=1|0`（mock 向量开关）
@@ -64,8 +64,8 @@ ORDER BY ts DESC, id DESC LIMIT 1
   "sql": "SELECT id, person, task, status, ts FROM tasks WHERE person = ? AND task = ? ORDER BY ts DESC, id DESC LIMIT 1",
   "intent": "status_query",
   "resolver_mode": "hybrid",
-  "alpha_vec": 0.65,
-  "thresh": 0.58,
+  "alpha_vec": 1.0,
+  "thresh": 0.45,
   "candidates": {
     "persons": [{"value": "张三", "score": 0.91}, ...],
     "tasks":   [{"value": "提交9月周报", "score": 0.88}, ...]
@@ -90,6 +90,9 @@ python scripts/init_tasks_sqlite.py
 - `GET /tasks/ask?q=老张九月报搞定了没？` → 别名映射“老张→张三”，口语可命中或返回合理候选
 
 遇到召回偏低可尝试：
+- 设为 `embeddings` 或 `hybrid`（两者均为“聚焦查询”：embeddings 用矩阵法，hybrid 用 FAISS，实现等价）
+- 适度下调 `thresh`（如 `0.5`）
+- 扩充别名词表（`EntityResolver.alias_map`）或任务名标准化
 - 将 `RESOLVER` 设为 `hybrid`，并适度下调 `thresh`（如 `0.5`）
 - 扩充别名词表（`EntityResolver.alias_map`）或任务名标准化
 

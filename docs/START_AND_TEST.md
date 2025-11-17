@@ -1,4 +1,4 @@
-﻿# Start and Test Guide 鈥?Minimal RAG Demo (FAISS + Milvus optional)
+﻿﻿# Start and Test Guide 鈥?Minimal RAG Demo (FAISS + Milvus optional)
 
 This guide shows how to run the API locally (best for VSCode hot-reload) and how to use a containerized Chinese embedding server (bge-small-zh). Milvus is optional and can be enabled later via compose profile.
 
@@ -144,6 +144,7 @@ curl "http://127.0.0.1:8000/tasks/ask?q=鑰佸紶涔濇湀鎶ユ悶瀹氫簡娌�
 ```
 
 Payload includes: `answer`, `status`, `person`, `task`, `ts`, `sql`, `resolver_mode`, `alpha_vec`, `thresh`, and `candidates` with scores.
+Note: in hybrid mode, `alpha_vec` is present but not used (hybrid is vector-only).
 
 ---
 
@@ -166,7 +167,7 @@ Payload includes: `answer`, `status`, `person`, `task`, `ts`, `sql`, `resolver_m
 - `MODEL_NAME` / `EMB_DIM` (e.g., `BAAI/bge-small-zh-v1.5` + `512`)
 - Milvus (optional later): `MILVUS_HOST`, `MILVUS_PORT`, `MILVUS_COLLECTION`
 
-Examples:
+Examples (hybrid = vector-only via FAISS Focus Query):
 
 ```powershell
 $env:STORE='faiss'; $env:RESOLVER='hybrid'; $env:EMB_URL='http://localhost:8080/embeddings'
@@ -209,7 +210,8 @@ B) With small model — hybrid (or embeddings)
 docker compose build embedder
 docker compose up -d embedder
 ='faiss'
-='hybrid'       # or 'embeddings' for pure vector
+='hybrid'       # vector-only via FAISS Focus Query (no rule fusion)
+# or use 'embeddings' for matrix-based Focus Query
 ='0'
 ='http://localhost:8080/embeddings'
 ='512'
@@ -271,5 +273,5 @@ Notes (New in Focus Query + Adaptive Thresholds)
 - Thresholds when `thresh` is omitted in `/tasks/ask`:
   - rules: 0.8
   - embeddings: 0.45
-  - hybrid: 0.58
+  - hybrid: 0.45
   You can still override by explicitly passing `&thresh=...`.

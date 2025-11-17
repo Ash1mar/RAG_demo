@@ -48,10 +48,10 @@ RAG_demo/
 
 ## Key Features
 
-- Vector search (FAISS default), keyword search, hybrid fusion
+- Vector search (FAISS default), keyword search; hybrid (vector-only for task resolver via FAISS focus)
 - Non‑LLM task ask (`/tasks/ask`) with:
   - Intent detection by keywords (完成/未完成/状态/进度/是否完成/搞定/结束)
-  - Entity resolution: rules / embeddings / hybrid (configurable)
+  - Entity resolution: rules / embeddings / hybrid (configurable; hybrid = vector-only via FAISS Focus Query, no rule fusion)
   - SQLite read‑only task store; returns answer + SQL + candidates with scores
 - Embeddings options:
   - Mock (no downloads) for quick start
@@ -98,8 +98,9 @@ See `.env.example` for a reference layout.
 ## What’s New
 
 - Embeddings‑only Focus Query: when `RESOLVER=embeddings`, the resolver first extracts rule‑high candidates (>=0.8) and uses them as focused queries alongside the full sentence. Scores take the max over these queries, improving alignment for short entity names.
+- Hybrid redefined for Task Q&A: `RESOLVER=hybrid` is now vector‑only and applies the same Focus Query behavior via FAISS (no rule fusion).
 - Mode‑adaptive thresholds (used when `thresh` is omitted in `/tasks/ask`):
   - rules: 0.8
   - embeddings: 0.45
-  - hybrid: 0.58
+  - hybrid: 0.45
   You can still provide `thresh` explicitly to override.
