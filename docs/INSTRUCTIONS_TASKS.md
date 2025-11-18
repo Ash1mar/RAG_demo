@@ -76,7 +76,7 @@ ORDER BY ts DESC, id DESC LIMIT 1
     "tasks":   [{"value": "提交9月周报", "score": 0.88}]
   },
   "nl_ir": {
-    "...": "TaskQuerySpec (见下)"
+    "...": "TaskQuerySpec（见下）"
   }
 }
 ```
@@ -94,7 +94,6 @@ python scripts/init_tasks_sqlite.py
 ```
 
 典型请求（预期结果）：
-
 - `GET /tasks/ask?q=张三的提交9月周报完成了吗？` → 期望 `DONE`（已完成）。
 - `GET /tasks/ask?q=张三的E3D接口联调现在什么状态？` → 期望 `TODO`（未完成 / 待办）。
 - `GET /tasks/ask?q=李四的整理工艺包V2是否已完成？` → 期望 `DONE`（已完成）。
@@ -132,7 +131,7 @@ python scripts/init_tasks_sqlite.py
 
 ## 性能与只读安全
 
-- SQLite 只读连接（URI 模式），超时（默认 2s），查询均 `LIMIT` 控制。
+- SQLite 只读连接（URI 模式），超时（默认 2s），查询均有 `LIMIT` 控制。
 - 嵌入来源三选一：`MOCK_EMB=1`（mock）、本地 SBERT、容器化嵌入服务（`EMB_URL`）。
 - Windows 推荐只用 FAISS；Milvus 通过 compose profile `milvus` 显式开启。
 
@@ -170,10 +169,10 @@ python scripts/init_tasks_sqlite.py
 3. 调用 `compile_tasks_sql(spec)`（模块 `app/services/sql_compiler.py`）生成只读 SQL + 参数。
 4. 使用 `SQLiteTasksStore.query(sql, params)` 执行查询。
 5. 返回 JSON payload，包括：
-   - `query`：原始 NL。
-   - `ir`：序列化后的 `TaskQuerySpec`。
-   - `sql`：生成的 SQL 字符串。
-   - `params`：参数元组。
+   - `query`：原始 NL；
+   - `ir`：序列化后的 `TaskQuerySpec`；
+   - `sql`：生成的 SQL 字符串；
+   - `params`：参数元组；
    - `rows`：从 `tasks` 表查出的原始记录列表。
 
 ### 注意事项
@@ -181,4 +180,20 @@ python scripts/init_tasks_sqlite.py
 - `/db/ask` 不生成自然语言回答，只返回结构化 JSON，用于调试 NL→JSON→SQL 链路。
 - 不会影响 `/tasks/ask` 的现有逻辑。
 - 若 IR 不完整或无法安全编译为 SQL，会返回 4xx，并在 `detail.reason` 中给出原因。
+
+### 测试文件说明：`tests/test_nl2sql_db_ask.py`
+
+为保证 NL→JSON→SQL 的实现可回归，本项目提供了一个基础单元测试文件：`tests/test_nl2sql_db_ask.py`，主要验证：
+
+- **IR 层测试**：
+  - 直接调用 `parse_task_query_nl("张三的E3D接口联调现在什么状态？")`，断言解析出的 `intent`、`person`、`task`、`limit`、`order_by` 等字段符合预期。
+- **SQL 编译层测试**：
+  - 手工构造一个 `TaskQuerySpec`（如 `person="张三"`, `task="E3D接口联调"`），调用 `compile_tasks_sql(spec)`，检查生成的 SQL：
+    - 仅为 `SELECT ... FROM tasks ...`；
+    - 包含 `WHERE person = ? AND task = ?` 子句；
+    - 绑定的参数元组与预期一致。
+- **API 层测试**：
+  - 使用 FastAPI `TestClient` 调用 `/db/ask`，验证返回 JSON 中存在 `query`、`ir`、`sql`、`params`、`rows`，并且对于不合法 query（如空字符串）返回 4xx 且带有错误原因。
+
+这些测试聚焦于“语义 IR 输出”和“生成 SQL/查询结果”的正确性，而不是内部实现细节，因此后续即使将 `parse_task_query_nl` 替换为真实 LLM，只要保持 IR 语义和 SQL 行为一致，测试仍可复用。
 

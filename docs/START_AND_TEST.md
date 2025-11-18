@@ -1,6 +1,6 @@
 # Start and Test Guide – Minimal RAG Demo (FAISS + Milvus optional)
 
-This guide shows how to run the API locally (best for VSCode hot‑reload) and how to use a containerized Chinese embedding server (bge-small-zh). Milvus is optional and can be enabled later via compose profile.
+This guide shows how to run the API locally (best for VSCode hot‑reload), how to use a containerized Chinese embedding server (bge-small-zh), and how to validate the NL→JSON→SQL pipeline for task status queries. Milvus is optional and can be enabled later via compose profile.
 
 ---
 
@@ -218,7 +218,38 @@ Expected outcome:
 
 ---
 
-## 9) Environment Variables
+## 9) NL→JSON→SQL Tests (pytest)
+
+To validate the NL→JSON→SQL pipeline end‑to‑end, a small pytest module is provided:
+
+- File: `tests/test_nl2sql_db_ask.py`
+- It covers three layers:
+  - **IR layer**: calls `parse_task_query_nl("张三的E3D接口联调现在什么状态？")` and asserts that `intent`, `person`, `task`, `limit`, and `order_by` are parsed as expected.
+  - **SQL compiler layer**: constructs a `TaskQuerySpec` by hand and calls `compile_tasks_sql(spec)`, checking that the generated SQL:
+    - is a `SELECT ... FROM tasks ...` query
+    - contains the expected `WHERE person = ? AND task = ?` clause
+    - binds the correct parameters.
+  - **API layer**: uses FastAPI’s `TestClient` to call `/db/ask`, asserting that the JSON payload includes `query`, `ir`, `sql`, `params`, and `rows`, and that invalid queries return a 4xx error.
+
+Prerequisites:
+- Make sure you have installed test dependencies (pytest, httpx, etc.) via `pip install -r requirements.txt` (or add them as needed).
+- Ensure the tasks DB is initialized once:
+
+```bash
+python scripts/init_tasks_sqlite.py
+```
+
+Run tests (from project root):
+
+```bash
+pytest -q tests/test_nl2sql_db_ask.py
+```
+
+This validates that NL→JSON parsing, JSON→SQL compilation, and the `/db/ask` endpoint stay consistent. If you later swap out the internal implementation of `parse_task_query_nl` (for example, to call a real LLM), these tests should still pass as long as the IR semantics and SQL behavior remain compatible.
+
+---
+
+## 10) Environment Variables
 
 - `STORE` = `faiss` (default) or `milvus`
 - `DATA_DIR` = `data` (FAISS persistence dir)
@@ -237,7 +268,7 @@ uvicorn app.demo_app:app --reload
 
 ---
 
-## 10) Notes – Focus Query, Adaptive Thresholds, hybrid_plus_rules, NL→JSON IR
+## 11) Notes – Focus Query, Adaptive Thresholds, hybrid_plus_rules, NL→JSON IR
 
 - Embeddings‑only Focus Query (`$env:RESOLVER='embeddings'`):
   - The API first extracts high‑confidence rule candidates (>= 0.8) and sends them alongside the full sentence to the embedder; the final score per candidate is the max similarity across these queries.
