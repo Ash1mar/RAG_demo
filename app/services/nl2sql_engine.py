@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import List, Optional, Dict, Any
+from os import getenv
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
+
+from app.services.llm_client import get_llm_client
 
 
 class TaskQueryIntent(str, Enum):
@@ -104,32 +107,67 @@ class TaskQuerySpec(BaseModel):
     )
 
 
+_USE_LLM_FOR_NL2SQL = getenv("TASKS_NL2SQL_LLM", "0") == "1"
+
+
 def parse_task_query_nl(q: str) -> TaskQuerySpec:
     """从自然语言任务查询句子中，抽取结构化语义 IR（TaskQuerySpec）。
 
-    当前实现说明（占位 / 规则版）：
-    - 只做非常轻量的规则解析，便于先打通 NL→JSON→SQL 的整体流程；
-    - 不访问数据库、不生成 SQL；
-    - 不依赖 FastAPI 和存储实现，可以在服务层和 API 层单独调用。
+    当前实现说明：
+    - 默认使用轻量规则解析 `_rule_based_parse_task_query_nl`，不访问数据库、不生成 SQL；
+    - 当环境变量 `TASKS_NL2SQL_LLM=1` 时，会优先尝试通过 LLMClient 抽象
+      （app.services.llm_client.get_llm_client）生成 IR，失败时自动回退到规则解析。
 
     未来演进方向：
-    - 在本函数内部接入小模型/LLM，通过 prompt 让模型直接输出符合 TaskQuerySpec
-      JSON Schema 的结构化对象，再用 TaskQuerySpec.parse_obj(...) 做校验；
-    - 或者将本函数改为包装器：负责调用外部 LLM 服务，并处理异常/兜底逻辑。
+    - 在 LLMClient 实现中接入真实 LLM（如 OpenAI/DeepSeek/国产大模型），
+      通过 prompt 让模型直接输出符合 TaskQuerySpec JSON Schema 的结构化对象，
+      再用 TaskQuerySpec.parse_obj(...) 做校验；
+    - 对上层调用方（TaskQueryEngine、SQL 编译器）保持接口稳定，只关心 TaskQuerySpec。
     """
 
     text = (q or "").strip()
     if not text:
         return TaskQuerySpec(intent=TaskQueryIntent.unknown, raw_query=q)
 
-    # —— 1) 粗略识别意图 —— #
+    # 可选：优先尝试通过 LLMClient 解析 IR（由环境变量控制）
+    if _USE_LLM_FOR_NL2SQL:
+        try:
+            client = get_llm_client()
+            raw = client.generate_task_query_spec(text)
+            spec = TaskQuerySpec.parse_obj(raw)
+            # 确保保留原始 query
+            if not spec.raw_query:
+                spec.raw_query = q
+            # 标注来源，便于调试
+            spec.extra.setdefault("nl2sql_source", "llm")
+            return spec
+        except Exception:
+            # 安全兜底：LLM 解析失败时退回规则解析
+            pass
+
+    # 规则版本解析（当前主实现）
+    spec = _rule_based_parse_task_query_nl(text)
+    spec.raw_query = q
+    spec.extra.setdefault("nl2sql_source", "rules")
+    return spec
+
+
+def _rule_based_parse_task_query_nl(q: str) -> TaskQuerySpec:
+    """规则版 NL→JSON 解析实现。
+
+    只做非常轻量的规则解析，便于先打通 NL→JSON→SQL 的整体流程；
+    不访问数据库、不生成 SQL；可被 LLM 版本替换或作为兜底。
+    """
+    text = q.strip()
+
+    # 1) 粗略识别意图
     intent = TaskQueryIntent.task_status_single
     if any(kw in text for kw in ("列表", "有哪些", "所有", "全部")):
         intent = TaskQueryIntent.task_status_list
     if any(kw in text for kw in ("张三", "李四", "老王", "老张")) and "有哪些" in text:
         intent = TaskQueryIntent.task_list_by_person
 
-    # —— 2) 粗略解析人名 & 任务文本 —— #
+    # 2) 粗略解析人名 & 任务文本
     person: Optional[str] = None
     task: Optional[str] = None
 
@@ -144,14 +182,14 @@ def parse_task_query_nl(q: str) -> TaskQuerySpec:
         # 没有“的”，暂不做复杂切分，全部作为任务描述
         task = text
 
-    # —— 3) 粗略识别状态过滤 —— #
+    # 3) 粗略识别状态过滤
     status: List[TaskStatus] = []
     if any(kw in text for kw in ("完成了吗", "完成了没", "搞定了没", "搞定没有", "done")):
         status = [TaskStatus.DONE]
     elif any(kw in text for kw in ("未完成", "没完成", "还没做", "待办", "todo")):
         status = [TaskStatus.TODO]
 
-    # —— 4) 默认排序 & limit —— #
+    # 4) 默认排序 & limit
     order_by = [OrderBySpec(field="ts", direction=OrderByDirection.desc)]
     limit = 10
 

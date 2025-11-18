@@ -5,10 +5,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
 import faiss
+import numpy as np
 
 from app.services.embeddings import Embedder
+from app.services.nl2sql_engine import parse_task_query_nl
+from app.services.sql_compiler import compile_tasks_sql, TaskSqlCompileError
 from app.tasks_store.base import TasksStore
 
 
@@ -37,7 +39,7 @@ class ResolverConfig:
     topk: int = 3
     alpha_vec: float = 1.0   # default; may be tuned per mode
     thresh: float = 0.58     # default; may be overridden per mode
-    mode: str = "hybrid"      # one of: "rules" | "embeddings" | "hybrid"
+    mode: str = "hybrid"     # one of: "rules" | "embeddings" | "hybrid" | "hybrid_plus_rules"
     # Fine-grained controls (hybrid/hybrid_plus_rules)
     thresh_person: Optional[float] = None
     thresh_task: Optional[float] = None
@@ -66,8 +68,12 @@ class EntityResolver:
 
     def build(self) -> None:
         # Use original strings (keep case/punct for embeddings), normalization is only for rules
-        p_vecs = self.embedder.encode(self.persons).astype(np.float32) if self.persons else np.zeros((0, self.embedder.dim), dtype=np.float32)
-        t_vecs = self.embedder.encode(self.tasks).astype(np.float32) if self.tasks else np.zeros((0, self.embedder.dim), dtype=np.float32)
+        p_vecs = self.embedder.encode(self.persons).astype(np.float32) if self.persons else np.zeros(
+            (0, self.embedder.dim), dtype=np.float32
+        )
+        t_vecs = self.embedder.encode(self.tasks).astype(np.float32) if self.tasks else np.zeros(
+            (0, self.embedder.dim), dtype=np.float32
+        )
         if p_vecs.size:
             faiss.normalize_L2(p_vecs)
         if t_vecs.size:
@@ -96,7 +102,15 @@ class EntityResolver:
         union = len(qset | cset) or 1
         return inter / union
 
-    def _search(self, idx: Optional[faiss.Index], vecs: Optional[np.ndarray], cands: List[str], query: str, *, k: Optional[int] = None) -> List[Tuple[str, float]]:
+    def _search(
+        self,
+        idx: Optional[faiss.Index],
+        vecs: Optional[np.ndarray],
+        cands: List[str],
+        query: str,
+        *,
+        k: Optional[int] = None,
+    ) -> List[Tuple[str, float]]:
         if idx is None or vecs is None or not cands:
             return []
         qv = self.embedder.encode([query]).astype(np.float32)
@@ -131,7 +145,7 @@ class EntityResolver:
     ) -> List[Tuple[str, float]]:
         """
         embeddings-only 的“聚焦查询”实现：
-        1) 对整句 query 编码；
+        1) 对完整 query 编码；
         2) 若存在规则法高置信候选（>=0.8），则将这些候选文本也编码；
         3) 用 [query] + focus 的多路向量与候选向量矩阵计算相似度，逐候选取最大值；
         4) 返回 Top‑k。
@@ -144,8 +158,7 @@ class EntityResolver:
             queries.extend(focus)
         embs = self.embedder.encode(queries).astype(np.float32)
         faiss.normalize_L2(embs)
-        # 余弦相似（已归一化）→ 点积
-        sims = embs @ vecs.T  # (m, N)
+        sims = embs @ vecs.T  # (m, N) 余弦相似（已归一化）= 点积
         best = sims.max(axis=0)  # (N,)
         topk = min(self.cfg.topk if k is None else k, len(cands))
         order = np.argsort(-best)[:topk]
@@ -163,7 +176,7 @@ class EntityResolver:
     ) -> List[Tuple[str, float]]:
         """
         FAISS 版本的“聚焦查询”：
-        - 将 [query] + focus 编码并归一化；
+        - 用 [query] + focus 编码并归一化；
         - 对每一路查询向量用 FAISS 在候选索引上检索 K_all=len(cands)；
         - 对同一候选取多路分数的最大值；
         - 返回 Top‑k。
@@ -177,11 +190,10 @@ class EntityResolver:
         embs = self.embedder.encode(queries).astype(np.float32)
         faiss.normalize_L2(embs)
         n = len(cands)
-        # 初始化为极小值，便于逐路取最大
         best = np.full(n, -1.0, dtype=np.float32)
         K_all = n  # 小规模集合取全量，避免截断导致的漏召回
         for i in range(embs.shape[0]):
-            D, I = idx.search(embs[i:i+1], K_all)
+            D, I = idx.search(embs[i : i + 1], K_all)
             scores = D[0]
             ids = I[0]
             for s, j in zip(scores, ids):
@@ -204,7 +216,7 @@ class EntityResolver:
             # 规则粗提（>=0.8）作为聚焦词，提升短实体名对齐的分数稳定性
             focus = [cand for cand in self.persons if self._kw_score(q, cand) >= 0.8]
             return self._vector_rank_with_focus(self._pers_vecs, self.persons, q, focus)
-        # hybrid（向量-only）：采用 FAISS 的“聚焦查询”与 embeddings 行为保持一致
+        # hybrid（向量 only）：采用 FAISS 的聚焦查询，与 embeddings 行为保持一致
         focus = [cand for cand in self.persons if self._kw_score(q, cand) >= 0.8]
         return self._faiss_rank_with_focus(self._idx_person, self._pers_vecs, self.persons, q, focus, k=self.cfg.topk)
 
@@ -215,7 +227,7 @@ class EntityResolver:
         if mode == "embeddings":
             focus = [cand for cand in self.tasks if self._kw_score(query, cand) >= 0.8]
             return self._vector_rank_with_focus(self._task_vecs, self.tasks, query, focus)
-        # hybrid（向量-only）：采用 FAISS 的“聚焦查询”与 embeddings 行为保持一致
+        # hybrid（向量 only）：采用 FAISS 的聚焦查询，与 embeddings 行为保持一致
         focus = [cand for cand in self.tasks if self._kw_score(query, cand) >= 0.8]
         return self._faiss_rank_with_focus(self._idx_task, self._task_vecs, self.tasks, query, focus, k=self.cfg.topk)
 
@@ -245,8 +257,10 @@ class TaskQueryEngine:
             return
         persons = self.tasks_store.list_persons()
         tasks = self.tasks_store.list_tasks()
+
         # 模式自适应阈值（可被运行时 thresh 覆盖）
         mode = self.resolver_mode
+
         def _default_thresh(m: str) -> float:
             m = (m or "hybrid").lower()
             if m == "rules":
@@ -292,6 +306,28 @@ class TaskQueryEngine:
         }
 
     def answer(self, q: str, topk: int = 3, thresh: Optional[float] = None) -> Dict[str, Any]:
+        """Main entry for non‑LLM task status queries.
+
+        说明：
+        - 默认行为（rules/embeddings/hybrid/hybrid_plus_rules）保持不变，作为 legacy 解析路径；
+        - 当 resolver_mode 显式设置为 "nl2sql" 时，会优先尝试 NL→JSON→SQL 分支，
+          失败时回退到 legacy 行为。该模式仅用于本地调试和灰度实验。
+        """
+        mode_raw = (self.resolver_mode or "hybrid").lower()
+        nl2sql_attempted = False
+        nl2sql_error: Optional[Dict[str, Any]] = None
+        if mode_raw == "nl2sql":
+            nl2sql_attempted = True
+            try:
+                return self._answer_via_nl2sql(q)
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                nl2sql_error = {
+                    "resolver_mode": "nl2sql_failed_fallback_legacy",
+                    "nl2sql_error": "unexpected_failure",
+                    "nl2sql_reason": str(exc),
+                }
+                # fall through to legacy behavior
+
         self.ensure_built()
         assert self.resolver is not None
 
@@ -349,7 +385,7 @@ class TaskQueryEngine:
             tp = 0.45 if getattr(self.resolver.cfg, "thresh_person", None) is None else float(self.resolver.cfg.thresh_person)
             tt = 0.40 if getattr(self.resolver.cfg, "thresh_task", None) is None else float(self.resolver.cfg.thresh_task)
             delta_min = 0.09 if getattr(self.resolver.cfg, "delta_min", None) is None else float(self.resolver.cfg.delta_min)
-            weak_min = (tt if getattr(self.resolver.cfg, "weak_task_min", None) is None else float(self.resolver.cfg.weak_task_min))
+            weak_min = tt if getattr(self.resolver.cfg, "weak_task_min", None) is None else float(self.resolver.cfg.weak_task_min)
 
             p_ok = best_p[1] >= tp
             t_ok = best_t[1] >= tt
@@ -361,7 +397,9 @@ class TaskQueryEngine:
                 elif mode_decide == "hybrid_plus_rules":
                     # rules-assisted gating: strong rule agreement slightly relaxes the low bar
                     rule_s = float(self.resolver._kw_score(q, best_t[0]))
-                    assist_min = (weak_min if getattr(self.resolver.cfg, "rules_assist_min", None) is None else float(self.resolver.cfg.rules_assist_min))
+                    assist_min = weak_min if getattr(self.resolver.cfg, "rules_assist_min", None) is None else float(
+                        self.resolver.cfg.rules_assist_min
+                    )
                     if rule_s >= 0.8 and best_t[1] >= assist_min:
                         t_ok = True
                         low_conf = True
@@ -392,17 +430,96 @@ class TaskQueryEngine:
         zh_status = "已完成" if status == "DONE" else "未完成/待办"
         answer = f"{person} 的「{task}」{zh_status}（最近更新时间：{ts_str}）"
 
-        payload.update({
-            "answer": answer,
-            "person": person,
-            "task": task,
-            "status": status,
-            "ts": ts,
-        })
+        payload.update(
+            {
+                "answer": answer,
+                "person": person,
+                "task": task,
+                "status": status,
+                "ts": ts,
+            }
+        )
         # annotate low confidence if accepted via weak rules
         try:
-            if 'low_conf' in locals() and low_conf:
+            if "low_conf" in locals() and low_conf:
                 payload["answer"] = str(payload.get("answer", "")) + "，低置信度"
         except Exception:
             pass
+        if nl2sql_attempted and nl2sql_error is not None:
+            payload.update(nl2sql_error)
         return payload
+
+    def _answer_via_nl2sql(self, q: str) -> Dict[str, Any]:
+        """Experimental NL→JSON→SQL resolver path.
+
+        流程：
+        1. 调用 parse_task_query_nl(q) 得到 TaskQuerySpec 语义 IR；
+        2. 调用 compile_tasks_sql(spec) 生成只读 SQL 和参数；
+        3. 使用 tasks_store.query(sql, params) 执行查询；
+
+        该分支是未来切换到 NL2SQL 的扩展点，目前仅在 resolver_mode="nl2sql"
+        时用于本地调试/灰度，不改变默认 /tasks/ask 行为。
+        """
+        intent = "status_query" if is_status_intent(q) else "unknown"
+        payload: Dict[str, Any] = {
+            "intent": intent,
+            "resolver_mode": "nl2sql",
+        }
+
+        # 1) NL -> IR
+        try:
+            spec = parse_task_query_nl(q)
+            payload["nl_ir"] = spec.dict()
+        except Exception as exc:
+            payload["error"] = "nl2sql_parse_failed"
+            payload["reason"] = str(exc)
+            return payload
+
+        # 2) IR -> SQL
+        try:
+            compiled = compile_tasks_sql(spec)
+        except TaskSqlCompileError as exc:
+            payload["error"] = "nl2sql_compile_failed"
+            payload["reason"] = str(exc)
+            return payload
+
+        payload["sql"] = compiled.sql
+        payload["params"] = compiled.params
+
+        # 3) 执行 SQL（要求 tasks_store 提供 query(...) 辅助方法）
+        query_fn = getattr(self.tasks_store, "query", None)
+        if query_fn is None:
+            payload["error"] = "nl2sql_query_not_supported_by_tasks_store"
+            return payload
+
+        try:
+            rows = query_fn(compiled.sql, compiled.params)
+        except Exception as exc:  # pragma: no cover - defensive
+            payload["error"] = "nl2sql_db_query_failed"
+            payload["reason"] = str(exc)
+            return payload
+
+        payload["rows"] = rows
+
+        # 有结果时，构造一个简要的人类可读回答；否则仅返回 rows
+        if rows:
+            rec = rows[0]
+            person = rec.get("person")
+            task = rec.get("task")
+            status = str(rec.get("status", "")).upper()
+            ts = int(rec.get("ts", -1))
+            ts_str = ts_to_str(ts) if ts >= 0 else "未知时间"
+            zh_status = "已完成" if status == "DONE" else "未完成/待办"
+            payload.update(
+                {
+                    "answer": f"{person} 的「{task}」{zh_status}（最近更新时间：{ts_str}）",
+                    "person": person,
+                    "task": task,
+                    "status": status,
+                    "ts": ts,
+                }
+            )
+        else:
+            payload["answer"] = "未在任务库中找到匹配记录（NL2SQL）"
+        return payload
+
