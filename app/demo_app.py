@@ -14,7 +14,7 @@ from app.services.hybrid import merge_scores
 from app.services.keyword import KeywordIndex
 from app.vector_store.faiss_store import FaissVectorStore
 from app.services.task_query import TaskQueryEngine
-from app.services.nl2sql_engine import parse_task_query_nl
+from app.services.nl2sql_engine import parse_task_query_nl, build_task_query_plan
 from app.services.sql_compiler import compile_tasks_sql, TaskSqlCompileError
 from app.tasks_store.base import TasksStore
 from app.tasks_store.sqlite_store import SQLiteTasksStore, SQLiteTasksConfig
@@ -22,7 +22,7 @@ from app.tasks_store.sqlite_store import SQLiteTasksStore, SQLiteTasksConfig
 
 app = FastAPI(title="Minimal RAG Demo", version="0.1.0")
 
-# ---- Global singletons (demo 级；生产迁移到 DI/Factory) ----
+# ---- Global singletons (demo 级；生产迁移) ----
 EMBEDDER = Embedder(
     model_name=getenv("MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2"),
     use_mock=getenv("MOCK_EMB", "0") == "1",
@@ -137,7 +137,7 @@ def task_status(person: str, task: str) -> Dict[str, Any]:
     """Return latest status for a given person+task.
 
     Example queries (for local sample DB):
-    - 张三, 提交9月周报  -> DONE
+    - 张三, 提交9月周报? -> DONE
     - 张三, E3D接口联调  -> TODO
     - 李四, 整理工艺包V2 -> DONE
     """
@@ -160,34 +160,30 @@ def task_status(person: str, task: str) -> Dict[str, Any]:
 
 @app.get("/tasks/ask")
 def tasks_ask(q: str, topk: int = 3, thresh: Optional[float] = None) -> Dict[str, Any]:
-    """无模型问数：解析人名/任务名 -> 查询 SQLite 最新状态 -> 生成中文回答。
+    """
 
-    调试输出包含：候选与分数、SQL 模板、解析出的 person/task。
+ 
     """
     if not q.strip():
         raise HTTPException(400, "empty query")
-    # NL -> 任务查询语义 IR（中间表示），仅做结构化解析，不访问数据库/不生成 SQL
+    
     ir = parse_task_query_nl(q)
     payload = TQ_ENGINE.answer(q, topk=topk, thresh=thresh)
     try:
         payload["nl_ir"] = ir.dict()
+        # 
+        #
+        payload["ir"] = build_task_query_plan(ir)
     except Exception:
         payload["nl_ir"] = {"raw_query": q, "error": "failed_to_serialize_ir"}
+        payload["ir"] = {"raw_query": q, "error": "failed_to_build_query_plan"}
     return payload
-
-
 @app.get("/db/ask")
 def db_ask(q: str = Query(..., description="Natural language task query for direct NL→JSON→SQL experiment")) -> Dict[str, Any]:
-    """NL→JSON→SQL 闭环实验端点：直接以 tasks 表为目标的只读查询。
-
-    流程：
-    1. 调用 parse_task_query_nl(q) 得到 TaskQuerySpec 语义 IR；
-    2. 调用 compile_tasks_sql(spec) 生成只读 SQL 和参数；
-    3. 使用 SQLiteTasksStore.query(sql, params) 执行查询；
-    4. 返回结构化 JSON，包含原始 query、IR、SQL 和 rows，用于调试 NL→SQL 链路。
-
-    注意：本端点不会生成自然语言回答，也不会替代 /tasks/ask 的逻辑。
-    """
+    """NL→JSON→SQL 闭环实验端点：直接以 tasks 表为目标的只读查询?
+    流程?    1. 调用 parse_task_query_nl(q) 得到 TaskQuerySpec 语义 IR?    2. 调用 compile_tasks_sql(spec) 生成只读 SQL 和参数；
+    3. 使用 SQLiteTasksStore.query(sql, params) 执行查询?    4. 返回结构�?JSON，包含原�?query、IR、SQL ?rows，用于调?NL→SQL 链路?
+    注意：本端点不会生成自然语言回答，也不会替代 /tasks/ask 的逻辑?    """
     text = (q or "").strip()
     if not text:
         raise HTTPException(400, "empty query")
@@ -195,7 +191,7 @@ def db_ask(q: str = Query(..., description="Natural language task query for dire
     # 1) NL -> IR
     spec = parse_task_query_nl(text)
 
-    # 2) IR -> SQL（只读、tasks 单表）
+    # 2) IR -> SQL（只读、tasks 单表）    
     try:
         compiled = compile_tasks_sql(spec)
     except TaskSqlCompileError as exc:
@@ -219,7 +215,7 @@ def db_ask(q: str = Query(..., description="Natural language task query for dire
             },
         )
 
-    # 4) 汇总调试信息
+    # 4) 
     return {
         "query": text,
         "ir": spec.dict(),
@@ -231,7 +227,7 @@ def db_ask(q: str = Query(..., description="Natural language task query for dire
 
 @app.post("/tasks/reload")
 def tasks_reload() -> Dict[str, Any]:
-    """重建实体解析索引（从数据库重新加载候选）。"""
+    """�ؽ�ʵ����������������ݿ����¼��غ�ѡ��"""
     return {"reloaded": True, **TQ_ENGINE.reload()}
 
 

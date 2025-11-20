@@ -9,7 +9,11 @@ import faiss
 import numpy as np
 
 from app.services.embeddings import Embedder
-from app.services.nl2sql_engine import parse_task_query_nl
+from app.services.nl2sql_engine import (
+    parse_task_query_nl,
+    build_task_query_plan,
+    TaskQueryIntent,
+)
 from app.services.sql_compiler import compile_tasks_sql, TaskSqlCompileError
 from app.tasks_store.base import TasksStore
 
@@ -454,14 +458,13 @@ class TaskQueryEngine:
         return payload
 
     def _answer_via_hybrid_llm(self, q: str, topk: int = 3, thresh: Optional[float] = None) -> Dict[str, Any]:
-        """NL→JSON（可由 LLM 提供）+ hybrid 向量对齐 + SQL compiler 的实验分支."""
-        intent = "status_query" if is_status_intent(q) else "unknown"
+        """NL->JSON (LLM/rules) + hybrid entity alignment + SQL compiler."""
         payload: Dict[str, Any] = {
-            "intent": intent,
+            "intent": "unknown",
             "resolver_mode": "hybrid_llm",
         }
 
-        # 1) NL -> IR（LLM/规则），用于抽取 person / task 等结构化字段
+        # 1) NL -> IR (LLM/rules)
         try:
             spec = parse_task_query_nl(q)
             payload["nl_ir"] = spec.dict()
@@ -469,6 +472,20 @@ class TaskQueryEngine:
             payload["error"] = "hybrid_llm_parse_failed"
             payload["reason"] = str(exc)
             return payload
+
+        # Map fine-grained TaskQueryIntent to coarse-grained label.
+        spec_intent = getattr(spec, "intent", None)
+        if isinstance(spec_intent, TaskQueryIntent):
+            if spec_intent == TaskQueryIntent.task_list_by_person:
+                payload["intent"] = "task_list"
+            elif spec_intent == TaskQueryIntent.task_history:
+                payload["intent"] = "task_history"
+            elif spec_intent in (TaskQueryIntent.task_status_single, TaskQueryIntent.task_status_list):
+                payload["intent"] = "status_query"
+            elif spec_intent == TaskQueryIntent.person_summary:
+                payload["intent"] = "person_summary"
+            else:
+                payload["intent"] = "unknown"
 
         # 2) 使用现有 EntityResolver（hybrid 向量逻辑）在候选列表上对齐 LLM 抽取的 person / task
         self.ensure_built()
@@ -526,11 +543,17 @@ class TaskQueryEngine:
                 payload["answer"] = "识别置信度不足，请确认候选是否正确"
                 return payload
 
-        # 通过对齐后的人名 / 任务名，更新 IR，并统一走 SQL compiler
         person = best_p[0]
         task = best_t[0]
-        spec.person = person
-        spec.task = task
+
+        if getattr(spec, "intent", None) == TaskQueryIntent.task_list_by_person:
+            # For task_list_by_person, keep task unset so SQL lists all tasks of this person.
+            spec.person = person
+            spec.task = None
+        else:
+            # Default: single-task style queries still set both person and task.
+            spec.person = person
+            spec.task = task
 
         try:
             compiled = compile_tasks_sql(spec)
@@ -558,15 +581,44 @@ class TaskQueryEngine:
 
         payload["rows"] = rows
 
-        if rows:
+        if not rows:
+            payload["answer"] = "未在任务库中找到匹配记录（hybrid_llm）"
+            payload["person"] = person
+            payload["task"] = task
+            return payload
+
+        spec_intent = getattr(spec, "intent", None)
+
+        # 1) task_list_by_person: summarize multiple tasks for this person
+        if spec_intent == TaskQueryIntent.task_list_by_person:
+            count = len(rows)
+            preview_tasks = []
+            for rec in rows[:5]:
+                t_name = str(rec.get("task", ""))
+                t_status = str(rec.get("status", "")).upper()
+                preview_tasks.append(f"{t_name}({t_status})")
+            preview = "；".join(preview_tasks) if preview_tasks else "无任务"
+            payload.update(
+                {
+                    "answer": f"{person} 当前共有 {count} 个任务：{preview}",
+                    "person": person,
+                    "task": None,
+                }
+            )
+            if low_conf:
+                payload["answer"] = str(payload.get("answer", "")) + "（低置信度）"
+            return payload
+
+        # 2) task_history: show count + latest status
+        if spec_intent == TaskQueryIntent.task_history:
+            count = len(rows)
             rec = rows[0]
             status = str(rec.get("status", "")).upper()
             ts = int(rec.get("ts", -1))
             ts_str = ts_to_str(ts) if ts >= 0 else "未知时间"
-            zh_status = "已完成" if status == "DONE" else "未完成/待办"
             payload.update(
                 {
-                    "answer": f"{person} 的「{task}」{zh_status}（最近更新时间：{ts_str}）",
+                    "answer": f"{person} 的「{task}」共有 {count} 条状态记录，最近一次为 {status}（时间：{ts_str}）",
                     "person": person,
                     "task": task,
                     "status": status,
@@ -574,11 +626,26 @@ class TaskQueryEngine:
                 }
             )
             if low_conf:
-                payload["answer"] = str(payload.get("answer", "")) + "，低置信度"
-        else:
-            payload["answer"] = "未在任务库中找到匹配记录（hybrid_llm）"
-            payload["person"] = person
-            payload["task"] = task
+                payload["answer"] = str(payload.get("answer", "")) + "（低置信度）"
+            return payload
+
+        # 3) default: keep the old single-latest behavior (status_query)
+        rec = rows[0]
+        status = str(rec.get("status", "")).upper()
+        ts = int(rec.get("ts", -1))
+        ts_str = ts_to_str(ts) if ts >= 0 else "未知时间"
+        zh_status = "已完成" if status == "DONE" else "未完成/待办"
+        payload.update(
+            {
+                "answer": f"{person} 的「{task}」{zh_status}（最近更新时间：{ts_str}）",
+                "person": person,
+                "task": task,
+                "status": status,
+                "ts": ts,
+            }
+        )
+        if low_conf:
+            payload["answer"] = str(payload.get("answer", "")) + "（低置信度）"
         return payload
 
     def _answer_via_nl2sql(self, q: str) -> Dict[str, Any]:
