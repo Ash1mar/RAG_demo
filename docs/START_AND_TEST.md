@@ -1,6 +1,6 @@
 # Start and Test Guide – Minimal RAG Demo (FAISS + Milvus optional)
 
-This guide shows how to run the API locally (best for VSCode hot‑reload), how to use a containerized Chinese embedding server (bge-small-zh), how to validate the NL→JSON→SQL pipeline for task status queries, and how to optionally plug in a local Ollama + LLM to generate `TaskQuerySpec` via structured outputs.
+This guide shows how to run the API locally (best for VSCode hot‑reload), how to use a containerized Chinese embedding server (bge-small-zh), how to validate the NL→JSON→SQL pipeline for task status queries, and how to optionally plug in a local Ollama + LLM to generate `TaskQuerySpec` via structured outputs and drive the new `hybrid_llm` resolver mode.
 
 ---
 
@@ -110,7 +110,7 @@ Invoke-RestMethod -Uri "http://127.0.0.1:8000/ingest" -Method POST -ContentType 
 
 ---
 
-## 5) Search / Hybrid / Keyword / Answer / Reset
+## 5) Search / Hybrid / Keyword / Reset
 
 ```powershell
 curl "http://127.0.0.1:8000/search?q=Milvus&k=5"
@@ -120,77 +120,24 @@ curl -X POST "http://127.0.0.1:8000/reset"
 
 ---
 
-## 6) Task Status – Non‑LLM Ask (Step 2)
+## 6) Task Status – Non‑LLM Ask (Step 2 baseline)
 
-Initialize sample tasks once:
+Initialize sample tasks once (if not yet done):
 
 ```powershell
 python scripts/init_tasks_sqlite.py
 ```
 
-Start API (if not already running):
+Then start the API (FAISS + mock or real embeddings as you prefer) and call:
 
 ```powershell
-uvicorn app.demo_app:app --host 0.0.0.0 --port 8000 --reload
-```
-
-Ask in Chinese (rules + embeddings resolver, **no LLM**):
-
-```powershell
-curl "http://127.0.0.1:8000/tasks/ask?q=张三的提取月周报完成了吗？"
+curl "http://127.0.0.1:8000/tasks/ask?q=张三的提交9月周报完成了吗？"
 curl "http://127.0.0.1:8000/tasks/ask?q=张三的E3D接口联调现在什么状态？"
 curl "http://127.0.0.1:8000/tasks/ask?q=李四的整理工艺包V2是否已完成？"
 curl "http://127.0.0.1:8000/tasks/ask?q=老张九月报搞定了没？"
 ```
 
-Payload includes: `answer`, `status`, `person`, `task`, `ts`, `sql`, `resolver_mode`, `alpha_vec`, `thresh`, and `candidates` with scores. In vector‑only hybrid mode, `alpha_vec` is present but not used for fusion.
-
-For NL→JSON→SQL debugging, you can also call the experimental DB ask endpoint:
-
-```powershell
-curl "http://127.0.0.1:8000/db/ask?q=张三的E3D接口联调现在什么状态？"
-```
-
-This returns a JSON payload with: `query`, `ir` (TaskQuerySpec), `sql`, `params`, and `rows` (raw records from the `tasks` table). It does not generate a natural‑language answer and does not affect `/tasks/ask` behavior.
-
----
-
-## 6.5) Optional: Enable Ollama‑based NL→JSON (TaskQuerySpec)
-
-Goal: use a local Ollama server (for example with `deepseek-r1:7b`) to parse Chinese task queries into structured `TaskQuerySpec`, then keep the existing SQL compiler and DB layer unchanged.
-
-### A) Prepare Ollama and model
-
-- Install Ollama (see official docs), then make sure the daemon is running (default listens on `http://localhost:11434`).
-- Pull the model you want to use (example):
-
-```powershell
-ollama pull deepseek-r1:7b
-```
-
-### B) Configure env vars for this project
-
-PowerShell example (project root, before starting the API):
-
-```powershell
-$env:LLM_ENABLED='true'
-$env:LLM_PROVIDER='ollama'
-$env:LLM_MODEL='deepseek-r1:7b'          # or your own tag in Ollama
-$env:LLM_OLLAMA_BASE_URL='http://localhost:11434'
-$env:TASKS_NL2SQL_LLM='1'                # enable LLM path in parse_task_query_nl
-```
-
-Then start the API as usual:
-
-```powershell
-uvicorn app.demo_app:app --host 0.0.0.0 --port 8000 --reload
-```
-
-Now the `/db/ask` endpoint will first try to call `LLMClient.generate_task_query_spec` (Ollama) to produce a `TaskQuerySpec` via structured outputs (`format` JSON Schema). If the LLM call or validation fails, it automatically falls back to the existing rule‑based parser, so the endpoint remains safe to use.
-
-Notes:
-- The `/tasks/ask` non‑LLM endpoint continues to work as before; the LLM path is only used inside `parse_task_query_nl` for the NL→JSON→SQL experimental flow.
-- You can switch back to rules‑only by either setting `LLM_PROVIDER='dummy'` or unsetting/clearing `TASKS_NL2SQL_LLM`.
+These use the existing non‑LLM resolver (`rules` / `embeddings` / `hybrid` / `hybrid_plus_rules`) depending on the `RESOLVER` env var.
 
 ---
 
@@ -221,7 +168,7 @@ Remove-Item Env:EMB_URL -ErrorAction Ignore
 $env:MOCK_EMB='1'
 Invoke-RestMethod -Uri "http://127.0.0.1:8000/tasks/reload" -Method POST | Out-Null
 
-curl "http://127.0.0.1:8000/tasks/ask?q=张三的提取月周报完成了吗？"
+curl "http://127.0.0.1:8000/tasks/ask?q=张三的提交9月周报完成了吗？"
 curl "http://127.0.0.1:8000/tasks/ask?q=张三的E3D接口联调现在什么状态？"
 curl "http://127.0.0.1:8000/tasks/ask?q=李四的整理工艺包V2是否已完成？"
 curl "http://127.0.0.1:8000/tasks/ask?q=老张九月报搞定了没？"
@@ -240,7 +187,7 @@ $env:EMB_URL='http://localhost:8080/embeddings'
 $env:EMB_DIM='512'           # bge-small-zh
 Invoke-RestMethod -Uri "http://127.0.0.1:8000/tasks/reload" -Method POST | Out-Null
 
-curl "http://127.0.0.1:8000/tasks/ask?q=张三的提取月周报完成了吗？"
+curl "http://127.0.0.1:8000/tasks/ask?q=张三的提交9月周报完成了吗？"
 curl "http://127.0.0.1:8000/tasks/ask?q=张三的E3D接口联调现在什么状态？"
 curl "http://127.0.0.1:8000/tasks/ask?q=李四的整理工艺包V2是否已完成？"
 curl "http://127.0.0.1:8000/tasks/ask?q=老张九月报搞定了没？"
@@ -298,7 +245,7 @@ This validates that NL→JSON parsing, JSON→SQL compilation, and the `/db/ask`
 
 - `STORE` = `faiss` (default) or `milvus`
 - `DATA_DIR` = `data` (FAISS persistence dir)
-- `RESOLVER` = `rules` | `embeddings` | `hybrid` | `hybrid_plus_rules`
+- `RESOLVER` = `rules` | `embeddings` | `hybrid` | `hybrid_plus_rules` | `hybrid_llm`
 - `MOCK_EMB` = `1` (use mock embeddings) or unset / `0`
 - `EMB_URL` = `http://localhost:8080/embeddings` (use containerized embedder)
 - `MODEL_NAME` / `EMB_DIM` (e.g., `BAAI/bge-small-zh-v1.5` + `512`)
@@ -306,5 +253,62 @@ This validates that NL→JSON parsing, JSON→SQL compilation, and the `/db/ask`
 - `LLM_PROVIDER` = `dummy` (default) or `ollama`
 - `LLM_MODEL` = Ollama model tag (e.g., `deepseek-r1:7b`)
 - `LLM_OLLAMA_BASE_URL` = Ollama HTTP endpoint (default `http://localhost:11434`)
-- `TASKS_NL2SQL_LLM` = `1` to enable LLM‑first NL→JSON parsing for `/db/ask` (falls back to rules on failure)
-*** End Patch```)?;
+- `TASKS_NL2SQL_LLM` = `1` to enable LLM‑first NL→JSON parsing for `/db/ask` and `hybrid_llm` (falls back to rules on failure)
+
+---
+
+## 11) LLM‑driven NL→JSON + `hybrid_llm` Resolver
+
+This section summarizes how to wire the NL→JSON→SQL pipeline with a local LLM (e.g., via Ollama) and the new `hybrid_llm` mode for `/tasks/ask`.
+
+### 11.1) Enable the LLM client
+
+1. Install and run Ollama locally, and pull a compatible model (for example `deepseek-r1:7b`).
+2. Configure LLM environment variables:
+
+```powershell
+$env:LLM_ENABLED='true'
+$env:LLM_PROVIDER='ollama'
+$env:LLM_MODEL='deepseek-r1:7b'          # or other model
+$env:LLM_OLLAMA_BASE_URL='http://localhost:11434'
+```
+
+3. Optionally, enable LLM‑first NL→JSON parsing in the NL→SQL pipeline:
+
+```powershell
+$env:TASKS_NL2SQL_LLM='1'
+```
+
+Then start the API as usual:
+
+```powershell
+uvicorn app.demo_app:app --host 0.0.0.0 --port 8000 --reload
+```
+
+At this point, `parse_task_query_nl` will first try to call `LLMClient.generate_task_query_spec` to produce a `TaskQuerySpec` (JSON) and fall back to the rules‑based parser if the LLM call or validation fails. This behavior affects both `/db/ask` and the `hybrid_llm` resolver described next.
+
+### 11.2) Use `hybrid_llm` for `/tasks/ask`
+
+To route `/tasks/ask` through the “LLM NL→JSON + small model + FAISS + SQL compiler” pipeline:
+
+```powershell
+$env:RESOLVER='hybrid_llm'
+$env:TASKS_NL2SQL_LLM='1'
+Invoke-RestMethod -Uri "http://127.0.0.1:8000/tasks/reload" -Method POST | Out-Null
+```
+
+Then query as usual:
+
+```powershell
+curl "http://127.0.0.1:8000/tasks/ask?q=张三的E3D接口联调现在什么状态？"
+```
+
+Internally, the flow is:
+
+1. LLM (or rules as fallback) produces a `TaskQuerySpec` via `parse_task_query_nl` (NL→JSON).
+2. `TaskQueryEngine` uses the existing `EntityResolver` hybrid vector logic (bge+FAISS) to align `person` / `task` from the IR to the actual candidate lists.
+3. The aligned `TaskQuerySpec` is compiled into a read‑only SQL query by `compile_tasks_sql`.
+4. The SQL is executed via `SQLiteTasksStore.query`, and `/tasks/ask` returns a human‑readable Chinese answer plus `sql` / `params` / `rows` / `candidates` / `nl_ir` for debugging.
+
+If you want a pure LLM NL→JSON→SQL debugging view (no vector alignment, no natural‑language answer), use `/db/ask` as described in section 9. The `hybrid_llm` mode is for “production‑style” `/tasks/ask` with LLM + small model + SQL compiler combined.
+

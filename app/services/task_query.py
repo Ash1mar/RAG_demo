@@ -280,7 +280,7 @@ class TaskQueryEngine:
         res.build()
         # Per-mode defaults
         m = (mode or "hybrid").lower()
-        if m == "hybrid":
+        if m == "hybrid" or m == "hybrid_llm":
             # vector-only with FAISS focus; split thresholds and delta logic
             res.cfg.thresh_person = 0.45
             res.cfg.thresh_task = 0.40
@@ -327,6 +327,10 @@ class TaskQueryEngine:
                     "nl2sql_reason": str(exc),
                 }
                 # fall through to legacy behavior
+
+        # LLM 抽取 + hybrid 对齐的实验模式：统一走 TaskQuerySpec → SQL compiler。
+        if mode_raw == "hybrid_llm":
+            return self._answer_via_hybrid_llm(q, topk=topk, thresh=thresh)
 
         self.ensure_built()
         assert self.resolver is not None
@@ -381,7 +385,7 @@ class TaskQueryEngine:
         # New acceptance logic for vector-only modes (hybrid, hybrid_plus_rules)
         low_conf = False
         mode_decide = (self.resolver.cfg.mode or "hybrid").lower()
-        if mode_decide in ("hybrid", "hybrid_plus_rules"):
+        if mode_decide in ("hybrid", "hybrid_plus_rules", "hybrid_llm"):
             tp = 0.45 if getattr(self.resolver.cfg, "thresh_person", None) is None else float(self.resolver.cfg.thresh_person)
             tt = 0.40 if getattr(self.resolver.cfg, "thresh_task", None) is None else float(self.resolver.cfg.thresh_task)
             delta_min = 0.09 if getattr(self.resolver.cfg, "delta_min", None) is None else float(self.resolver.cfg.delta_min)
@@ -447,6 +451,134 @@ class TaskQueryEngine:
             pass
         if nl2sql_attempted and nl2sql_error is not None:
             payload.update(nl2sql_error)
+        return payload
+
+    def _answer_via_hybrid_llm(self, q: str, topk: int = 3, thresh: Optional[float] = None) -> Dict[str, Any]:
+        """NL→JSON（可由 LLM 提供）+ hybrid 向量对齐 + SQL compiler 的实验分支."""
+        intent = "status_query" if is_status_intent(q) else "unknown"
+        payload: Dict[str, Any] = {
+            "intent": intent,
+            "resolver_mode": "hybrid_llm",
+        }
+
+        # 1) NL -> IR（LLM/规则），用于抽取 person / task 等结构化字段
+        try:
+            spec = parse_task_query_nl(q)
+            payload["nl_ir"] = spec.dict()
+        except Exception as exc:
+            payload["error"] = "hybrid_llm_parse_failed"
+            payload["reason"] = str(exc)
+            return payload
+
+        # 2) 使用现有 EntityResolver（hybrid 向量逻辑）在候选列表上对齐 LLM 抽取的 person / task
+        self.ensure_built()
+        assert self.resolver is not None
+
+        # runtime overrides（保持与 answer 一致的 topk / thresh 行为）
+        if topk != self.resolver.cfg.topk:
+            self.resolver.cfg.topk = int(topk)
+        if thresh is not None and abs(float(thresh) - self.resolver.cfg.thresh) > 1e-9:
+            self.resolver.cfg.thresh = float(thresh)
+
+        # 优先使用 IR 中的 person/task 作为查询文本，否则退回整句
+        q_person = spec.person or q
+        q_task = spec.task or q
+
+        person_hits = self.resolver.resolve_person(q_person)[:topk]
+        task_hits = self.resolver.resolve_task(q_task)[:topk]
+
+        payload.update(
+            {
+                "alpha_vec": round(float(self.resolver.cfg.alpha_vec), 4),
+                "thresh": round(float(self.resolver.cfg.thresh), 4),
+                "candidates": {
+                    "persons": [{"value": v, "score": round(float(s), 4)} for v, s in person_hits],
+                    "tasks": [{"value": v, "score": round(float(s), 4)} for v, s in task_hits],
+                },
+            }
+        )
+
+        best_p = person_hits[0] if person_hits else None
+        best_t = task_hits[0] if task_hits else None
+        if not best_p or not best_t:
+            payload["error"] = "hybrid_llm_no_candidates"
+            payload["answer"] = "未识别出人员或任务，请从候选中选择"
+            return payload
+
+        # 复用 hybrid 的接受逻辑（阈值 / margin 等），但 resolver_mode 为 hybrid_llm
+        low_conf = False
+        mode_decide = (self.resolver.cfg.mode or "hybrid").lower()
+        if mode_decide in ("hybrid", "hybrid_plus_rules", "hybrid_llm"):
+            tp = 0.45 if getattr(self.resolver.cfg, "thresh_person", None) is None else float(self.resolver.cfg.thresh_person)
+            tt = 0.40 if getattr(self.resolver.cfg, "thresh_task", None) is None else float(self.resolver.cfg.thresh_task)
+            delta_min = 0.09 if getattr(self.resolver.cfg, "delta_min", None) is None else float(self.resolver.cfg.delta_min)
+            weak_min = tt if getattr(self.resolver.cfg, "weak_task_min", None) is None else float(self.resolver.cfg.weak_task_min)
+
+            p_ok = best_p[1] >= tp
+            t_ok = best_t[1] >= tt
+            if not t_ok:
+                second_t = task_hits[1][1] if len(task_hits) > 1 else -1.0
+                if best_t[1] >= weak_min and (second_t >= 0) and (best_t[1] - second_t) >= delta_min:
+                    t_ok = True
+                    low_conf = True
+
+            if not p_ok or not t_ok:
+                payload["answer"] = "识别置信度不足，请确认候选是否正确"
+                return payload
+
+        # 通过对齐后的人名 / 任务名，更新 IR，并统一走 SQL compiler
+        person = best_p[0]
+        task = best_t[0]
+        spec.person = person
+        spec.task = task
+
+        try:
+            compiled = compile_tasks_sql(spec)
+        except TaskSqlCompileError as exc:
+            payload["error"] = "hybrid_llm_compile_failed"
+            payload["reason"] = str(exc)
+            payload["person"] = person
+            payload["task"] = task
+            return payload
+
+        payload["sql"] = compiled.sql
+        payload["params"] = compiled.params
+
+        query_fn = getattr(self.tasks_store, "query", None)
+        if query_fn is None:
+            payload["error"] = "hybrid_llm_query_not_supported_by_tasks_store"
+            return payload
+
+        try:
+            rows = query_fn(compiled.sql, compiled.params)
+        except Exception as exc:  # pragma: no cover - defensive
+            payload["error"] = "hybrid_llm_db_query_failed"
+            payload["reason"] = str(exc)
+            return payload
+
+        payload["rows"] = rows
+
+        if rows:
+            rec = rows[0]
+            status = str(rec.get("status", "")).upper()
+            ts = int(rec.get("ts", -1))
+            ts_str = ts_to_str(ts) if ts >= 0 else "未知时间"
+            zh_status = "已完成" if status == "DONE" else "未完成/待办"
+            payload.update(
+                {
+                    "answer": f"{person} 的「{task}」{zh_status}（最近更新时间：{ts_str}）",
+                    "person": person,
+                    "task": task,
+                    "status": status,
+                    "ts": ts,
+                }
+            )
+            if low_conf:
+                payload["answer"] = str(payload.get("answer", "")) + "，低置信度"
+        else:
+            payload["answer"] = "未在任务库中找到匹配记录（hybrid_llm）"
+            payload["person"] = person
+            payload["task"] = task
         return payload
 
     def _answer_via_nl2sql(self, q: str) -> Dict[str, Any]:
@@ -522,4 +654,3 @@ class TaskQueryEngine:
         else:
             payload["answer"] = "未在任务库中找到匹配记录（NL2SQL）"
         return payload
-
