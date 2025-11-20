@@ -117,43 +117,35 @@ def _post_process_intent(spec: TaskQuerySpec, text: str) -> None:
     """
     t = text.strip()
 
-    # If the intent is "task list by person" but the question
-    # itself does not explicitly mention completion status,
-    # force status to [DONE, TODO] so we always list all tasks.
-    if getattr(spec, "intent", None) == TaskQueryIntent.task_list_by_person:
-        status_kws = ("完成", "未完成", "done", "todo", "搞定", "结束")
-        if not any(kw in t for kw in status_kws):
-            spec.status = []
-
     # Normalize status / limit for very common list-by-person pattern to reduce LLM randomness.
-    if "现在有哪些任务" in t and getattr(spec, "intent", None) == TaskQueryIntent.task_list_by_person:
-        status_kws = ("完成", "未完成", "done", "todo", "搞定", "结束")
+    if "现在有哪些任�? in t and getattr(spec, "intent", None) == TaskQueryIntent.task_list_by_person:
+        status_kws = ("完成", "未完�?, "done", "todo", "搞定", "结束")
         if not any(kw in t for kw in status_kws):
             spec.status = [TaskStatus.DONE, TaskStatus.TODO]
         if spec.limit is None or spec.limit < 1 or spec.limit > 200:
             spec.limit = 50
 
-    # 强信号：按人查任务列表。
-    if "有哪些任务" in t or "任务列表" in t:
+    # 强信号：按人查任务列表�?
+    if "有哪些任�? in t or "任务列表" in t:
         spec.intent = TaskQueryIntent.task_list_by_person
-        # 列表类问题，通常关注 DONE 和 TODO。
+        # 列表类问题，通常关注 DONE �?TODO�?
         if not spec.status:
             spec.status = [TaskStatus.DONE, TaskStatus.TODO]
 
-    # 任务历史（目前保留，将来可用）。
-    if "都是什么状态" in t or ("历史" in t and "状态" in t):
+    # 任务历史（目前保留，将来可用）�?
+    if "都是什么状�? in t or ("历史" in t and "状�? in t):
         spec.intent = TaskQueryIntent.task_history
 
-    # “什么状态”结尾，且句子里能抽到人和任务 → 单条状态查询。
+    # “什么状态”结尾，且句子里能抽到人和任�?�?单条状态查询�?
     if (
         t.endswith("什么状态？")
-        or t.endswith("什么状态?")
-        or "现在什么状态" in t
-        or "是什么状态" in t
+        or t.endswith("什么状�?")
+        or "现在什么状�? in t
+        or "是什么状�? in t
     ):
         if spec.person and spec.task:
             spec.intent = TaskQueryIntent.task_status_single
-            # 单条状态查询聚焦 DONE/TODO；去掉 ANY。
+            # 单条状态查询聚�?DONE/TODO；去�?ANY�?
             if not spec.status:
                 spec.status = [TaskStatus.DONE, TaskStatus.TODO]
             else:
@@ -162,7 +154,7 @@ def _post_process_intent(spec: TaskQuerySpec, text: str) -> None:
                     for s in spec.status
                     if not isinstance(s, TaskStatus) or s != TaskStatus.ANY
                 ]
-            # 鼓励单行语义。
+            # 鼓励单行语义�?
             if spec.limit is None or spec.limit > 1:
                 spec.limit = 1
 
@@ -175,7 +167,7 @@ def parse_task_query_nl(q: str) -> TaskQuerySpec:
 
     llm_error: Optional[Exception] = None
 
-    # 优先尝试 LLM 解析。
+    # 优先尝试 LLM 解析�?
     if _USE_LLM_FOR_NL2SQL:
         try:
             client = get_llm_client()
@@ -192,7 +184,7 @@ def parse_task_query_nl(q: str) -> TaskQuerySpec:
                 "TASKS_NL2SQL LLM parse failed; falling back to rule-based parser"
             )
 
-    # 回退到规则解析。
+    # 回退到规则解析�?
     spec = _rule_based_parse_task_query_nl(text)
     spec.raw_query = q
     _post_process_intent(spec, text)
@@ -207,18 +199,18 @@ def _rule_based_parse_task_query_nl(q: str) -> TaskQuerySpec:
 
     # 1) 粗略意图识别
     intent = TaskQueryIntent.task_status_single
-    if any(kw in text for kw in ("列表", "有哪些", "所有", "全部")):
+    if any(kw in text for kw in ("列表", "有哪�?, "所�?, "全部")):
         intent = TaskQueryIntent.task_status_list
-    if any(kw in text for kw in ("张三", "李四", "老王", "老张")) and "有哪些" in text:
+    if any(kw in text for kw in ("张三", "李四", "老王", "老张")) and "有哪�? in text:
         intent = TaskQueryIntent.task_list_by_person
 
-    # 2) 粗略人物和任务抽取
+    # 2) 粗略人物和任务抽�?
     person: Optional[str] = None
     task: Optional[str] = None
 
-    if "什么状态" in text:
+    if "什么状�? in text:
         # 示例：张三的E3D接口联调现在什么状态？
-        left, _, right = text.partition("什么状态")
+        left, _, right = text.partition("什么状�?)
         if left:
             person = left.strip()
         task = right.strip() or None
@@ -229,10 +221,10 @@ def _rule_based_parse_task_query_nl(q: str) -> TaskQuerySpec:
     status: List[TaskStatus] = []
     if any(kw in text for kw in ("完成了吗", "完成了没", "搞定了没", "搞定没有", "done")):
         status = [TaskStatus.DONE]
-    elif any(kw in text for kw in ("未完成", "没完成", "还没", "待办", "todo")):
+    elif any(kw in text for kw in ("未完�?, "没完�?, "还没", "待办", "todo")):
         status = [TaskStatus.TODO]
 
-    # 4) 默认排序和 limit
+    # 4) 默认排序�?limit
     order_by = [OrderBySpec(field="ts", direction=OrderByDirection.desc)]
     limit = 10
 

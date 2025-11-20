@@ -166,17 +166,21 @@ def tasks_ask(q: str, topk: int = 3, thresh: Optional[float] = None) -> Dict[str
     """
     if not q.strip():
         raise HTTPException(400, "empty query")
-    
-    ir = parse_task_query_nl(q)
+
     payload = TQ_ENGINE.answer(q, topk=topk, thresh=thresh)
     try:
-        payload["nl_ir"] = ir.dict()
-        # 
-        #
-        payload["ir"] = build_task_query_plan(ir)
+        # For engines that do not populate IR fields themselves, backfill from a fresh parse.
+        if "nl_ir" not in payload or "ir" not in payload:
+            spec = parse_task_query_nl(q)
+            if "nl_ir" not in payload:
+                payload["nl_ir"] = spec.dict()
+            if "ir" not in payload:
+                payload["ir"] = build_task_query_plan(spec)
     except Exception:
-        payload["nl_ir"] = {"raw_query": q, "error": "failed_to_serialize_ir"}
-        payload["ir"] = {"raw_query": q, "error": "failed_to_build_query_plan"}
+        if "nl_ir" not in payload:
+            payload["nl_ir"] = {"raw_query": q, "error": "failed_to_serialize_ir"}
+        if "ir" not in payload:
+            payload["ir"] = {"raw_query": q, "error": "failed_to_build_query_plan"}
     return payload
 @app.get("/db/ask")
 def db_ask(q: str = Query(..., description="Natural language task query for direct NL→JSON→SQL experiment")) -> Dict[str, Any]:

@@ -467,7 +467,6 @@ class TaskQueryEngine:
         # 1) NL -> IR (LLM/rules)
         try:
             spec = parse_task_query_nl(q)
-            payload["nl_ir"] = spec.dict()
         except Exception as exc:
             payload["error"] = "hybrid_llm_parse_failed"
             payload["reason"] = str(exc)
@@ -554,6 +553,14 @@ class TaskQueryEngine:
             # Default: single-task style queries still set both person and task.
             spec.person = person
             spec.task = task
+
+        # Rebuild IR from the aligned spec so external callers see the resolved person/task.
+        try:
+            payload["nl_ir"] = spec.dict()
+            payload["ir"] = build_task_query_plan(spec)
+        except Exception:
+            payload["nl_ir"] = {"raw_query": q, "error": "failed_to_serialize_aligned_ir"}
+            payload["ir"] = {"raw_query": q, "error": "failed_to_build_query_plan_from_aligned_spec"}
 
         try:
             compiled = compile_tasks_sql(spec)

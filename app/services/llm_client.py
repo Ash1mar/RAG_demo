@@ -77,6 +77,11 @@ class OllamaLLMClient:
             ],
             "stream": False,
             "format": schema,
+            # Use deterministic decoding for NL→IR so that the same
+            # question produces a stable TaskQuerySpec.
+            "options": {
+                "temperature": 0.0,
+            },
         }
 
         url = f"{self.base_url.rstrip('/')}/api/chat"
@@ -171,4 +176,3 @@ def get_llm_client() -> LLMClient:
 
     # TODO: add support for other providers (OpenAI / DeepSeek / etc.)
     raise NotImplementedError(f"Unsupported LLM provider: {llm_settings.provider}")
-
