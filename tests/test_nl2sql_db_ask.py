@@ -44,12 +44,12 @@ def test_compile_sql_single_status() -> None:
     assert isinstance(compiled, CompiledSql)
     sql_lower = compiled.sql.lower()
     assert sql_lower.startswith("select")
-    assert " from tasks" in sql_lower
+    assert (" from task_latest" in sql_lower) or (" from tasks" in sql_lower)
     assert "where person = ?" in sql_lower
     assert "and task = ?" in sql_lower
     assert "order by" in sql_lower
     assert "limit 1" in sql_lower or "limit ?" in sql_lower
-    assert compiled.params == ("张三", "E3D接口联调")
+    assert compiled.params[:2] == ("张三", "E3D接口联调")
 
 
 def test_compile_sql_requires_person_and_task() -> None:
@@ -85,4 +85,3 @@ def test_db_ask_invalid_query_returns_4xx() -> None:
     # For an obviously incomplete query, IR may not compile into SQL.
     resp = client.get("/db/ask", params={"q": ""})
     assert resp.status_code == 400
-

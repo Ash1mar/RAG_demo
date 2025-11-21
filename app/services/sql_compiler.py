@@ -81,9 +81,14 @@ def compile_tasks_sql(spec: TaskQuerySpec) -> CompiledSql:
         return CompiledSql(sql=sql, params=tuple(params))
 
     # ---- Task list by person / general list ----
-    if intent in (TaskQueryIntent.task_status_list, TaskQueryIntent.task_list_by_person):
+    if intent in (
+        TaskQueryIntent.task_status_list,
+        TaskQueryIntent.task_list_by_person,
+        TaskQueryIntent.task_history,
+    ):
         # Respect spec.limit when present; otherwise use a conservative default.
-        raw_limit = spec.limit if spec.limit is not None else 100
+        default_limit = 100 if intent != TaskQueryIntent.task_history else 200
+        raw_limit = spec.limit if spec.limit is not None else default_limit
         try:
             limit_int = max(1, min(int(raw_limit), 1000))
         except Exception as exc:  # pragma: no cover - defensive

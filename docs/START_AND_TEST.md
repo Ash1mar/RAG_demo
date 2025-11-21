@@ -139,6 +139,12 @@ curl "http://127.0.0.1:8000/tasks/ask?q=老张九月报搞定了没？"
 
 These use the existing non‑LLM resolver (`rules` / `embeddings` / `hybrid` / `hybrid_plus_rules`) depending on the `RESOLVER` env var.
 
+Additional intent-focused examples (useful when exercising `hybrid_llm` or `/db/ask`):
+- task_status_list: `张三最近的任务状态列表？`
+- task_list_by_person: `张三都有哪些任务？`
+- task_history: `张三的E3D接口联调历史状态记录`
+- task_status_single: `张三的E3D接口联调现在什么状态？`
+
 ---
 
 ## 7) Troubleshooting
@@ -311,4 +317,3 @@ Internally, the flow is:
 4. The SQL is executed via `SQLiteTasksStore.query`, and `/tasks/ask` returns a human‑readable Chinese answer plus `sql` / `params` / `rows` / `candidates` / `nl_ir` for debugging.
 
 If you want a pure LLM NL→JSON→SQL debugging view (no vector alignment, no natural‑language answer), use `/db/ask` as described in section 9. The `hybrid_llm` mode is for “production‑style” `/tasks/ask` with LLM + small model + SQL compiler combined.
-

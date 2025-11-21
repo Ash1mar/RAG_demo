@@ -37,6 +37,8 @@ class TaskStatus(str, Enum):
 
     DONE = "DONE"
     TODO = "TODO"
+    IN_PROGRESS = "IN_PROGRESS"
+    BLOCKED = "BLOCKED"
     ANY = "ANY"  # no restriction (only used in IR)
 
 
@@ -85,13 +87,29 @@ class TaskQuerySpec(BaseModel):
         default_factory=list,
         description="Keywords extracted from task description for fuzzy matching.",
     )
+    project: Optional[str] = Field(
+        None, description="Project identifier/name for filtering."
+    )
+    tags: List[str] = Field(
+        default_factory=list,
+        description="Tags/labels from task description for filtering.",
+    )
+    priority: Optional[int] = Field(
+        None, description="Priority (1 highest)."
+    )
     status: List[TaskStatus] = Field(
         default_factory=list,
         description="Required task status filters; empty means no restriction.",
     )
 
     time_range: Optional[TimeRange] = Field(
-        None, description="Time range for the query, e.g. recent week/month."
+        None, description="Time range for the query, e.g. recent week/month (status timestamp)."
+    )
+    due_range: Optional[TimeRange] = Field(
+        None, description="Due time range filter (epoch ms or ISO)."
+    )
+    created_range: Optional[TimeRange] = Field(
+        None, description="Created time range filter (epoch ms or ISO)."
     )
     order_by: List[OrderBySpec] = Field(
         default_factory=list, description="Order-by fields."
@@ -193,7 +211,7 @@ def parse_task_query_nl(q: str) -> TaskQuerySpec:
             )
 
     # 回退到规则解析。
-    spec = _rule_based_parse_task_query_nl(text)
+    spec = _rule_based_parse_task_query_nl_v2(text)
     spec.raw_query = q
     _post_process_intent(spec, text)
     spec.extra.setdefault("nl2sql_source", "rules")
@@ -250,6 +268,60 @@ def _rule_based_parse_task_query_nl(q: str) -> TaskQuerySpec:
     )
 
 
+def _rule_based_parse_task_query_nl_v2(q: str) -> TaskQuerySpec:
+    """Cleaner rule-based parser with expanded status hints."""
+    text = (q or "").strip()
+
+    # 1) coarse intent guess
+    intent = TaskQueryIntent.task_status_single
+    if any(kw in text for kw in ("列表", "有哪些", "所有", "全部")):
+        intent = TaskQueryIntent.task_status_list
+    if any(kw in text for kw in ("张三", "李四", "老王", "老张")) and "有哪些" in text:
+        intent = TaskQueryIntent.task_list_by_person
+
+    # 2) coarse entity extraction
+    person: Optional[str] = None
+    task: Optional[str] = None
+    if "什么状态" in text:
+        left, _, right = text.partition("什么状态")
+        if left:
+            person = left.strip()
+        task = right.strip() or None
+    else:
+        task = text or None
+
+    # 3) status hints (expanded)
+    status: List[TaskStatus] = []
+    if any(kw in text for kw in ("阻塞", "卡住", "block", "blocked")):
+        status = [TaskStatus.BLOCKED]
+    elif any(kw in text for kw in ("进行中", "进展", "跟进中", "在做", "in progress")):
+        status = [TaskStatus.IN_PROGRESS]
+    elif any(kw in text for kw in ("完成了吗", "完成了没", "搞定了没", "搞定没有", "done")):
+        status = [TaskStatus.DONE]
+    elif any(kw in text for kw in ("未完成", "没完成", "还没", "待办", "todo")):
+        status = [TaskStatus.TODO]
+
+    # 4) defaults: latest first, then priority
+    order_by = [
+        OrderBySpec(field="ts", direction=OrderByDirection.desc),
+        OrderBySpec(field="priority", direction=OrderByDirection.asc),
+    ]
+    limit = 10
+
+    return TaskQuerySpec(
+        intent=intent,
+        raw_query=q,
+        person=person or None,
+        task=(task or "").strip() or None,
+        task_keywords=[],
+        status=status,
+        time_range=None,
+        order_by=order_by,
+        limit=limit,
+        extra={},
+    )
+
+
 def build_task_query_plan(spec: TaskQuerySpec) -> Dict[str, Any]:
     """Convert TaskQuerySpec into a generic query plan dict."""
     intent = (
@@ -258,13 +330,21 @@ def build_task_query_plan(spec: TaskQuerySpec) -> Dict[str, Any]:
         else str(spec.intent)
     )
 
-    target: Dict[str, Any] = {"table": "tasks"}
+    table = "tasks" if spec.intent == TaskQueryIntent.task_history else "task_latest"
+    target: Dict[str, Any] = {"table": table}
 
     filters: List[Dict[str, Any]] = []
     if spec.person:
         filters.append({"field": "person", "op": "eq", "value": spec.person})
     if spec.task:
         filters.append({"field": "task", "op": "eq", "value": spec.task})
+    if spec.project:
+        filters.append({"field": "project", "op": "eq", "value": spec.project})
+    if spec.priority is not None:
+        filters.append({"field": "priority", "op": "eq", "value": spec.priority})
+    if spec.tags:
+        for tag in spec.tags:
+            filters.append({"field": "tags", "op": "like", "value": f"%{tag}%"})
     if spec.status:
         concrete = [
             s for s in spec.status if not isinstance(s, TaskStatus) or s != TaskStatus.ANY
@@ -289,6 +369,22 @@ def build_task_query_plan(spec: TaskQuerySpec) -> Dict[str, Any]:
             filters.append(
                 {"field": "ts", "op": "lte", "value": spec.time_range.end}
             )
+    if spec.due_range:
+        if spec.due_range.start:
+            filters.append(
+                {"field": "due_ts", "op": "gte", "value": spec.due_range.start}
+            )
+        if spec.due_range.end:
+            filters.append({"field": "due_ts", "op": "lte", "value": spec.due_range.end})
+    if spec.created_range:
+        if spec.created_range.start:
+            filters.append(
+                {"field": "created_ts", "op": "gte", "value": spec.created_range.start}
+            )
+        if spec.created_range.end:
+            filters.append(
+                {"field": "created_ts", "op": "lte", "value": spec.created_range.end}
+            )
 
     if spec.intent in (
         TaskQueryIntent.task_status_single,
@@ -296,7 +392,20 @@ def build_task_query_plan(spec: TaskQuerySpec) -> Dict[str, Any]:
         TaskQueryIntent.task_list_by_person,
         TaskQueryIntent.task_history,
     ):
-        projections: List[str] = ["id", "person", "task", "status", "ts"]
+        projections: List[str] = [
+            "id",
+            "person",
+            "task",
+            "status",
+            "ts",
+            "project",
+            "tags",
+            "priority",
+            "due_ts",
+            "created_ts",
+            "updated_ts",
+            "status_note",
+        ]
     else:
         projections = ["*"]
 
@@ -315,6 +424,7 @@ def build_task_query_plan(spec: TaskQuerySpec) -> Dict[str, Any]:
         # Default to latest-first on ts, then id for deterministic ordering.
         sort = [
             {"field": "ts", "direction": "DESC"},
+            {"field": "priority", "direction": "ASC"},
             {"field": "id", "direction": "DESC"},
         ]
 
