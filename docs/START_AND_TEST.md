@@ -144,6 +144,7 @@ Additional intent-focused examples (useful when exercising `hybrid_llm` or `/db/
 - task_list_by_person: `张三都有哪些任务？`
 - task_history: `张三的E3D接口联调历史状态记录`
 - task_status_single: `张三的E3D接口联调现在什么状态？`
+- task_count_by_status: `How many tasks are still not done for Zhang San?`  <!-- advanced, typically via LLM IR -->
 
 ---
 
@@ -266,6 +267,7 @@ curl "http://127.0.0.1:8000/tasks/ask?q=<NL_QUERY>"
 | Multi-person list (filters + time_range) | `张三和李四最近一周的任务列表还有哪些？` | `filters` contains `{"field":"person","op":"in","values":["张三","李四"]}`, `time_range.start=now-7d`, intent `task_status_list` or `task_list_by_person`. Hybrid resolver should echo `filter_persons`. |
 | Project + tag filter | `把芯片项目里带#安全整改标签的任务都列出来` | `project="芯片"`, `tags=["安全整改"]`, SQL adds `project = ?` AND `tags LIKE ?`. |
 | Priority + due_range | `列出李四本周截止的高优P1任务` | `priority=1`, `due_range` reflects current week boundaries, limit tightened, ORDER BY defaults to ts/priority. |
+| Status counts by bucket (advanced) | `How many tasks are still not done for Zhang San in the last week?` | IR uses `answer_mode=task_count_by_status` with optional `time_range`; SQL projects `status, COUNT(*) AS task_count` and adds `GROUP BY status`. Typically triggered by LLM or explicit IR, not by keyword rules. |
 | Person summary (group by) | `给我张三和李四的任务状态汇总` | Intent `person_summary`, `filters` includes multi-person IN; SQL should output `COUNT(*) AS task_count` with `GROUP BY person, status`. |
 | Task history (full timeline) | `张三的E3D接口联调历史状态` | Intent `task_history`, SQL selects from `tasks` (not `task_latest`) with higher default limit (200). |
 
@@ -314,7 +316,7 @@ $env:LLM_OLLAMA_BASE_URL='http://localhost:11434'
 3. Optionally, enable LLM‑first NL→JSON parsing in the NL→SQL pipeline:
 
 ```powershell
-$env:TASKS_NL2SQL_LLM='1'
+    $env:TASKS_NL2SQL_LLM='1'
 ```
 
 Then start the API as usual:
@@ -349,3 +351,86 @@ Internally, the flow is:
 4. The SQL is executed via `SQLiteTasksStore.query`, and `/tasks/ask` returns a human‑readable Chinese answer plus `sql` / `params` / `rows` / `candidates` / `nl_ir` for debugging.
 
 If you want a pure LLM NL→JSON→SQL debugging view (no vector alignment, no natural‑language answer), use `/db/ask` as described in section 9. The `hybrid_llm` mode is for “production‑style” `/tasks/ask` with LLM + small model + SQL compiler combined.
+
+### 11.3) Phase 1 – “Let the LLM fill the IR completely” (no extra code)
+
+To “eat the IR full” without touching parser code, teach the LLM prompt to populate *all existing* fields in `TaskQuerySpec`. Below is a lightweight checklist and JSON template you can copy into whatever prompt system you are using (Ollama, OpenAI, etc.).
+
+**LLM output contract**
+
+```json
+{
+  "intent": "task_status_single | task_status_list | task_list_by_person | task_history | person_summary",
+  "answer_mode": "default | completion_time_latest | task_count_by_status",
+  "person": "张三",
+  "task": "E3D接口联调",
+  "task_keywords": ["接口", "联调"],
+  "project": "芯片项目",
+  "tags": ["安全整改"],
+  "priority": 1,
+  "status": ["DONE", "TODO"],
+  "time_range": {"start": "now-7d", "end": "now"},
+  "due_range": {"start": "start_of_week", "end": "end_of_week"},
+  "created_range": null,
+  "order_by": [
+    {"field": "ts", "direction": "desc"},
+    {"field": "priority", "direction": "asc"}
+  ],
+  "limit": 20,
+  "filters": [
+    {"field": "person", "op": "in", "values": ["张三", "李四"]},
+    {"field": "status", "op": "in", "values": ["TODO"]},
+    {"field": "project", "op": "eq", "value": "芯片"}
+  ]
+}
+```
+
+**Prompting tips (no parser code changes required)**
+
+1. **Always fill `intent` + `answer_mode` explicitly.**  
+   - Single-task status → `task_status_single` + `answer_mode=default`.  
+   - “When was it finished?” → `intent=task_history`, `answer_mode=completion_time_latest`, `status=["DONE"]`, `limit=1`.  
+   - “How many tasks still not done?” → set `answer_mode=task_count_by_status`, optionally `status=["TODO","IN_PROGRESS"]`, plus a `time_range` or `due_range` as needed.
+
+2. **Use the typed filters instead of free-form strings.**  
+   - Multi-person → push into `filters` with `{"field":"person","op":"in","values":[...]}`.  
+   - Projects/tags/priority/time windows all have dedicated slots—prefer those over inventing new fields.
+
+3. **Order + limit should stay bounded.**  
+   - Default order: `ts desc`, `priority asc`.  
+   - Default limit: 10 (or 50 for list-by-person); adapt only when user explicitly asks.
+
+4. **Provide example IRs to the LLM for few-shot guidance.**  
+   Here are two copy-paste ready examples:
+
+   - *“张三的E3D接口联调是什么时候完成的？”*  
+     ```json
+     {
+       "intent": "task_history",
+       "answer_mode": "completion_time_latest",
+       "person": "张三",
+       "task": "E3D接口联调",
+       "status": ["DONE"],
+       "order_by": [{"field": "ts", "direction": "desc"}],
+       "limit": 1,
+       "filters": []
+     }
+     ```
+
+   - *“How many tasks are still not done for Zhang San in the last week?”*  
+     ```json
+     {
+       "intent": "task_status_list",
+       "answer_mode": "task_count_by_status",
+       "person": "张三",
+       "status": ["TODO", "IN_PROGRESS"],
+       "time_range": {"start": "now-7d", "end": "now"},
+       "filters": [],
+       "limit": 50,
+       "order_by": []
+     }
+     ```
+
+5. **Debug quickly via `/db/ask?q=<NL>`** to see the exact IR / SQL the backend consumed. Adjust your LLM prompt until the JSON mirrors what you expect.
+
+With this approach, Phase 1 requires *zero* parser changes—the LLM simply fills the rich IR we already built, and the existing plan/compiler/formatter stack does the rest.

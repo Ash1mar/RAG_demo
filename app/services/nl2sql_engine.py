@@ -232,56 +232,7 @@ _COMPLETION_TIME_HINTS = (
 
 
 
-_TASK_COUNT_QUESTION_HINTS = (
-    "\u8fd8\u6709\u591a\u5c11",
-    "\u8fd8\u5269\u591a\u5c11",
-    "\u5269\u4e0b\u591a\u5c11",
-    "\u8fd8\u5269\u51e0",
-    "\u8fd8\u6709\u51e0",
-    "\u5269\u51e0",
-    "\u6709\u591a\u5c11\u4efb\u52a1",
-    "\u5269\u4f59\u591a\u5c11",
-)
 
-_TASK_COUNT_STATUS_HINTS = [
-    (
-        (
-            "\u672a\u5b8c\u6210",
-            "\u672a\u5b8c",
-            "\u6ca1\u5b8c\u6210",
-            "\u6ca1\u641e\u5b9a",
-            "\u672a\u7ed3\u675f",
-            "\u5f85\u529e",
-            "todo",
-        ),
-        TaskStatus.TODO,
-    ),
-    (
-        (
-            "\u8fdb\u884c\u4e2d",
-            "\u5728\u505a",
-            "\u5904\u7406\u4e2d",
-            "in progress",
-        ),
-        TaskStatus.IN_PROGRESS,
-    ),
-    (
-        (
-            "\u5361\u4f4f",
-            "\u88ab\u5361",
-            "blocked",
-        ),
-        TaskStatus.BLOCKED,
-    ),
-    (
-        (
-            "\u5df2\u5b8c\u6210",
-            "\u5b8c\u6210\u4e86\u591a\u5c11",
-            "done",
-        ),
-        TaskStatus.DONE,
-    ),
-]
 
 def _split_multi_values(value: Optional[str]) -> List[str]:
     if not value:
@@ -335,24 +286,6 @@ def _detect_due_range(text: str) -> Optional[TimeRange]:
             start = f"now-{amount * 30}d"
         return TimeRange(start=start, end="now")
     return None
-
-
-
-
-def _detect_task_count_mode(text: str) -> Optional[List[TaskStatus]]:
-    if not text:
-        return None
-    if not any(kw in text for kw in _TASK_COUNT_QUESTION_HINTS):
-        return None
-    statuses: List[TaskStatus] = []
-    for hints, status in _TASK_COUNT_STATUS_HINTS:
-        if any(h in text for h in hints):
-            if status not in statuses:
-                statuses.append(status)
-    if not statuses:
-        statuses = [TaskStatus.TODO, TaskStatus.IN_PROGRESS]
-    return statuses
-
 
 def _looks_like_person(token: str) -> bool:
     if not token:
@@ -513,36 +446,6 @@ def _post_process_intent(spec: TaskQuerySpec, text: str) -> None:
         spec.limit = 1
         if not spec.order_by:
             spec.order_by = [OrderBySpec(field="ts", direction=OrderByDirection.desc)]
-
-    count_statuses = _detect_task_count_mode(t)
-    if count_statuses:
-        spec.intent = TaskQueryIntent.task_status_list
-        spec.answer_mode = TaskAnswerMode.task_count_by_status
-        existing_statuses = []
-        if getattr(spec, "status", None):
-            existing_statuses = list(spec.status)
-        merged: List[TaskStatus] = []
-        seen = set()
-        for item in existing_statuses + count_statuses:
-            try:
-                enum_item = item if isinstance(item, TaskStatus) else TaskStatus(str(item))
-            except Exception:
-                continue
-            if enum_item not in seen:
-                merged.append(enum_item)
-                seen.add(enum_item)
-        spec.status = merged or count_statuses
-        if spec.limit is None:
-            spec.limit = max(len(count_statuses), len(TaskStatus.__members__), 4)
-        else:
-            try:
-                limit_val = int(spec.limit)
-            except Exception:
-                limit_val = 0
-            min_limit = max(len(count_statuses), len(TaskStatus.__members__), 4)
-            if limit_val < min_limit:
-                spec.limit = min_limit
-        spec.order_by = []
 
     if (
         t.endswith("什么状态？")

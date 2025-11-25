@@ -126,12 +126,9 @@ def test_parse_completion_time_question_sets_answer_mode() -> None:
     assert spec.limit == 1
 
 
-def test_parse_task_count_question_sets_answer_mode() -> None:
+def test_parse_task_count_question_defaults_without_llm() -> None:
     spec = parse_task_query_nl(COUNT_QUERY)
-    assert spec.answer_mode == TaskAnswerMode.task_count_by_status
-    assert spec.intent == TaskQueryIntent.task_status_list
-    assert spec.limit is not None and spec.limit >= 4
-    assert any(status == TaskStatus.TODO for status in spec.status)
+    assert spec.answer_mode == TaskAnswerMode.default
 
 
 def test_post_process_adds_multi_person_filters() -> None:
