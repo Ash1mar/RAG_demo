@@ -49,6 +49,20 @@ def _build_params_from_plan(ir: Dict[str, Any]) -> Tuple[Any, ...]:
     return tuple(params)
 
 
+def _spec_has_field_filter(spec: TaskQuerySpec, field: str) -> bool:
+    if getattr(spec, field, None):
+        return True
+    filters = getattr(spec, "filters", None) or []
+    for flt in filters:
+        try:
+            flt_field = str(getattr(flt, "field", "")).lower()
+        except AttributeError:
+            continue
+        if flt_field == field:
+            return True
+    return False
+
+
 def compile_tasks_sql(spec: TaskQuerySpec) -> CompiledSql:
     """Compile TaskQuerySpec (NL semantic IR) into a safe, read‑only SQL for `tasks` table.
 
@@ -99,6 +113,22 @@ def compile_tasks_sql(spec: TaskQuerySpec) -> CompiledSql:
         sql = build_sql_from_ir(ir)
         params = list(_build_params_from_plan(ir))
         # Last param is the LIMIT positional value; ensure it matches the clamped limit.
+        if params:
+            params[-1] = limit_int
+        return CompiledSql(sql=sql, params=tuple(params))
+
+    if intent == TaskQueryIntent.person_summary:
+        if not _spec_has_field_filter(spec, "person"):
+            raise TaskSqlCompileError("person_summary requires at least one person scope")
+        raw_limit = spec.limit if spec.limit is not None else 100
+        try:
+            limit_int = max(1, min(int(raw_limit), 500))
+        except Exception as exc:
+            raise TaskSqlCompileError("invalid limit in TaskQuerySpec") from exc
+        spec.limit = limit_int
+        ir = build_task_query_plan(spec)
+        sql = build_sql_from_ir(ir)
+        params = list(_build_params_from_plan(ir))
         if params:
             params[-1] = limit_int
         return CompiledSql(sql=sql, params=tuple(params))

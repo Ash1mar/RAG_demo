@@ -88,6 +88,7 @@ def build_sql_from_ir(ir: Dict[str, Any]) -> str:
     filters = ir.get("filters") or []
     projections = ir.get("projections") or []
     sort = ir.get("sort") or []
+    group_by = ir.get("group_by") or []
     limit = ir.get("limit")
 
     if not projections:
@@ -96,11 +97,14 @@ def build_sql_from_ir(ir: Dict[str, Any]) -> str:
     cols = ", ".join(projections)
 
     where_sql = _render_where(filters)
+    group_sql = ""
+    if group_by:
+        group_sql = " GROUP BY " + ", ".join(group_by)
     order_sql = _render_order_by(sort)
 
     # Intent-level branching is intentionally minimal; both status queries
     # and task lists share the same basic SELECT/WHERE/ORDER/LIMIT shape.
-    base = f"SELECT {cols} FROM {table}{where_sql}{order_sql}"
+    base = f"SELECT {cols} FROM {table}{where_sql}{group_sql}{order_sql}"
 
     # Always use a positional placeholder for LIMIT when present so that
     # callers can clamp and bind the concrete value themselves.

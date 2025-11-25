@@ -10,8 +10,11 @@ import numpy as np
 
 from app.services.embeddings import Embedder
 from app.services.nl2sql_engine import (
+    QueryFilter,
+    TaskAnswerMode,
     TaskQueryIntent,
     TaskStatus,
+    TaskQuerySpec,
     build_task_query_plan,
     parse_task_query_nl,
 )
@@ -298,6 +301,74 @@ class TaskQueryEngine:
             "tasks": len(self.resolver.tasks if self.resolver else []),
         }
 
+    def _align_filters_with_resolver(self, spec: TaskQuerySpec) -> Dict[str, List[str]]:
+        """
+        Align QueryFilter values for person/task using the resolver so that
+        downstream SQL compilation can leverage multi-value filters directly.
+        """
+        alignment: Dict[str, List[str]] = {}
+        filters = getattr(spec, "filters", None) or []
+        if not filters or self.resolver is None:
+            return alignment
+
+        for field_name in ("person", "task"):
+            raw_values: List[str] = []
+            target_filters: List[QueryFilter] = []
+            for flt in filters:
+                if not isinstance(flt, QueryFilter):
+                    continue
+                field = str(getattr(flt, "field", "") or "")
+                if field.lower() != field_name:
+                    continue
+                target_filters.append(flt)
+                op = str(getattr(flt, "op", "eq") or "").lower()
+                if op == "in":
+                    values = getattr(flt, "values", None) or []
+                    raw_values.extend([str(v) for v in values if v])
+                elif getattr(flt, "value", None):
+                    raw_values.append(str(flt.value))
+            if not raw_values:
+                continue
+
+            resolved_values: List[str] = []
+            resolver_fn = (
+                self.resolver.resolve_person
+                if field_name == "person"
+                else self.resolver.resolve_task
+            )
+            for raw in raw_values:
+                hits = resolver_fn(raw)
+                if hits:
+                    resolved_values.append(hits[0][0])
+                else:
+                    resolved_values.append(raw)
+
+            alignment[field_name] = resolved_values
+
+            idx = 0
+            for flt in target_filters:
+                op = str(getattr(flt, "op", "eq") or "").lower()
+                if op == "in":
+                    flt.values = list(resolved_values)
+                    idx = len(resolved_values)
+                else:
+                    if idx < len(resolved_values):
+                        flt.value = resolved_values[idx]
+                        idx += 1
+
+            if field_name == "person":
+                if len(resolved_values) > 1:
+                    spec.person = None
+                elif len(resolved_values) == 1 and not spec.person:
+                    spec.person = resolved_values[0]
+            else:
+                if len(resolved_values) > 1:
+                    spec.task = None
+                elif len(resolved_values) == 1 and not spec.task:
+                    spec.task = resolved_values[0]
+
+        return alignment
+
     def answer(self, q: str, topk: int = 3, thresh: Optional[float] = None) -> Dict[str, Any]:
         """Main entry for non-LLM task status queries."""
         mode_raw = (self.resolver_mode or "hybrid").lower()
@@ -467,11 +538,26 @@ class TaskQueryEngine:
         if thresh is not None and abs(float(thresh) - self.resolver.cfg.thresh) > 1e-9:
             self.resolver.cfg.thresh = float(thresh)
 
-        q_person = spec.person or q
-        q_task = spec.task or q
+        filter_alignment = self._align_filters_with_resolver(spec)
+        person_filter_values = filter_alignment.get("person", [])
+        task_filter_values = filter_alignment.get("task", [])
 
-        person_hits = self.resolver.resolve_person(q_person)[:topk]
-        task_hits = self.resolver.resolve_task(q_task)[:topk]
+        q_person = spec.person or (person_filter_values[0] if person_filter_values else q)
+        q_task = spec.task or (task_filter_values[0] if task_filter_values else q)
+
+        person_filters_active = bool(person_filter_values)
+        task_filters_active = bool(task_filter_values)
+
+        person_hits = (
+            [(val, 1.0) for val in person_filter_values]
+            if person_filters_active
+            else self.resolver.resolve_person(q_person)[:topk]
+        )
+        task_hits = (
+            [(val, 1.0) for val in task_filter_values]
+            if task_filters_active
+            else self.resolver.resolve_task(q_task)[:topk]
+        )
 
         payload.update(
             {
@@ -483,6 +569,10 @@ class TaskQueryEngine:
                 },
             }
         )
+        if person_filters_active:
+            payload["filter_persons"] = person_filter_values
+        if task_filters_active:
+            payload["filter_tasks"] = task_filter_values
 
         best_p = person_hits[0] if person_hits else None
         best_t = task_hits[0] if task_hits else None
@@ -506,11 +596,11 @@ class TaskQueryEngine:
             delta_min = 0.09 if getattr(self.resolver.cfg, "delta_min", None) is None else float(self.resolver.cfg.delta_min)
             weak_min = tt if getattr(self.resolver.cfg, "weak_task_min", None) is None else float(self.resolver.cfg.weak_task_min)
 
-            p_ok = best_p[1] >= tp
+            p_ok = person_filters_active or (best_p[1] >= tp)
             t_ok = True
             if task_required:
-                t_ok = best_t[1] >= tt
-                if not t_ok:
+                t_ok = task_filters_active or (best_t[1] >= tt)
+                if not t_ok and not task_filters_active:
                     second_t = task_hits[1][1] if len(task_hits) > 1 else -1.0
                     if best_t[1] >= weak_min and (second_t >= 0) and (best_t[1] - second_t) >= delta_min:
                         t_ok = True
@@ -521,8 +611,8 @@ class TaskQueryEngine:
                 payload["error"] = "hybrid_llm_low_confidence"
                 return payload
 
-        person = best_p[0]
-        task_val = best_t[0] if best_t else None
+        person = None if person_filters_active else best_p[0]
+        task_val = None if task_filters_active else (best_t[0] if best_t else None)
 
         # 清理 status: 去掉 ANY，列表类查询可选择性放宽
         if getattr(spec, "status", None):
@@ -535,14 +625,20 @@ class TaskQueryEngine:
                 spec.status = []
 
         if spec_intent == TaskQueryIntent.task_list_by_person:
-            spec.person = person
+            spec.person = None if person_filters_active else person
             spec.task = None
             # List-by-person should list all tasks; drop status filters from IR.
             spec.status = []
         else:
-            spec.person = person
+            if person_filters_active:
+                spec.person = None
+            else:
+                spec.person = person
             if task_required:
-                spec.task = task_val or spec.task
+                if task_filters_active:
+                    spec.task = None
+                else:
+                    spec.task = task_val or spec.task
             else:
                 spec.task = None
 
@@ -603,6 +699,38 @@ class TaskQueryEngine:
             payload["task"] = task_val
             return payload
 
+        answer_mode = getattr(spec, "answer_mode", TaskAnswerMode.default)
+        if isinstance(answer_mode, str):
+            try:
+                answer_mode = TaskAnswerMode(answer_mode)
+            except ValueError:
+                answer_mode = TaskAnswerMode.default
+        payload["answer_mode"] = answer_mode.value
+
+        if answer_mode == TaskAnswerMode.completion_time_latest:
+            done_row = next(
+                (
+                    rec
+                    for rec in rows
+                    if str(rec.get("status", "")).upper() == TaskStatus.DONE.value
+                ),
+                rows[0],
+            )
+            ts = int(done_row.get("ts", -1))
+            ts_str = ts_to_str(ts) if ts >= 0 else "unknown time"
+            payload.update(
+                {
+                    "answer": f'{person} / "{task_val or spec.task}" was completed at {ts_str}.',
+                    "person": person,
+                    "task": task_val or spec.task,
+                    "status": str(done_row.get("status", "")).upper(),
+                    "ts": ts,
+                }
+            )
+            if low_conf:
+                payload["answer"] = str(payload.get("answer", "")) + " (low confidence)"
+            return payload
+
         spec_intent = getattr(spec, "intent", None)
 
         if spec_intent == TaskQueryIntent.task_list_by_person:
@@ -611,15 +739,30 @@ class TaskQueryEngine:
             for rec in rows[:5]:
                 t_name = str(rec.get("task", ""))
                 t_status = str(rec.get("status", "")).upper()
-                preview_tasks.append(f"{t_name}({t_status})")
+                rec_person = str(rec.get("person", ""))
+                if person_filters_active and rec_person:
+                    preview_tasks.append(f"{rec_person}:{t_name}({t_status})")
+                else:
+                    preview_tasks.append(f"{t_name}({t_status})")
             preview = ", ".join(preview_tasks) if preview_tasks else "none"
-            payload.update(
-                {
-                    "answer": f"{person} has {count} tasks: {preview}",
-                    "person": person,
-                    "task": None,
-                }
-            )
+            if person_filters_active:
+                names = ", ".join(person_filter_values)
+                payload.update(
+                    {
+                        "answer": f"Tasks for {names}: {preview}",
+                        "person": None,
+                        "persons": person_filter_values,
+                        "task": None,
+                    }
+                )
+            else:
+                payload.update(
+                    {
+                        "answer": f"{person} has {count} tasks: {preview}",
+                        "person": person,
+                        "task": None,
+                    }
+                )
             if low_conf:
                 payload["answer"] = str(payload.get("answer", "")) + " (low confidence)"
             return payload
@@ -630,15 +773,30 @@ class TaskQueryEngine:
             for rec in rows[:5]:
                 t_name = str(rec.get("task", ""))
                 t_status = str(rec.get("status", "")).upper()
-                preview.append(f"{t_name}({t_status})")
+                rec_person = str(rec.get("person", ""))
+                if person_filters_active and rec_person:
+                    preview.append(f"{rec_person}:{t_name}({t_status})")
+                else:
+                    preview.append(f"{t_name}({t_status})")
             preview_str = ", ".join(preview) if preview else "none"
-            payload.update(
-                {
-                    "answer": f"{person} has {count} task status records: {preview_str}",
-                    "person": person,
-                    "task": None,  # list intent should not pin to a single task
-                }
-            )
+            if person_filters_active:
+                names = ", ".join(person_filter_values)
+                payload.update(
+                    {
+                        "answer": f"{names} have {count} task status records: {preview_str}",
+                        "person": None,
+                        "persons": person_filter_values,
+                        "task": None,
+                    }
+                )
+            else:
+                payload.update(
+                    {
+                        "answer": f"{person} has {count} task status records: {preview_str}",
+                        "person": person,
+                        "task": None,
+                    }
+                )
             if low_conf:
                 payload["answer"] = str(payload.get("answer", "")) + " (low confidence)"
             return payload
@@ -656,6 +814,34 @@ class TaskQueryEngine:
                     "task": task_val,
                     "status": status,
                     "ts": ts,
+                }
+            )
+            if low_conf:
+                payload["answer"] = str(payload.get("answer", "")) + " (low confidence)"
+            return payload
+
+        if spec_intent == TaskQueryIntent.person_summary:
+            summary: Dict[str, List[str]] = {}
+            for rec in rows:
+                p_name = str(rec.get("person", ""))
+                status = str(rec.get("status", "")).upper()
+                count_val = rec.get("task_count")
+                try:
+                    cnt = int(count_val)
+                except (TypeError, ValueError):
+                    cnt = count_val
+                summary.setdefault(p_name, []).append(f"{status}={cnt}")
+            parts = []
+            for p_name, stats in summary.items():
+                stats_str = ", ".join(stats)
+                parts.append(f"{p_name}: {stats_str}")
+            answer = "; ".join(parts) if parts else "No summary data."
+            payload.update(
+                {
+                    "answer": answer,
+                    "person": None if person_filters_active else person,
+                    "persons": person_filter_values if person_filters_active else ([person] if person else []),
+                    "task": None,
                 }
             )
             if low_conf:

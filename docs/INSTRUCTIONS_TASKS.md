@@ -157,12 +157,14 @@ python scripts/init_tasks_sqlite.py
 - 模块：`app/services/nl2sql_engine.py`
 - 核心模型：`TaskQuerySpec`，字段包括但不限于：
   - `intent`：如 `task_status_single` / `task_status_list` / `task_list_by_person` / `unknown`
+  - `answer_mode`?可选提示回答模式，如 `completion_time_latest`
   - `person` / `task`：解析出的人名和任务名（可空）
   - `task_keywords`：任务相关关键词列表
   - `status`：状态过滤枚举列表，如 `[DONE]` / `[TODO]`
   - `time_range`：时间范围
   - `order_by`：排序字段 + 方向列表
   - `limit`：返回上限
+  - `filters`: flexible list of `{field, op, value/values}` entries for multi-person/task scopes and advanced conditions.
 
 - 接口函数：
   - `parse_task_query_nl(q: str) -> TaskQuerySpec`

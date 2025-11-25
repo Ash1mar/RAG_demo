@@ -2,12 +2,27 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+import pytest
+
 from fastapi.testclient import TestClient
 
 from app.demo_app import app, TASKS
-from app.services.nl2sql_engine import TaskQueryIntent, parse_task_query_nl, TaskQuerySpec
+from app.services.nl2sql_engine import (
+    QueryFilter,
+    TaskAnswerMode,
+    TaskQueryIntent,
+    TaskQuerySpec,
+    TaskStatus,
+    build_task_query_plan,
+    parse_task_query_nl,
+    _post_process_intent,
+)
 from app.services.sql_compiler import compile_tasks_sql, TaskSqlCompileError, CompiledSql
 
+STATUS_QUERY = "\u5f20\u4e09\u7684E3D\u63a5\u53e3\u8054\u8c03\u73b0\u5728\u4ec0\u4e48\u72b6\u6001\uff1f"
+MULTI_PERSON_QUERY = "\u5f20\u4e09\u548c\u674e\u56db\u6700\u8fd1\u4e00\u5468\u7684\u4efb\u52a1\u5217\u8868\u8fd8\u6709\u54ea\u4e9b\uff1f"
+COMPLETION_QUERY = "\u5f20\u4e09\u7684E3D\u63a5\u53e3\u8054\u8c03\u662f\u4ec0\u4e48\u65f6\u5019\u5b8c\u6210\u7684\uff1f"
+DUE_PRIORITY_QUERY = "\u5217\u51fa\u674e\u56db\u672c\u5468\u622a\u6b62\u7684\u9ad8\u4f18P1\u4efb\u52a1"
 
 client = TestClient(app)
 
@@ -85,3 +100,96 @@ def test_db_ask_invalid_query_returns_4xx() -> None:
     # For an obviously incomplete query, IR may not compile into SQL.
     resp = client.get("/db/ask", params={"q": ""})
     assert resp.status_code == 400
+
+
+def test_parse_task_query_detects_time_range_and_filters() -> None:
+    spec = parse_task_query_nl(MULTI_PERSON_QUERY)
+    assert spec.intent in (
+        TaskQueryIntent.task_status_list,
+        TaskQueryIntent.task_list_by_person,
+    )
+    assert spec.time_range is not None
+    assert spec.person is not None
+    assert any(
+        f.field == "person" and f.op.lower() == "in" and f.values and len(f.values) >= 2
+        for f in spec.filters
+    )
+
+
+def test_parse_completion_time_question_sets_answer_mode() -> None:
+    q = "张三的E3D接口联调是什么时候完成的？"
+    spec = parse_task_query_nl(q)
+    assert spec.answer_mode == TaskAnswerMode.completion_time_latest
+    assert spec.intent == TaskQueryIntent.task_history
+    assert spec.status == [TaskStatus.DONE]
+    assert spec.limit == 1
+
+
+def test_post_process_adds_multi_person_filters() -> None:
+    spec = TaskQuerySpec(
+        intent=TaskQueryIntent.task_status_list,
+        raw_query="",
+        person="??",
+        filters=[],
+    )
+    _post_process_intent(spec, MULTI_PERSON_QUERY)
+    assert any(
+        getattr(f, "field", "") == "person"
+        and getattr(f, "op", "").lower() == "in"
+        for f in spec.filters
+    )
+    assert spec.person is None
+
+
+def test_post_process_detects_due_range_and_priority_keywords() -> None:
+    spec = TaskQuerySpec(
+        intent=TaskQueryIntent.task_list_by_person,
+        raw_query=DUE_PRIORITY_QUERY,
+        person="??",
+        filters=[],
+    )
+    _post_process_intent(spec, DUE_PRIORITY_QUERY)
+    assert spec.due_range is not None
+    assert spec.due_range.start == "start_of_week"
+    assert spec.priority == 1
+
+
+def test_build_plan_respects_custom_filters() -> None:
+    spec = TaskQuerySpec(
+        intent=TaskQueryIntent.task_status_list,
+        raw_query="multi person query",
+        person="张三",
+        filters=[
+            QueryFilter(field="person", op="in", values=["张三", "李四"]),
+            QueryFilter(field="project", op="eq", value="Alpha"),
+        ],
+    )
+    plan = build_task_query_plan(spec)
+    fields = [f["field"] for f in plan["filters"]]
+    assert "person" in fields
+    assert "project" in fields
+    assert any(f["op"] == "in" and f["field"] == "person" for f in plan["filters"])
+
+
+def test_compile_sql_person_summary_requires_scope() -> None:
+    spec = TaskQuerySpec(
+        intent=TaskQueryIntent.person_summary,
+        raw_query="summary missing scope",
+    )
+    with pytest.raises(TaskSqlCompileError):
+        compile_tasks_sql(spec)
+
+
+def test_compile_sql_person_summary_group_by() -> None:
+    spec = TaskQuerySpec(
+        intent=TaskQueryIntent.person_summary,
+        raw_query="summary",
+        person="张三",
+        status=[TaskStatus.DONE],
+    )
+    compiled = compile_tasks_sql(spec)
+    sql_lower = compiled.sql.lower()
+    assert "count" in sql_lower
+    assert "group by" in sql_lower
+    assert "task_count" in sql_lower
+    assert compiled.params[-1] == spec.limit

@@ -247,6 +247,38 @@ This validates that NL→JSON parsing, JSON→SQL compilation, and the `/db/ask`
 
 ---
 
+### 9.5) Manual NL Query Scenarios (covering new IR features)
+
+Use these natural language prompts to quickly probe recently added IR fields (`filters`, multi-person scopes, summaries, time ranges). For each scenario you can:
+
+```powershell
+# Inspect IR/SQL directly
+curl "http://127.0.0.1:8000/db/ask?q=<NL_QUERY>"
+
+# Or run through the hybrid_llm resolver (needs RESOLVER=hybrid_llm, TASKS_NL2SQL_LLM=1)
+curl "http://127.0.0.1:8000/tasks/ask?q=<NL_QUERY>"
+```
+
+| Scenario | NL query (copy/paste) | What to verify |
+| --- | --- | --- |
+| Single status baseline | `张三的E3D接口联调现在什么状态？` | Intent `task_status_single`, `person`/`task` filled, `limit=1`, SQL targets `task_latest`. |
+| Completion time (latest DONE) | `张三的E3D接口联调是什么时候完成的？` | Parser sets `answer_mode=completion_time_latest`, `status=[DONE]`, `limit=1`, intent switches to `task_history`. `/tasks/ask` should respond `… was completed at …` instead of状态描述。 |
+| Multi-person list (filters + time_range) | `张三和李四最近一周的任务列表还有哪些？` | `filters` contains `{"field":"person","op":"in","values":["张三","李四"]}`, `time_range.start=now-7d`, intent `task_status_list` or `task_list_by_person`. Hybrid resolver should echo `filter_persons`. |
+| Project + tag filter | `把芯片项目里带#安全整改标签的任务都列出来` | `project="芯片"`, `tags=["安全整改"]`, SQL adds `project = ?` AND `tags LIKE ?`. |
+| Priority + due_range | `列出李四本周截止的高优P1任务` | `priority=1`, `due_range` reflects current week boundaries, limit tightened, ORDER BY defaults to ts/priority. |
+| Person summary (group by) | `给我张三和李四的任务状态汇总` | Intent `person_summary`, `filters` includes multi-person IN; SQL should output `COUNT(*) AS task_count` with `GROUP BY person, status`. |
+| Task history (full timeline) | `张三的E3D接口联调历史状态` | Intent `task_history`, SQL selects from `tasks` (not `task_latest`) with higher default limit (200). |
+
+When verifying via `/db/ask`, focus on the `ir` bloc (`filters`, `time_range`, `order_by`) and generated SQL. When verifying via `/tasks/ask` in `hybrid_llm`, confirm:
+
+- `candidates.persons` contains each resolved person with score 1.0 when filters are pre-aligned.
+- `sql` / `params` reflect group-by or IN clauses as expected.
+- `answer` surfaces aggregated preview for `person_summary` and multi-person lists (names included).
+
+Feel free to extend the table with more domain-specific prompts (e.g., tags per department, time windows like “过去30天”), keeping the same inspection steps.
+
+---
+
 ## 10) Environment Variables
 
 - `STORE` = `faiss` (default) or `milvus`
