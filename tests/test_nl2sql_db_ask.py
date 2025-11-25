@@ -23,6 +23,7 @@ STATUS_QUERY = "\u5f20\u4e09\u7684E3D\u63a5\u53e3\u8054\u8c03\u73b0\u5728\u4ec0\
 MULTI_PERSON_QUERY = "\u5f20\u4e09\u548c\u674e\u56db\u6700\u8fd1\u4e00\u5468\u7684\u4efb\u52a1\u5217\u8868\u8fd8\u6709\u54ea\u4e9b\uff1f"
 COMPLETION_QUERY = "\u5f20\u4e09\u7684E3D\u63a5\u53e3\u8054\u8c03\u662f\u4ec0\u4e48\u65f6\u5019\u5b8c\u6210\u7684\uff1f"
 DUE_PRIORITY_QUERY = "\u5217\u51fa\u674e\u56db\u672c\u5468\u622a\u6b62\u7684\u9ad8\u4f18P1\u4efb\u52a1"
+COUNT_QUERY = "\u5f20\u4e09\u8fd8\u6709\u591a\u5c11\u4efb\u52a1\u672a\u5b8c\u6210\uff1f"
 
 client = TestClient(app)
 
@@ -125,6 +126,14 @@ def test_parse_completion_time_question_sets_answer_mode() -> None:
     assert spec.limit == 1
 
 
+def test_parse_task_count_question_sets_answer_mode() -> None:
+    spec = parse_task_query_nl(COUNT_QUERY)
+    assert spec.answer_mode == TaskAnswerMode.task_count_by_status
+    assert spec.intent == TaskQueryIntent.task_status_list
+    assert spec.limit is not None and spec.limit >= 4
+    assert any(status == TaskStatus.TODO for status in spec.status)
+
+
 def test_post_process_adds_multi_person_filters() -> None:
     spec = TaskQuerySpec(
         intent=TaskQueryIntent.task_status_list,
@@ -192,4 +201,36 @@ def test_compile_sql_person_summary_group_by() -> None:
     assert "count" in sql_lower
     assert "group by" in sql_lower
     assert "task_count" in sql_lower
+    assert compiled.params[-1] == spec.limit
+
+
+def test_build_plan_for_task_count_answer_mode() -> None:
+    spec = TaskQuerySpec(
+        intent=TaskQueryIntent.task_status_list,
+        raw_query=COUNT_QUERY,
+        person="张三",
+        status=[TaskStatus.TODO, TaskStatus.IN_PROGRESS],
+        answer_mode=TaskAnswerMode.task_count_by_status,
+        limit=10,
+    )
+    plan = build_task_query_plan(spec)
+    assert plan["projections"] == ["status", "COUNT(*) AS task_count"]
+    assert plan["group_by"] == ["status"]
+    assert plan["sort"][0]["field"] == "task_count"
+    assert plan["limit"] == 10
+
+
+def test_compile_sql_task_count_answer_mode_includes_group_by() -> None:
+    spec = TaskQuerySpec(
+        intent=TaskQueryIntent.task_status_list,
+        raw_query=COUNT_QUERY,
+        person="张三",
+        status=[TaskStatus.TODO, TaskStatus.IN_PROGRESS],
+        answer_mode=TaskAnswerMode.task_count_by_status,
+        limit=8,
+    )
+    compiled = compile_tasks_sql(spec)
+    sql_lower = compiled.sql.lower()
+    assert "count(*) as task_count" in sql_lower
+    assert "group by status" in sql_lower
     assert compiled.params[-1] == spec.limit

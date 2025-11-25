@@ -529,6 +529,17 @@ class TaskQueryEngine:
             else:
                 payload["intent"] = "unknown"
 
+        raw_answer_mode = getattr(spec, "answer_mode", TaskAnswerMode.default)
+        if isinstance(raw_answer_mode, TaskAnswerMode):
+            answer_mode_hint = raw_answer_mode
+        elif isinstance(raw_answer_mode, str):
+            try:
+                answer_mode_hint = TaskAnswerMode(raw_answer_mode)
+            except ValueError:
+                answer_mode_hint = TaskAnswerMode.default
+        else:
+            answer_mode_hint = TaskAnswerMode.default
+
         # 2) Hybrid entity alignment on top of IR
         self.ensure_built()
         assert self.resolver is not None
@@ -580,10 +591,19 @@ class TaskQueryEngine:
         if spec_intent in (TaskQueryIntent.task_list_by_person, TaskQueryIntent.person_summary):
             task_required = False
         elif spec_intent == TaskQueryIntent.task_status_list and not spec.task:
-            # 当没有给出具体任务时，允许仅按人列出状态列表
+            # ?????????????????????????????????????
+            task_required = False
+        if answer_mode_hint == TaskAnswerMode.task_count_by_status:
             task_required = False
 
-        if not best_p or (task_required and not best_t):
+        person_required = not (
+            answer_mode_hint == TaskAnswerMode.task_count_by_status
+            and not person_filters_active
+            and not spec.person
+        )
+
+
+        if (person_required and not best_p) or (task_required and not best_t):
             payload["error"] = "hybrid_llm_no_candidates"
             payload["answer"] = "Could not resolve person or task; please pick from candidates."
             return payload
@@ -596,7 +616,13 @@ class TaskQueryEngine:
             delta_min = 0.09 if getattr(self.resolver.cfg, "delta_min", None) is None else float(self.resolver.cfg.delta_min)
             weak_min = tt if getattr(self.resolver.cfg, "weak_task_min", None) is None else float(self.resolver.cfg.weak_task_min)
 
-            p_ok = person_filters_active or (best_p[1] >= tp)
+            if person_required:
+                if person_filters_active:
+                    p_ok = True
+                else:
+                    p_ok = bool(best_p) and (best_p[1] >= tp)
+            else:
+                p_ok = True
             t_ok = True
             if task_required:
                 t_ok = task_filters_active or (best_t[1] >= tt)
@@ -611,8 +637,18 @@ class TaskQueryEngine:
                 payload["error"] = "hybrid_llm_low_confidence"
                 return payload
 
-        person = None if person_filters_active else best_p[0]
-        task_val = None if task_filters_active else (best_t[0] if best_t else None)
+        if person_filters_active:
+            person = None
+        elif best_p:
+            person = best_p[0]
+        else:
+            person = spec.person
+        if task_filters_active:
+            task_val = None
+        elif best_t:
+            task_val = best_t[0]
+        else:
+            task_val = spec.task
 
         # 清理 status: 去掉 ANY，列表类查询可选择性放宽
         if getattr(spec, "status", None):
@@ -699,12 +735,7 @@ class TaskQueryEngine:
             payload["task"] = task_val
             return payload
 
-        answer_mode = getattr(spec, "answer_mode", TaskAnswerMode.default)
-        if isinstance(answer_mode, str):
-            try:
-                answer_mode = TaskAnswerMode(answer_mode)
-            except ValueError:
-                answer_mode = TaskAnswerMode.default
+        answer_mode = answer_mode_hint
         payload["answer_mode"] = answer_mode.value
 
         if answer_mode == TaskAnswerMode.completion_time_latest:
@@ -725,6 +756,60 @@ class TaskQueryEngine:
                     "task": task_val or spec.task,
                     "status": str(done_row.get("status", "")).upper(),
                     "ts": ts,
+                }
+            )
+            if low_conf:
+                payload["answer"] = str(payload.get("answer", "")) + " (low confidence)"
+            return payload
+
+        if answer_mode == TaskAnswerMode.task_count_by_status:
+            counts_map: Dict[str, int] = {}
+            for rec in rows:
+                status = str(rec.get("status", "")).upper() or "UNKNOWN"
+                raw_count = rec.get("task_count")
+                try:
+                    cnt = int(raw_count)
+                except (TypeError, ValueError):
+                    cnt = 1
+                if cnt < 0:
+                    cnt = 0
+                counts_map[status] = counts_map.get(status, 0) + cnt
+            counts = [
+                {"status": status, "count": counts_map[status]}
+                for status in sorted(counts_map.keys(), key=lambda s: (-counts_map[s], s))
+            ]
+            total = sum(item["count"] for item in counts)
+            stats_str = ", ".join(f"{item['status']}={item['count']}" for item in counts) or "none"
+            if person_filters_active and person_filter_values:
+                subject_label = ", ".join(person_filter_values)
+            elif person:
+                subject_label = str(person)
+            else:
+                subject_label = "Tasks"
+            scope_bits: List[str] = []
+            time_range = getattr(spec, "time_range", None)
+            if time_range:
+                scope_bits.append(
+                    f"time_range={getattr(time_range, 'start', None) or '*'}~{getattr(time_range, 'end', None) or '*'}"
+                )
+            due_range = getattr(spec, "due_range", None)
+            if due_range:
+                scope_bits.append(
+                    f"due_range={getattr(due_range, 'start', None) or '*'}~{getattr(due_range, 'end', None) or '*'}"
+                )
+            scope_suffix = f" within {', '.join(scope_bits)}" if scope_bits else ""
+            if subject_label == "Tasks":
+                answer_prefix = "Tasks by status"
+            else:
+                answer_prefix = f"{subject_label} tasks by status"
+            payload.update(
+                {
+                    "answer": f"{answer_prefix}{scope_suffix}: {stats_str} (total {total}).",
+                    "person": None if person_filters_active else person,
+                    "persons": person_filter_values if person_filters_active else ([person] if person else []),
+                    "task": None,
+                    "status_counts": counts,
+                    "total_tasks": total,
                 }
             )
             if low_conf:
