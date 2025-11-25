@@ -39,6 +39,8 @@ class TaskAnswerMode(str, Enum):
     default = "default"
     completion_time_latest = "completion_time_latest"
     task_count_by_status = "task_count_by_status"
+    person_summary_by_project = "person_summary_by_project"
+    overdue_count_by_person = "overdue_count_by_person"
 
 
 class TaskStatus(str, Enum):
@@ -412,6 +414,11 @@ def _post_process_intent(spec: TaskQuerySpec, text: str) -> None:
     t = (text or "").strip()
     if not t:
         return
+    # Phase 3 heuristics freeze: keep this function limited to the generic
+    # heuristics below (completion-time detection, status intent tweaks,
+    # multi-person filters, time/due/priority hints, limit/order adjustments).
+    # New domain-specific behaviors should be expressed via LLM IR fields /
+    # answer_mode, not by adding more pattern matching here.
 
     raw_mode = getattr(spec, "answer_mode", TaskAnswerMode.default)
     if isinstance(raw_mode, TaskAnswerMode):
@@ -772,6 +779,20 @@ def build_task_query_plan(spec: TaskQuerySpec) -> Dict[str, Any]:
             "COUNT(*) AS task_count",
         ]
         group_by = ["status"]
+    elif answer_mode == TaskAnswerMode.person_summary_by_project:
+        projections = [
+            "project",
+            "person",
+            "status",
+            "COUNT(*) AS task_count",
+        ]
+        group_by = ["project", "person", "status"]
+    elif answer_mode == TaskAnswerMode.overdue_count_by_person:
+        projections = [
+            "person",
+            "COUNT(*) AS overdue_count",
+        ]
+        group_by = ["person"]
     elif spec.intent in (
         TaskQueryIntent.task_status_single,
         TaskQueryIntent.task_status_list,
@@ -817,6 +838,17 @@ def build_task_query_plan(spec: TaskQuerySpec) -> Dict[str, Any]:
         sort = [
             {"field": "task_count", "direction": "DESC"},
             {"field": "status", "direction": "ASC"},
+        ]
+    elif answer_mode == TaskAnswerMode.person_summary_by_project:
+        sort = [
+            {"field": "project", "direction": "ASC"},
+            {"field": "person", "direction": "ASC"},
+            {"field": "status", "direction": "ASC"},
+        ]
+    elif answer_mode == TaskAnswerMode.overdue_count_by_person:
+        sort = [
+            {"field": "overdue_count", "direction": "DESC"},
+            {"field": "person", "direction": "ASC"},
         ]
     elif not sort:
         if spec.intent == TaskQueryIntent.person_summary:

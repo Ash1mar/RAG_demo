@@ -361,7 +361,7 @@ To “eat the IR full” without touching parser code, teach the LLM prompt to p
 ```json
 {
   "intent": "task_status_single | task_status_list | task_list_by_person | task_history | person_summary",
-  "answer_mode": "default | completion_time_latest | task_count_by_status",
+  "answer_mode": "default | completion_time_latest | task_count_by_status | person_summary_by_project | overdue_count_by_person",
   "person": "张三",
   "task": "E3D接口联调",
   "task_keywords": ["接口", "联调"],
@@ -390,7 +390,9 @@ To “eat the IR full” without touching parser code, teach the LLM prompt to p
 1. **Always fill `intent` + `answer_mode` explicitly.**  
    - Single-task status → `task_status_single` + `answer_mode=default`.  
    - “When was it finished?” → `intent=task_history`, `answer_mode=completion_time_latest`, `status=["DONE"]`, `limit=1`.  
-   - “How many tasks still not done?” → set `answer_mode=task_count_by_status`, optionally `status=["TODO","IN_PROGRESS"]`, plus a `time_range` or `due_range` as needed.
+   - “How many tasks still not done?” → set `answer_mode=task_count_by_status`, optionally `status=["TODO","IN_PROGRESS"]`, plus a `time_range` or `due_range` as needed.  
+   - “Summaries per project/person” → set `answer_mode=person_summary_by_project`, optionally set `project` / `filters`.  
+   - “How many overdue tasks per person” → set `answer_mode=overdue_count_by_person`, supply `due_range` or `time_range`, and keep `status` to non-DONE buckets.
 
 2. **Use the typed filters instead of free-form strings.**  
    - Multi-person → push into `filters` with `{"field":"person","op":"in","values":[...]}`.  
@@ -430,7 +432,70 @@ To “eat the IR full” without touching parser code, teach the LLM prompt to p
        "order_by": []
      }
      ```
+   - *“Give me project-wise status summary for 张三和李四”*  
+     ```json
+     {
+       "intent": "task_status_list",
+       "answer_mode": "person_summary_by_project",
+       "filters": [
+         {"field":"person","op":"in","values":["张三","李四"]}
+       ],
+       "project": "芯片项目",
+       "status": [],
+       "limit": 200,
+       "order_by": []
+     }
+     ```
+   - *“Who still has overdue tasks this week?”*  
+     ```json
+     {
+       "intent": "task_status_list",
+       "answer_mode": "overdue_count_by_person",
+       "status": ["TODO","IN_PROGRESS","BLOCKED"],
+       "due_range": {"start": "start_of_week", "end": "end_of_week"},
+       "filters": [],
+       "limit": 100,
+       "order_by": []
+     }
+     ```
 
 5. **Debug quickly via `/db/ask?q=<NL>`** to see the exact IR / SQL the backend consumed. Adjust your LLM prompt until the JSON mirrors what you expect.
 
 With this approach, Phase 1 requires *zero* parser changes—the LLM simply fills the rich IR we already built, and the existing plan/compiler/formatter stack does the rest.
+
+### 11.4) Phase 2 – Aggregation answer modes (LLM-only)
+
+On top of Phase 1, you can now drive two new aggregation styles directly from the LLM output by setting `answer_mode` explicitly (no parser/rule changes needed):
+
+1. **`person_summary_by_project`**  
+   - **LLM IR**:  
+     ```json
+     {
+       "intent": "task_status_list",
+       "answer_mode": "person_summary_by_project",
+       "project": "芯片项目",
+       "filters": [{"field":"person","op":"in","values":["张三","李四"]}]
+     }
+     ```  
+   - **Plan / SQL**: generates `SELECT project, person, status, COUNT(*) AS task_count ... GROUP BY project, person, status`.  
+   - **Answer formatter**: outputs natural language summaries per project, e.g. `Project 芯片项目: 张三(DONE=2, TODO=1); 李四(TODO=3)`.  
+   - **Usage tip**: the LLM should push any scope (projects, people, time ranges) into the IR. Parser heuristics are untouched.
+
+2. **`overdue_count_by_person`**  
+   - **LLM IR**: set `answer_mode="overdue_count_by_person"`, supply a `due_range` (e.g., `"start_of_week"/"end_of_week"`) and keep `status` to non-DONE buckets (`["TODO","IN_PROGRESS","BLOCKED"]`).  
+   - **Plan / SQL**: compiles into `SELECT person, COUNT(*) AS overdue_count ... GROUP BY person` with the provided filters/time windows.  
+   - **Answer formatter**: returns `Overdue tasks per person ... Zhang三=3, 李四=1` plus scope hints derived from `time_range`/`due_range`.
+
+Because these modes are only triggered by the LLM output, you can experiment safely without touching `_post_process_intent`; the normal `/tasks/ask` fallback paths remain unchanged.
+
+### 11.5) Phase 3 – Freeze parser heuristics
+
+To keep the rule-based parser stable, we “froze” the heuristics layer at a small, well-documented set (see `docs/INSTRUCTIONS_TASKS.md` for the table). The parser will continue to handle only:
+
+- completion-time intent flips (`answer_mode=completion_time_latest`)
+- multi-person filters
+- generic time/due range hints
+- priority keywords
+- limit/order sanity checks
+
+Everything else—including new aggregation modes like `person_summary_by_project`, `overdue_count_by_person`—must come from the LLM IR (`answer_mode`, `filters`, `time_range`, `due_range`, etc.). When you want new semantics, extend the IR/plan/formatter pipeline instead of adding more keyword rules.

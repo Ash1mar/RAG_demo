@@ -593,11 +593,19 @@ class TaskQueryEngine:
         elif spec_intent == TaskQueryIntent.task_status_list and not spec.task:
             # ?????????????????????????????????????
             task_required = False
-        if answer_mode_hint == TaskAnswerMode.task_count_by_status:
+        if answer_mode_hint in (
+            TaskAnswerMode.task_count_by_status,
+            TaskAnswerMode.person_summary_by_project,
+            TaskAnswerMode.overdue_count_by_person,
+        ):
             task_required = False
 
         person_required = not (
-            answer_mode_hint == TaskAnswerMode.task_count_by_status
+            answer_mode_hint in (
+                TaskAnswerMode.task_count_by_status,
+                TaskAnswerMode.person_summary_by_project,
+                TaskAnswerMode.overdue_count_by_person,
+            )
             and not person_filters_active
             and not spec.person
         )
@@ -810,6 +818,78 @@ class TaskQueryEngine:
                     "task": None,
                     "status_counts": counts,
                     "total_tasks": total,
+                }
+            )
+            if low_conf:
+                payload["answer"] = str(payload.get("answer", "")) + " (low confidence)"
+            return payload
+
+        if answer_mode == TaskAnswerMode.person_summary_by_project:
+            summary: Dict[str, Dict[str, Dict[str, int]]] = {}
+            for rec in rows:
+                project = str(rec.get("project", "") or "Unspecified")
+                person_name = str(rec.get("person", "") or "Unknown")
+                status_val = str(rec.get("status", "") or "UNKNOWN").upper()
+                count_val = rec.get("task_count")
+                try:
+                    cnt = int(count_val)
+                except (TypeError, ValueError):
+                    cnt = 0
+                summary.setdefault(project, {}).setdefault(person_name, {})[status_val] = cnt
+
+            parts: List[str] = []
+            for project, people in summary.items():
+                person_bits: List[str] = []
+                for person_name, status_map in people.items():
+                    status_bits = [f"{status}={count}" for status, count in status_map.items()]
+                    person_bits.append(f"{person_name}({', '.join(status_bits)})")
+                project_summary = "; ".join(person_bits) if person_bits else "no data"
+                parts.append(f"{project}: {project_summary}")
+            answer = " | ".join(parts) if parts else "No summary data."
+            payload.update(
+                {
+                    "answer": f"Project/person status summary: {answer}",
+                    "project_summary": summary,
+                    "person": None,
+                    "persons": [],
+                    "task": None,
+                }
+            )
+            if low_conf:
+                payload["answer"] = str(payload.get("answer", "")) + " (low confidence)"
+            return payload
+
+        if answer_mode == TaskAnswerMode.overdue_count_by_person:
+            rows_summary: List[Dict[str, Any]] = []
+            for rec in rows:
+                person_name = str(rec.get("person", "") or "Unknown")
+                raw_count = rec.get("overdue_count")
+                try:
+                    cnt = int(raw_count)
+                except (TypeError, ValueError):
+                    cnt = 0
+                rows_summary.append({"person": person_name, "count": cnt})
+            rows_summary.sort(key=lambda item: (-item["count"], item["person"]))
+            scope_bits: List[str] = []
+            time_range = getattr(spec, "time_range", None)
+            if time_range:
+                scope_bits.append(
+                    f"time_range={getattr(time_range, 'start', None) or '*'}~{getattr(time_range, 'end', None) or '*'}"
+                )
+            due_range = getattr(spec, "due_range", None)
+            if due_range:
+                scope_bits.append(
+                    f"due_range={getattr(due_range, 'start', None) or '*'}~{getattr(due_range, 'end', None) or '*'}"
+                )
+            scope_suffix = f" within {', '.join(scope_bits)}" if scope_bits else ""
+            summary_str = ", ".join(f"{item['person']}={item['count']}" for item in rows_summary) or "none"
+            payload.update(
+                {
+                    "answer": f"Overdue tasks per person{scope_suffix}: {summary_str}.",
+                    "overdue_counts": rows_summary,
+                    "person": None,
+                    "persons": [item["person"] for item in rows_summary],
+                    "task": None,
                 }
             )
             if low_conf:

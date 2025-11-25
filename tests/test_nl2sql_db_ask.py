@@ -13,6 +13,7 @@ from app.services.nl2sql_engine import (
     TaskQueryIntent,
     TaskQuerySpec,
     TaskStatus,
+    TimeRange,
     build_task_query_plan,
     parse_task_query_nl,
     _post_process_intent,
@@ -198,6 +199,34 @@ def test_compile_sql_person_summary_group_by() -> None:
     assert "count" in sql_lower
     assert "group by" in sql_lower
     assert "task_count" in sql_lower
+    assert compiled.params[-1] == spec.limit
+
+
+def test_build_plan_person_summary_by_project_answer_mode() -> None:
+    spec = TaskQuerySpec(
+        intent=TaskQueryIntent.task_status_list,
+        raw_query="project summary",
+        answer_mode=TaskAnswerMode.person_summary_by_project,
+        project="芯片",
+    )
+    plan = build_task_query_plan(spec)
+    assert plan["projections"] == ["project", "person", "status", "COUNT(*) AS task_count"]
+    assert plan["group_by"] == ["project", "person", "status"]
+    assert plan["sort"][0]["field"] == "project"
+
+
+def test_compile_sql_overdue_count_by_person_answer_mode() -> None:
+    spec = TaskQuerySpec(
+        intent=TaskQueryIntent.task_status_list,
+        raw_query="overdue counts",
+        answer_mode=TaskAnswerMode.overdue_count_by_person,
+        status=[TaskStatus.TODO, TaskStatus.IN_PROGRESS],
+        due_range=TimeRange(start="start_of_week", end="end_of_week"),
+    )
+    compiled = compile_tasks_sql(spec)
+    sql_lower = compiled.sql.lower()
+    assert "count(*) as overdue_count" in sql_lower
+    assert "group by person" in sql_lower
     assert compiled.params[-1] == spec.limit
 
 
