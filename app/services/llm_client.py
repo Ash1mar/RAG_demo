@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Dict, Protocol
@@ -10,15 +10,15 @@ from app.config import llm_settings
 
 
 class LLMClient(Protocol):
-    """Abstract LLM client for NL→JSON task query parsing.
+    """Abstract LLM client for NL鈫扟SON task query parsing.
 
-    Implementations should take a natural‑language task query and return a
-    JSON‑serializable dict that can be fed into TaskQuerySpec.parse_obj(...)
+    Implementations should take a natural鈥憀anguage task query and return a
+    JSON鈥憇erializable dict that can be fed into TaskQuerySpec.parse_obj(...)
     (see nl2sql_engine.TaskQuerySpec for the expected schema).
     """
 
     def generate_task_query_spec(self, q: str) -> Dict[str, Any]:
-        """Generate a TaskQuerySpec‑compatible JSON dict from a NL query."""
+        """Generate a TaskQuerySpec鈥慶ompatible JSON dict from a NL query."""
         ...
 
 
@@ -32,12 +32,11 @@ class DummyLLMClient:
 
     Current behavior:
     - Raises NotImplementedError to force callers to fall back to the
-      rule‑based parser in nl2sql_engine.
+      rule鈥慴ased parser in nl2sql_engine.
 
     TODO:
     - Replace or extend this class with real HTTP SDK calls to OpenAI /
-      DeepSeek / 国内大模型等，根据环境变量选择 provider / model。
-    """
+      DeepSeek / 鍥藉唴澶фā鍨嬬瓑锛屾牴鎹幆澧冨彉閲忛€夋嫨 provider / model銆?    """
 
     provider: str = "dummy"
     model: str = "dummy"
@@ -77,7 +76,7 @@ class OllamaLLMClient:
             ],
             "stream": False,
             "format": schema,
-            # Use deterministic decoding for NL→IR so that the same
+            # Use deterministic decoding for NL鈫扞R so that the same
             # question produces a stable TaskQuerySpec.
             "options": {
                 "temperature": 0.0,
@@ -89,7 +88,7 @@ class OllamaLLMClient:
         try:
             resp = httpx.post(url, json=payload, timeout=30.0)
             resp.raise_for_status()
-        except httpx.HTTPError as exc:  # includes network errors and non‑2xx
+        except httpx.HTTPError as exc:  # includes network errors and non鈥?xx
             raise LLMParseError(f"Failed to call Ollama /api/chat: {exc}") from exc
 
         try:
@@ -123,7 +122,7 @@ def build_task_query_user_prompt(q: str) -> str:
         "Convert it into a JSON object that satisfies the TaskQuerySpec JSON schema.\n\n"
         "Requirements:\n"
         "1) Output only JSON (no explanations).\n"
-        "2) Field names must come from the schema: intent, raw_query, person, task, "
+        "2) Field names must come from the schema: intent, raw_query, is_supported, intent_confidence, raw_intent_nl, person, task, "
         "task_keywords, project, tags, status, time_range, due_range, created_range, "
         "order_by, limit, answer_mode, filters, extra.\n"
         "3) raw_query must contain the original user query verbatim.\n"
@@ -143,7 +142,9 @@ def build_task_query_user_prompt(q: str) -> str:
         "9) LIMIT defaults to 10 (task_list_by_person can use 50) unless the question demands "
         "otherwise; order_by defaults to ts desc then priority asc.\n"
         "10) filters should express remaining constraints with eq/in/like/gte/lte "
-        "(project, tags, status, priority, etc.).\n\n"
+        "(project, tags, status, priority, etc.).\n"
+        "11) Provide is_supported=true only when the query clearly maps to an existing simple intent; otherwise set is_supported=false and prefer intent=\"unknown\".\n"
+        "12) intent_confidence must be a float between 0 and 1 (e.g. 0.9 for strong matches); raw_intent_nl should briefly summarize the user intent in natural language.\n\n"
         "Return a single JSON object and nothing else.\n\n"
         f"User query:\n{q}"
     )
@@ -151,13 +152,13 @@ def build_task_query_user_prompt(q: str) -> str:
 
 TASK_QUERY_SYSTEM_PROMPT = (
     "You are a strict JSON schema parser for task-status queries.\n"
-    "Convert each Chinese task question into a JSON object that matches the TaskQuerySpec schema (intent, raw_query, person, task, task_keywords, project, tags, status, time_range, due_range, created_range, order_by, limit, answer_mode, filters, extra).\n\n"
+    "Convert each Chinese task question into a JSON object that matches the TaskQuerySpec schema (intent, raw_query, is_supported, intent_confidence, raw_intent_nl, person, task, task_keywords, project, tags, status, time_range, due_range, created_range, order_by, limit, answer_mode, filters, extra).\n\n"
     "Requirements:\n"
     "- Output ONLY a JSON object, no extra text.\n"
     "- Field names must exactly match the schema (case-sensitive).\n"
     "- If the query omits a field, leave it null/empty or use a safe default; never invent people/tasks/projects.\n"
     "- raw_query must be the original user query.\n"
-    "- intent must be one of task_status_single | task_status_list | task_list_by_person | task_history | person_summary.\n"
+    "- intent must be one of task_status_single | task_status_list | task_list_by_person | task_history | person_summary | unknown.\n"
     "- answer_mode must be one of default | completion_time_latest | task_count_by_status | person_summary_by_project | overdue_count_by_person.\n"
     "- status values must use the enum strings (DONE, TODO, IN_PROGRESS, BLOCKED, ANY).\n"
     "- When the query asks \"when was it finished\" (phrases meaning finished/done/completed), set answer_mode=completion_time_latest, status=[\"DONE\"], limit=1, order_by ts desc.\n"
@@ -168,6 +169,8 @@ TASK_QUERY_SYSTEM_PROMPT = (
     "- Populate project/tags/priority/time_range/due_range whenever the query mentions them (P0/P1, this week/month, deadline/due, etc.).\n"
     "- Keep LIMIT reasonable (default 10; list-by-person up to 50) unless the user explicitly asks otherwise.\n"
     "- Use filters with eq/in/like/gte/lte for additional constraints.\n"
+    "- Provide is_supported=true only when the question clearly belongs to the supported simple intents; otherwise set is_supported=false and prefer intent=\"unknown\".\n"
+    "- intent_confidence must be 0~1 (float) and raw_intent_nl should briefly describe the perceived intent in Chinese.\n"
     "You MUST respect the JSON Schema provided via the `format` parameter."
 )
 
@@ -175,7 +178,7 @@ TASK_QUERY_SYSTEM_PROMPT = (
 def get_llm_client() -> LLMClient:
     """Factory for LLMClient.
 
-    Decides implementation based on environment‑driven llm_settings.
+    Decides implementation based on environment鈥慸riven llm_settings.
     """
 
     if not llm_settings.enabled or llm_settings.provider == "dummy":

@@ -2,7 +2,7 @@
 
 from enum import Enum
 from os import getenv
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 import logging
 import re
 
@@ -121,6 +121,20 @@ class TaskQuerySpec(BaseModel):
         TaskQueryIntent.task_status_single, description="Recognized query intent."
     )
     raw_query: str = Field(..., description="Original natural language query.")
+    is_supported: Optional[bool] = Field(
+        None,
+        description="LLM hint describing whether the IR fast path should handle this query.",
+    )
+    intent_confidence: Optional[float] = Field(
+        None,
+        ge=0.0,
+        le=1.0,
+        description="LLM confidence score (0~1) for the predicted intent.",
+    )
+    raw_intent_nl: Optional[str] = Field(
+        None,
+        description="Free-form natural language summary of the detected intent (LLM provided).",
+    )
     answer_mode: TaskAnswerMode = Field(
         TaskAnswerMode.default, description="Optional hint for downstream answer formatter."
     )
@@ -176,6 +190,99 @@ class TaskQuerySpec(BaseModel):
     )
 
 
+def is_complex_by_text(raw_query: Optional[str]) -> bool:
+    """Simple keyword sniffing to flag obviously complex/BI-style questions."""
+
+    text = (raw_query or "").strip()
+    if not text:
+        return False
+    lower = text.lower()
+    for kw in _COMPLEX_KEYWORDS:
+        if not kw:
+            continue
+        if kw in text or kw.lower() in lower:
+            return True
+    return False
+
+
+def _collect_filter_values(spec: TaskQuerySpec, field_name: str) -> List[str]:
+    values: List[str] = []
+    filters = getattr(spec, "filters", None) or []
+    normalized = field_name.lower()
+    for flt in filters:
+        if not isinstance(flt, QueryFilter):
+            continue
+        raw_field = str(getattr(flt, "field", "") or "").lower()
+        if raw_field != normalized:
+            continue
+        op = str(getattr(flt, "op", "eq") or "eq").lower()
+        if op == "in":
+            for val in getattr(flt, "values", None) or []:
+                if val not in (None, ""):
+                    values.append(str(val))
+        else:
+            val = getattr(flt, "value", None)
+            if val not in (None, ""):
+                values.append(str(val))
+    return values
+
+
+def too_many_entities(spec: TaskQuerySpec) -> bool:
+    """Heuristic guardrail: multi-person/task/project/tag queries => complex."""
+
+    def _count(values: List[str], extra: Optional[str]) -> int:
+        uniq: Set[str] = {v for v in values if v}
+        if extra:
+            uniq.add(extra)
+        return len(uniq)
+
+    person_values = _collect_filter_values(spec, "person")
+    task_values = _collect_filter_values(spec, "task")
+    project_values = _collect_filter_values(spec, "project")
+
+    if _count(person_values, getattr(spec, "person", None)) >= 2:
+        return True
+    if _count(task_values, getattr(spec, "task", None)) >= 2:
+        return True
+    if _count(project_values, getattr(spec, "project", None)) >= 2:
+        return True
+
+    status_list = [s for s in getattr(spec, "status", []) or []]
+    if len(status_list) >= 3:
+        return True
+
+    tags = getattr(spec, "tags", []) or []
+    if len(tags) >= 3:
+        return True
+
+    return False
+
+
+def is_simple_intent(spec: Optional[TaskQuerySpec]) -> bool:
+    """Return True only when the IR fast path should own the query."""
+
+    if spec is None:
+        return False
+
+    if is_complex_by_text(getattr(spec, "raw_query", "")):
+        return False
+
+    if getattr(spec, "is_supported", None) is False:
+        return False
+
+    if getattr(spec, "intent", TaskQueryIntent.unknown) == TaskQueryIntent.unknown:
+        return False
+
+    confidence = getattr(spec, "intent_confidence", None)
+    if confidence is not None and confidence < 0.5:
+        return False
+
+    if too_many_entities(spec):
+        return False
+
+    return True
+
+
 _USE_LLM_FOR_NL2SQL = getenv("TASKS_NL2SQL_LLM", "0") == "1"
 
 _PERSON_SEPARATOR_CHARS = "、，,/和及与"
@@ -216,6 +323,28 @@ _PRIORITY_HINTS = [
 
 _ORDER_ASC_HINTS = ("最早", "时间升序", "按创建顺序")
 _ORDER_DESC_HINTS = ("最新", "最近", "按更新时间", "按优先级")
+
+_COMPLEX_KEYWORDS = [
+    "\u7edf\u8ba1",
+    "\u6bd4\u4f8b",
+    "\u5360\u6bd4",
+    "\u6548\u7387",
+    "\u6700\u5fd9",
+    "\u6700\u6162",
+    "\u903e\u671f\u7387",
+    "\u5e73\u5747",
+    "\u6392\u540d",
+    "\u5bf9\u6bd4",
+    "\u5404\u90e8\u95e8",
+    "\u6bcf\u4e2a\u90e8\u95e8",
+    "\u6309\u9879\u76ee",
+    "\u603b\u4f53\u60c5\u51b5",
+    "\u6982\u51b5",
+    "\u5206\u5e03",
+    "ratio",
+    "percent",
+    "compare",
+]
 
 _PERSON_TASK_STATUS_RE = re.compile(
     r"(?P<person>[\u4e00-\u9fffA-Za-z0-9_]+)的(?P<task>.+?)(?:现在|目前)?(?:什么状态|状况|进度|进展)"
