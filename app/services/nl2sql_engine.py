@@ -259,7 +259,16 @@ def too_many_entities(spec: TaskQuerySpec) -> bool:
 
 
 def is_simple_intent(spec: Optional[TaskQuerySpec]) -> bool:
-    """Return True only when the IR fast path should own the query."""
+    """Return True only when the IR fast path should own the query.
+
+    Phase 2 whitelist strategy:
+    - Only allow very simple, well‑specified single‑task intents:
+      * task_status_single  (person + task, latest status)
+      * task_history        (person + task, status history / completion time)
+    - All list / aggregation / multi‑entity queries are considered too
+      complex or fragile for the IR fast path and should be delegated to
+      downstream resolvers / Text2SQL.
+    """
 
     if spec is None:
         return False
@@ -270,8 +279,21 @@ def is_simple_intent(spec: Optional[TaskQuerySpec]) -> bool:
     if getattr(spec, "is_supported", None) is False:
         return False
 
-    if getattr(spec, "intent", TaskQueryIntent.unknown) == TaskQueryIntent.unknown:
+    raw_intent = getattr(spec, "intent", TaskQueryIntent.unknown)
+    if isinstance(raw_intent, TaskQueryIntent):
+        intent = raw_intent
+    else:
+        try:
+            intent = TaskQueryIntent(str(raw_intent))
+        except Exception:
+            intent = TaskQueryIntent.unknown
+    # Whitelist: only single‑task intents go through fast path.
+    if intent not in (TaskQueryIntent.task_status_single, TaskQueryIntent.task_history):
         return False
+
+    if intent in (TaskQueryIntent.task_status_single, TaskQueryIntent.task_history):
+        if not getattr(spec, "person", None) or not getattr(spec, "task", None):
+            return False
 
     confidence = getattr(spec, "intent_confidence", None)
     if confidence is not None and confidence < 0.5:
@@ -541,6 +563,7 @@ def _ensure_person_filter_from_text(spec: TaskQuerySpec, text: str) -> None:
 def _post_process_intent(spec: TaskQuerySpec, text: str) -> None:
     """Apply lightweight intent heuristics on top of LLM/rule output."""
     t = (text or "").strip()
+    t_lower = t.lower()
     if not t:
         return
     # Phase 3 heuristics freeze: keep this function limited to the generic
@@ -560,10 +583,32 @@ def _post_process_intent(spec: TaskQuerySpec, text: str) -> None:
     spec.answer_mode = answer_mode
 
     intent = getattr(spec, "intent", None)
-    status_kws = ("完成", "未完成", "done", "todo", "搞定", "结束")
+    status_kws = ("已完成", "未完成", "done", "todo", "搞定", "结束")
+    status_kws_lower = tuple(kw.lower() for kw in status_kws)
+
+    # 如果 LLM/规则没有给出任何 status，就根据文本自动推断一遍
+    if not getattr(spec, "status", None):
+        status_hints: list[TaskStatus] = []
+        status_map: list[tuple[tuple[str, ...], TaskStatus]] = [
+            (("阻塞", "卡住", "block", "blocked"), TaskStatus.BLOCKED),
+            (("进行中", "在做", "in progress"), TaskStatus.IN_PROGRESS),
+            (("已完成", "做完", "完成了", "done"), TaskStatus.DONE),
+            (("未完成", "没做", "还没做", "todo"), TaskStatus.TODO),
+        ]
+        for kws, st in status_map:
+            if any(kw.lower() in t_lower for kw in kws):
+                status_hints.append(st)
+        if status_hints:
+            seen: set[TaskStatus] = set()
+            normalized: list[TaskStatus] = []
+            for st in status_hints:
+                if st not in seen:
+                    seen.add(st)
+                    normalized.append(st)
+            spec.status = normalized
 
     if intent == TaskQueryIntent.task_list_by_person:
-        if not any(kw in t for kw in status_kws):
+        if not any(kw in t_lower for kw in status_kws_lower):
             spec.status = []
 
     if "现在有哪些任务" in t or "任务列表" in t:
@@ -603,6 +648,15 @@ def _post_process_intent(spec: TaskQuerySpec, text: str) -> None:
                 spec.limit = 1
 
     _ensure_person_filter_from_text(spec, t)
+    if not getattr(spec, "person", None):
+        inferred_tokens = _extract_person_tokens_from_text(t)
+        if len(inferred_tokens) == 1:
+            spec.person = inferred_tokens[0]
+
+    if spec.intent == TaskQueryIntent.task_list_by_person and not spec.person:
+        spec.is_supported = False
+        spec.extra.setdefault("unsupported_reason", "list_by_person_missing_person")
+
 
     if _range_is_empty(spec.time_range):
         tr = _detect_time_range(t)
@@ -670,6 +724,7 @@ def parse_task_query_nl(q: str) -> TaskQuerySpec:
 
 def _rule_based_parse_task_query_nl(q: str) -> TaskQuerySpec:
     text = (q or "").strip()
+    text_lower = text.lower()
 
     # 1) 粗略意图识别
     intent = TaskQueryIntent.task_status_single
@@ -693,9 +748,15 @@ def _rule_based_parse_task_query_nl(q: str) -> TaskQuerySpec:
 
     # 3) 粗略状态提示词
     status: List[TaskStatus] = []
-    if any(kw in text for kw in ("完成了吗", "完成了没", "搞定了没", "搞定没有", "done")):
+    if any(
+        kw.lower() in text_lower
+        for kw in ("已完成", "已经完成", "搞定", "完成了", "done")
+    ):
         status = [TaskStatus.DONE]
-    elif any(kw in text for kw in ("未完成", "没完成", "还没", "待办", "todo")):
+    elif any(
+        kw.lower() in text_lower
+        for kw in ("未完成", "没完成", "还没做", "待办", "todo")
+    ):
         status = [TaskStatus.TODO]
 
     # 4) 默认排序和 limit
@@ -719,6 +780,8 @@ def _rule_based_parse_task_query_nl(q: str) -> TaskQuerySpec:
 def _rule_based_parse_task_query_nl_v2(q: str) -> TaskQuerySpec:
     """Cleaner rule-based parser with expanded hints and filters."""
     text = (q or "").strip()
+
+    text_lower = text.lower()
 
     # 1) coarse intent guess
     intent = TaskQueryIntent.task_status_single
@@ -760,7 +823,7 @@ def _rule_based_parse_task_query_nl_v2(q: str) -> TaskQuerySpec:
         (("未完成", "没完成", "还没", "待办", "todo"), TaskStatus.TODO),
     ]
     for kws, st in status_map:
-        if any(kw in text for kw in kws):
+        if any(kw.lower() in text_lower for kw in kws):
             status.append(st)
     if completion_mode:
         answer_mode = TaskAnswerMode.completion_time_latest

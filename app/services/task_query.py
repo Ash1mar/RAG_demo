@@ -16,7 +16,10 @@ from app.services.nl2sql_engine import (
     TaskStatus,
     TaskQuerySpec,
     build_task_query_plan,
+    is_complex_by_text,
+    is_simple_intent,
     parse_task_query_nl,
+    too_many_entities,
 )
 from app.services.sql_compiler import TaskSqlCompileError, compile_tasks_sql
 from app.tasks_store.base import TasksStore
@@ -301,6 +304,38 @@ class TaskQueryEngine:
             "tasks": len(self.resolver.tasks if self.resolver else []),
         }
 
+    @staticmethod
+    def _intent_label(intent: Optional[TaskQueryIntent]) -> str:
+        if isinstance(intent, TaskQueryIntent):
+            if intent == TaskQueryIntent.task_list_by_person:
+                return "task_list"
+            if intent == TaskQueryIntent.task_history:
+                return "task_history"
+            if intent in (
+                TaskQueryIntent.task_status_single,
+                TaskQueryIntent.task_status_list,
+            ):
+                return "status_query"
+            if intent == TaskQueryIntent.person_summary:
+                return "person_summary"
+        return "unknown"
+
+    def _compute_routing_debug(self, spec: TaskQuerySpec) -> Tuple[bool, Dict[str, Any]]:
+        complex_flag = is_complex_by_text(getattr(spec, "raw_query", ""))
+        multi_flag = too_many_entities(spec)
+        simple_flag = is_simple_intent(spec)
+        intent = getattr(spec, "intent", None)
+        debug = {
+            "intent": intent.value if isinstance(intent, TaskQueryIntent) else str(intent),
+            "is_supported": getattr(spec, "is_supported", None),
+            "intent_confidence": getattr(spec, "intent_confidence", None),
+            "raw_intent_nl": getattr(spec, "raw_intent_nl", None),
+            "complex_by_text": complex_flag,
+            "too_many_entities": multi_flag,
+            "is_simple_intent": simple_flag,
+        }
+        return simple_flag, debug
+
     def _align_filters_with_resolver(self, spec: TaskQuerySpec) -> Dict[str, List[str]]:
         """
         Align QueryFilter values for person/task using the resolver so that
@@ -435,6 +470,10 @@ class TaskQueryEngine:
 
         best_p = person_hits[0] if person_hits else None
         best_t = task_hits[0] if task_hits else None
+        if not best_p and spec.person:
+            best_p = (spec.person, 1.0)
+        if not best_t and spec.task:
+            best_t = (spec.task, 1.0)
         if not best_p or not best_t:
             payload["answer"] = "Could not resolve person or task; please pick from candidates."
             return payload
@@ -517,17 +556,7 @@ class TaskQueryEngine:
             return payload
 
         spec_intent = getattr(spec, "intent", None)
-        if isinstance(spec_intent, TaskQueryIntent):
-            if spec_intent == TaskQueryIntent.task_list_by_person:
-                payload["intent"] = "task_list"
-            elif spec_intent == TaskQueryIntent.task_history:
-                payload["intent"] = "task_history"
-            elif spec_intent in (TaskQueryIntent.task_status_single, TaskQueryIntent.task_status_list):
-                payload["intent"] = "status_query"
-            elif spec_intent == TaskQueryIntent.person_summary:
-                payload["intent"] = "person_summary"
-            else:
-                payload["intent"] = "unknown"
+        payload["intent"] = self._intent_label(spec_intent)
 
         raw_answer_mode = getattr(spec, "answer_mode", TaskAnswerMode.default)
         if isinstance(raw_answer_mode, TaskAnswerMode):
@@ -539,6 +568,12 @@ class TaskQueryEngine:
                 answer_mode_hint = TaskAnswerMode.default
         else:
             answer_mode_hint = TaskAnswerMode.default
+
+        is_simple, routing_debug = self._compute_routing_debug(spec)
+        if is_simple:
+            return self._resolve_via_ir_fast_path(spec, routing_debug)
+        routing_debug["routed_via"] = "hybrid_llm"
+        payload["routing_debug"] = routing_debug
 
         # 2) Hybrid entity alignment on top of IR
         self.ensure_built()
@@ -600,15 +635,20 @@ class TaskQueryEngine:
         ):
             task_required = False
 
-        person_required = not (
-            answer_mode_hint in (
-                TaskAnswerMode.task_count_by_status,
-                TaskAnswerMode.person_summary_by_project,
-                TaskAnswerMode.overdue_count_by_person,
-            )
-            and not person_filters_active
-            and not spec.person
-        )
+        if spec_intent in (TaskQueryIntent.task_status_list,):
+            person_required = bool(person_filters_active or spec.person)
+        elif spec_intent == TaskQueryIntent.task_list_by_person:
+            person_required = bool(person_filters_active or spec.person)
+        elif spec_intent in (TaskQueryIntent.task_status_single, TaskQueryIntent.task_history):
+            person_required = True
+        elif answer_mode_hint in (
+            TaskAnswerMode.task_count_by_status,
+            TaskAnswerMode.person_summary_by_project,
+            TaskAnswerMode.overdue_count_by_person,
+        ):
+            person_required = False
+        else:
+            person_required = bool(person_filters_active or spec.person)
 
 
         if (person_required and not best_p) or (task_required and not best_t):
@@ -629,6 +669,9 @@ class TaskQueryEngine:
                     p_ok = True
                 else:
                     p_ok = bool(best_p) and (best_p[1] >= tp)
+                    if not p_ok and spec.person:
+                        p_ok = True
+                        low_conf = True
             else:
                 p_ok = True
             t_ok = True
@@ -637,6 +680,9 @@ class TaskQueryEngine:
                 if not t_ok and not task_filters_active:
                     second_t = task_hits[1][1] if len(task_hits) > 1 else -1.0
                     if best_t[1] >= weak_min and (second_t >= 0) and (best_t[1] - second_t) >= delta_min:
+                        t_ok = True
+                        low_conf = True
+                    elif spec.task:
                         t_ok = True
                         low_conf = True
 
@@ -671,8 +717,9 @@ class TaskQueryEngine:
         if spec_intent == TaskQueryIntent.task_list_by_person:
             spec.person = None if person_filters_active else person
             spec.task = None
-            # List-by-person should list all tasks; drop status filters from IR.
-            spec.status = []
+            if not getattr(spec, "status", None):
+                # Only widen to “all statuses” when用户没有指定状态过滤
+                spec.status = []
         else:
             if person_filters_active:
                 spec.person = None
@@ -1030,26 +1077,62 @@ class TaskQueryEngine:
             payload["answer"] = str(payload.get("answer", "")) + " (low confidence)"
         return payload
 
+    def _resolve_via_ir_fast_path(self, spec: TaskQuerySpec, routing_debug: Dict[str, Any]) -> Dict[str, Any]:
+        debug = dict(routing_debug or {})
+        debug["routed_via"] = "ir_fast_path"
+        payload: Dict[str, Any] = {
+            "intent": self._intent_label(getattr(spec, "intent", None)),
+            "resolver_mode": "hybrid_llm_ir_fast_path",
+            "routing_debug": debug,
+        }
+        return self._execute_ir_plan(
+            spec,
+            payload,
+            compile_error_code="ir_fast_path_compile_failed",
+            query_not_supported_code="ir_fast_path_query_not_supported_by_tasks_store",
+            query_error_code="ir_fast_path_db_query_failed",
+            no_rows_message="No matching records found (IR fast path).",
+        )
+
     def _answer_via_nl2sql(self, q: str) -> Dict[str, Any]:
         """Experimental NL→JSON→SQL resolver path."""
-        intent = "status_query" if is_status_intent(q) else "unknown"
         payload: Dict[str, Any] = {
-            "intent": intent,
+            "intent": "unknown",
             "resolver_mode": "nl2sql",
         }
 
         try:
             spec = parse_task_query_nl(q)
-            payload["nl_ir"] = spec.dict()
         except Exception as exc:
             payload["error"] = "nl2sql_parse_failed"
             payload["reason"] = str(exc)
             return payload
 
+        payload["intent"] = self._intent_label(getattr(spec, "intent", None))
+        return self._execute_ir_plan(
+            spec,
+            payload,
+            compile_error_code="nl2sql_compile_failed",
+            query_not_supported_code="nl2sql_query_not_supported_by_tasks_store",
+            query_error_code="nl2sql_db_query_failed",
+            no_rows_message="No matching records found (NL2SQL).",
+        )
+
+    def _execute_ir_plan(
+        self,
+        spec: TaskQuerySpec,
+        payload: Dict[str, Any],
+        *,
+        compile_error_code: str,
+        query_not_supported_code: str,
+        query_error_code: str,
+        no_rows_message: str,
+    ) -> Dict[str, Any]:
+        payload["nl_ir"] = spec.dict()
         try:
             compiled = compile_tasks_sql(spec)
         except TaskSqlCompileError as exc:
-            payload["error"] = "nl2sql_compile_failed"
+            payload["error"] = compile_error_code
             payload["reason"] = str(exc)
             return payload
 
@@ -1058,7 +1141,7 @@ class TaskQueryEngine:
 
         query_fn = getattr(self.tasks_store, "query", None)
         if query_fn is None:
-            payload["error"] = "nl2sql_query_not_supported_by_tasks_store"
+            payload["error"] = query_not_supported_code
             return payload
 
         def _run_query(sql: str, params: Tuple[Any, ...]) -> List[Dict[str, Any]]:
@@ -1066,22 +1149,10 @@ class TaskQueryEngine:
 
         try:
             rows = _run_query(compiled.sql, compiled.params)
-        except Exception as exc:  # defensive
-            payload["error"] = "nl2sql_db_query_failed"
+        except Exception as exc:
+            payload["error"] = query_error_code
             payload["reason"] = str(exc)
             return payload
-
-        if not rows and getattr(spec, "status", None):
-            try:
-                relaxed_spec = spec.copy(deep=True)
-                relaxed_spec.status = []
-                relaxed_compiled = compile_tasks_sql(relaxed_spec)
-                rows = _run_query(relaxed_compiled.sql, relaxed_compiled.params)
-                payload["relaxed_status_filter"] = True
-                payload["sql_relaxed"] = relaxed_compiled.sql
-                payload["params_relaxed"] = relaxed_compiled.params
-            except Exception:
-                pass
 
         payload["rows"] = rows
 
@@ -1102,5 +1173,5 @@ class TaskQueryEngine:
                 }
             )
         else:
-            payload["answer"] = "No matching records found (NL2SQL)."
+            payload["answer"] = no_rows_message
         return payload

@@ -316,7 +316,7 @@ $env:LLM_OLLAMA_BASE_URL='http://localhost:11434'
 3. Optionally, enable LLM‑first NL→JSON parsing in the NL→SQL pipeline:
 
 ```powershell
-    $env:TASKS_NL2SQL_LLM='1'
+$env:TASKS_NL2SQL_LLM='1'
 ```
 
 Then start the API as usual:
@@ -476,7 +476,7 @@ On top of Phase 1, you can now drive two new aggregation styles directly from 
        "project": "芯片项目",
        "filters": [{"field":"person","op":"in","values":["张三","李四"]}]
      }
-     ```  
+     ```
    - **Plan / SQL**: generates `SELECT project, person, status, COUNT(*) AS task_count ... GROUP BY project, person, status`.  
    - **Answer formatter**: outputs natural language summaries per project, e.g. `Project 芯片项目: 张三(DONE=2, TODO=1); 李四(TODO=3)`.  
    - **Usage tip**: the LLM should push any scope (projects, people, time ranges) into the IR. Parser heuristics are untouched.
