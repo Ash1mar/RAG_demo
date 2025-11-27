@@ -288,21 +288,39 @@ def is_simple_intent(spec: Optional[TaskQuerySpec]) -> bool:
         except Exception:
             intent = TaskQueryIntent.unknown
     # Whitelist: only single‑task intents go through fast path.
-    if intent not in (TaskQueryIntent.task_status_single, TaskQueryIntent.task_history):
+    allowed_intents = {TaskQueryIntent.task_status_single, TaskQueryIntent.task_history}
+    if intent not in allowed_intents:
         return False
 
-    if intent in (TaskQueryIntent.task_status_single, TaskQueryIntent.task_history):
-        if not getattr(spec, "person", None) or not getattr(spec, "task", None):
+    def _has_single_entity(field: str) -> bool:
+        value = getattr(spec, field, None)
+        if value:
+            return True
+        filter_values = [
+            v for v in _collect_filter_values(spec, field) if v not in (None, "")
+        ]
+        if len(filter_values) == 1:
+            return True
+        extra = getattr(spec, "extra", {}) or {}
+        token_key = f"rule_{field}_tokens"
+        tokens = extra.get(token_key)
+        if isinstance(tokens, list):
+            token_values = [t for t in tokens if t]
+            if len(token_values) == 1:
+                return True
+        return False
+
+    if intent in allowed_intents:
+        if not _has_single_entity("person"):
             return False
-
-    confidence = getattr(spec, "intent_confidence", None)
-    if confidence is not None and confidence < 0.5:
-        return False
-
-    if too_many_entities(spec):
-        return False
-
-    return True
+        if not _has_single_entity("task"):
+            return False
+        # For single-task intents, we deliberately ignore too_many_entities()
+        # and only rely on intent + single person/task checks.
+        confidence = getattr(spec, "intent_confidence", None)
+        if confidence is not None and confidence < 0.5:
+            return False
+        return True
 
 
 _USE_LLM_FOR_NL2SQL = getenv("TASKS_NL2SQL_LLM", "0") == "1"
@@ -648,10 +666,20 @@ def _post_process_intent(spec: TaskQuerySpec, text: str) -> None:
                 spec.limit = 1
 
     _ensure_person_filter_from_text(spec, t)
-    if not getattr(spec, "person", None):
-        inferred_tokens = _extract_person_tokens_from_text(t)
-        if len(inferred_tokens) == 1:
-            spec.person = inferred_tokens[0]
+    entity_guess = _extract_person_task(t)
+    person_tokens_hint = _extract_person_tokens_from_text(t)
+    if not person_tokens_hint and entity_guess.get("person"):
+        person_tokens_hint = [entity_guess["person"]]
+    if not getattr(spec, "person", None) and len(person_tokens_hint) == 1:
+        spec.person = person_tokens_hint[0]
+    if not getattr(spec, "task", None):
+        guessed_task = entity_guess.get("task")
+        if guessed_task:
+            spec.task = guessed_task.strip()
+        elif getattr(spec, "task_keywords", None):
+            first_kw = next((kw for kw in spec.task_keywords if kw), None)
+            if first_kw:
+                spec.task = first_kw
 
     if spec.intent == TaskQueryIntent.task_list_by_person and not spec.person:
         spec.is_supported = False

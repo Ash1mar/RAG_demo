@@ -3,11 +3,17 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
+import json
+import logging
 from typing import Any, Dict, List, Optional, Tuple
 
+import httpx
 import faiss
 import numpy as np
+from pydantic import BaseModel, ValidationError
 
+from app.config import llm_settings
 from app.services.embeddings import Embedder
 from app.services.nl2sql_engine import (
     QueryFilter,
@@ -44,6 +50,82 @@ INTENT_STATUS_KWS = [
     "done",
     "todo",
 ]
+
+
+logger = logging.getLogger(__name__)
+
+TEXT2SQL_SCHEMA = """
+table task_latest (
+  id INTEGER PRIMARY KEY,
+  person TEXT NOT NULL,
+  task TEXT NOT NULL,
+  status TEXT NOT NULL,        -- DONE | TODO | IN_PROGRESS | BLOCKED
+  ts INTEGER NOT NULL,         -- epoch milliseconds
+  project TEXT,
+  tags TEXT,                   -- comma-separated strings
+  priority INTEGER,            -- 1 = highest priority
+  due_ts INTEGER,
+  created_ts INTEGER,
+  updated_ts INTEGER,
+  status_note TEXT
+);
+
+table tasks (
+  id INTEGER PRIMARY KEY,
+  person TEXT NOT NULL,
+  task TEXT NOT NULL,
+  status TEXT NOT NULL,
+  ts INTEGER NOT NULL,
+  project TEXT,
+  tags TEXT,
+  priority INTEGER,
+  due_ts INTEGER,
+  created_ts INTEGER,
+  updated_ts INTEGER,
+  status_note TEXT
+);
+"""
+
+TEXT2SQL_SYSTEM_PROMPT = (
+    "You are a precise Text-to-SQL assistant for a SQLite database that tracks task status updates. "
+    "You must only emit read-only SELECT statements that reference the task_latest or tasks tables described in the schema. "
+    "Never produce DML/DDL (INSERT/UPDATE/DELETE/ALTER/etc.), and always include a LIMIT of at most 100 rows. "
+    "Return only JSON with the structure {\"queries\":[{\"sql\":\"...\",\"description\":\"...\"}]}. "
+    "If the request needs multiple SQL statements, include up to two queries in the JSON array."
+)
+
+TEXT2SQL_MAX_QUERIES = 2
+TEXT2SQL_ROW_PREVIEW = 3
+TEXT2SQL_FORBIDDEN_KEYWORDS = (
+    'insert',
+    'update',
+    'delete',
+    'drop',
+    'alter',
+    'truncate',
+    'create',
+    'attach',
+    'detach',
+    'pragma',
+)
+TEXT2SQL_ALLOWED_TABLE_SNIPPETS = (' from task_latest', ' from tasks')
+
+class Text2SQLQueryModel(BaseModel):
+    sql: str
+    description: Optional[str] = None
+
+class Text2SQLResponseModel(BaseModel):
+    queries: List[Text2SQLQueryModel]
+
+class Text2SQLGenerateError(Exception):
+    """Raised when the LLM cannot produce a valid Text2SQL payload."""
+
+    def __init__(self, message: str, *, raw_response: Optional[str] = None):
+        super().__init__(message)
+        self.raw_response: Optional[str] = raw_response
+
+class Text2SQLValidationError(Exception):
+    """Raised when the generated SQL does not pass safety checks."""
 
 
 @dataclass
@@ -570,8 +652,10 @@ class TaskQueryEngine:
             answer_mode_hint = TaskAnswerMode.default
 
         is_simple, routing_debug = self._compute_routing_debug(spec)
-        if is_simple:
-            return self._resolve_via_ir_fast_path(spec, routing_debug)
+        if not is_simple:
+            routing_debug["routed_via"] = "text2sql"
+            payload["routing_debug"] = routing_debug
+            return self._answer_via_text2sql(q, spec, payload)
         routing_debug["routed_via"] = "hybrid_llm"
         payload["routing_debug"] = routing_debug
 
@@ -1175,3 +1259,256 @@ class TaskQueryEngine:
         else:
             payload["answer"] = no_rows_message
         return payload
+
+    def _answer_via_text2sql(
+        self,
+        q: str,
+        spec: Optional[TaskQuerySpec],
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Text2SQL pipeline entry point (LLM-generated SQL with safety checks)."""
+
+        base: Dict[str, Any] = dict(payload or {})
+        base["resolver_mode"] = "text2sql"
+
+        if spec is not None:
+            base.setdefault("intent", self._intent_label(getattr(spec, "intent", None)))
+            base["nl_ir"] = spec.dict()
+        else:
+            base.setdefault("intent", "unknown")
+            base["nl_ir"] = {"error": "missing_spec"}
+
+        if not llm_settings.enabled or llm_settings.provider == "dummy":
+            base["error"] = "text2sql_llm_disabled"
+            base["answer"] = "Text2SQL pipeline requires a configured LLM provider."
+            return base
+        if llm_settings.provider != "ollama":
+            base["error"] = "text2sql_llm_provider_unsupported"
+            base["answer"] = (
+                f"Text2SQL is not yet supported for provider {llm_settings.provider}."
+            )
+            return base
+
+        prompt = _build_text2sql_prompt(q, spec)
+        try:
+            llm_result = _call_text2sql_llm(prompt)
+        except Text2SQLGenerateError as exc:
+            base["error"] = "text2sql_llm_failed"
+            base["answer"] = "Failed to generate SQL from the LLM."
+            base["reason"] = str(exc)
+            if getattr(exc, "raw_response", None):
+                base["text2sql_raw_response"] = exc.raw_response
+            logger.warning("Text2SQL LLM failed: %s", exc)
+            return base
+
+        if not llm_result.queries:
+            base["error"] = "text2sql_empty_response"
+            base["answer"] = "LLM did not return any SQL queries."
+            return base
+
+        query_fn = getattr(self.tasks_store, "query", None)
+        if query_fn is None:
+            base["error"] = "text2sql_query_not_supported_by_tasks_store"
+            base["answer"] = "Current TasksStore cannot execute SQL queries."
+            return base
+
+        executed: List[Dict[str, Any]] = []
+        primary_rows: List[Dict[str, Any]] = []
+        primary_sql: Optional[str] = None
+
+        for item in llm_result.queries[:TEXT2SQL_MAX_QUERIES]:
+            try:
+                normalized_sql = _normalize_and_validate_text2sql_query(item.sql)
+            except Text2SQLValidationError as exc:
+                base["error"] = "text2sql_invalid_sql"
+                base["answer"] = "Generated SQL failed validation."
+                base["reason"] = str(exc)
+                base["invalid_sql"] = item.sql
+                return base
+
+            try:
+                rows = query_fn(normalized_sql, tuple())
+            except Exception as exc:
+                base["error"] = "text2sql_db_query_failed"
+                base["answer"] = "Generated SQL failed when executed against the database."
+                base["reason"] = str(exc)
+                base["sql"] = normalized_sql
+                base["params"] = []
+                logger.warning("Text2SQL query failed: %s", exc)
+                return base
+
+            executed.append(
+                {
+                    "sql": normalized_sql,
+                    "description": item.description,
+                    "rows": rows,
+                }
+            )
+            if not primary_rows:
+                primary_rows = rows
+                primary_sql = normalized_sql
+
+        base["text2sql"] = executed
+        if primary_sql is not None:
+            base["sql"] = primary_sql
+            base["params"] = []
+            base["rows"] = primary_rows
+
+        base.pop("error", None)
+        base.pop("reason", None)
+
+        if primary_rows:
+            base["answer"] = _summarize_text2sql_rows(primary_rows)
+        else:
+            base["answer"] = "Text2SQL query returned no rows."
+
+        return base
+
+
+def _build_text2sql_prompt(question: str, spec: Optional[TaskQuerySpec]) -> str:
+    hint = _make_text2sql_ir_hint(spec)
+    hint_json = json.dumps(hint, ensure_ascii=False, indent=2)
+    return (
+        "Generate at most two SQL queries that answer the user's question using the "
+        "SQLite schema below. SQL requirements:\n"
+        "- Only SELECT statements are allowed.\n"
+        "- Target the task_latest or tasks tables (task_latest contains the latest row per person+task).\n"
+        "- Always include an ORDER BY when the user cares about recency.\n"
+        "- ALWAYS include a LIMIT clause (<= 100 rows).\n"
+        "- Do not invent tables or columns.\n"
+        "- Do not use parameters; embed literal values directly in the SQL.\n"
+        "\n"
+        "Return your answer as pure JSON matching this shape (no extra commentary):\n"
+        '{"queries":[{"sql":"SELECT ...","description":"short natural language summary"}]}\n'
+        "\n"
+        "### Database schema\n"
+        f"{TEXT2SQL_SCHEMA.strip()}\n\n"
+        "### Natural language question\n"
+        f"{question}\n\n"
+        "### IR hint (may contain mistakes, but usually helpful)\n"
+        f"{hint_json}\n"
+    )
+
+
+def _make_text2sql_ir_hint(spec: Optional[TaskQuerySpec]) -> Dict[str, Any]:
+    if spec is None:
+        return {}
+
+    def _enum_to_str(value: Any) -> Any:
+        if isinstance(value, Enum):
+            return value.value
+        return value
+
+    hint: Dict[str, Any] = {
+        "intent": _enum_to_str(getattr(spec.intent, "value", spec.intent))
+        if getattr(spec, "intent", None) is not None
+        else None,
+        "person": spec.person,
+        "task": spec.task,
+        "project": spec.project,
+        "tags": spec.tags,
+        "priority": spec.priority,
+        "status": [_enum_to_str(s) for s in (spec.status or [])],
+        "time_range": spec.time_range.dict() if spec.time_range else None,
+        "due_range": spec.due_range.dict() if spec.due_range else None,
+        "created_range": spec.created_range.dict() if spec.created_range else None,
+        "limit": spec.limit,
+        "order_by": [ob.dict() for ob in (spec.order_by or [])],
+        "filters": [flt.dict() for flt in (spec.filters or [])],
+    }
+    return hint
+
+
+def _call_text2sql_llm(prompt: str) -> Text2SQLResponseModel:
+    if not llm_settings.enabled or llm_settings.provider == "dummy":
+        raise Text2SQLGenerateError("LLM provider is not configured")
+    if llm_settings.provider != "ollama":
+        raise Text2SQLGenerateError(
+            f"Provider {llm_settings.provider} is not supported for Text2SQL"
+        )
+
+    payload: Dict[str, Any] = {
+        "model": llm_settings.model,
+        "messages": [
+            {"role": "system", "content": TEXT2SQL_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "stream": False,
+        "options": {
+            "temperature": 0.0,
+        },
+    }
+
+    url = f"{llm_settings.ollama_base_url.rstrip('/')}/api/chat"
+    try:
+        resp = httpx.post(url, json=payload, timeout=60.0)
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise Text2SQLGenerateError(f"Ollama request failed: {exc}") from exc
+
+    response_text = resp.text
+    try:
+        data = resp.json()
+        content = data["message"]["content"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise Text2SQLGenerateError(
+            "Invalid response format from Ollama", raw_response=response_text
+        ) from exc
+
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise Text2SQLGenerateError(
+            "LLM output is not valid JSON", raw_response=content
+        ) from exc
+
+    try:
+        return Text2SQLResponseModel.parse_obj(parsed)
+    except ValidationError as exc:
+        raise Text2SQLGenerateError(
+            f"LLM JSON does not match expected schema: {exc}", raw_response=content
+        ) from exc
+
+
+def _normalize_and_validate_text2sql_query(sql: str) -> str:
+    if not sql or not sql.strip():
+        raise Text2SQLValidationError("SQL query is empty.")
+    normalized = sql.strip()
+    if normalized.endswith(";"):
+        normalized = normalized[:-1].strip()
+    lowered = normalized.lower()
+    if not lowered.startswith("select"):
+        raise Text2SQLValidationError("Only SELECT statements are permitted.")
+    if not any(snippet in lowered for snippet in TEXT2SQL_ALLOWED_TABLE_SNIPPETS):
+        raise Text2SQLValidationError("Query must reference task_latest or tasks.")
+    if not re.search(r"\blimit\b", lowered):
+        raise Text2SQLValidationError("Query must include a LIMIT clause.")
+    for keyword in TEXT2SQL_FORBIDDEN_KEYWORDS:
+        if keyword in lowered:
+            raise Text2SQLValidationError(f"Forbidden keyword detected: {keyword}")
+    return normalized
+
+
+def _summarize_text2sql_rows(rows: List[Dict[str, Any]]) -> str:
+    if not rows:
+        return "Text2SQL query returned no rows."
+
+    parts: List[str] = []
+    preview = rows[:TEXT2SQL_ROW_PREVIEW]
+    for row in preview:
+        person = row.get("person") or "unknown person"
+        task = row.get("task") or "unknown task"
+        status = str(row.get("status", "") or "").upper() or "UNKNOWN"
+        ts_val = row.get("ts")
+        try:
+            ts_int = int(ts_val)
+        except (TypeError, ValueError):
+            ts_int = None
+        ts_str = ts_to_str(ts_int) if ts_int is not None else str(ts_val)
+        parts.append(f'{person} / "{task}" -> {status} (ts={ts_str})')
+
+    remainder = len(rows) - len(preview)
+    summary = "; ".join(parts)
+    if remainder > 0:
+        summary += f" (+{remainder} more)"
+    return summary

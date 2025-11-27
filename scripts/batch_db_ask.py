@@ -97,6 +97,23 @@ def main() -> None:
             if "nl2sql_llm_error" in extra:
                 print("--- NL2SQL LLM error:", extra.get("nl2sql_llm_error"))
 
+        if payload.get("resolver_mode") == "text2sql":
+            if payload.get("error") == "text2sql_invalid_sql":
+                print("--- Invalid SQL:", payload.get("invalid_sql"))
+            if payload.get("error") == "text2sql_llm_failed":
+                reason = payload.get("reason")
+                if reason:
+                    print("--- Text2SQL failure reason:", reason)
+                raw = payload.get("text2sql_raw_response")
+                if raw:
+                    print("--- LLM raw response:", raw)
+            text2sql = payload.get("text2sql") or []
+            for ix, item in enumerate(text2sql, start=1):
+                print(f"--- Text2SQL query #{ix}:")
+                print("    SQL:", item.get("sql"))
+                if item.get("description"):
+                    print("    Description:", item.get("description"))
+
 
 if __name__ == "__main__":
     main()
