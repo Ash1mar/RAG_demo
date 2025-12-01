@@ -12,6 +12,7 @@ import httpx
 import faiss
 import numpy as np
 from pydantic import BaseModel, ValidationError
+from sqlglot import parse_one, exp
 
 from app.config import llm_settings
 from app.services.embeddings import Embedder
@@ -127,6 +128,7 @@ TEXT2SQL_DISALLOWED_COMPARISONS = (
 TEXT2SQL_SUSPICIOUS_LITERAL_THRESHOLD = 10_000_000_000
 _MILLIS_PER_SECOND = 1000
 _MILLIS_PER_DAY = 24 * 60 * 60 * _MILLIS_PER_SECOND
+SQL_ALLOWED_TABLES = {"task_latest", "tasks"}
 
 
 def _resolve_symbolic_time(text: str) -> Optional[int]:
@@ -1762,6 +1764,114 @@ def _strip_semicolons(sql: str) -> str:
     return sql.replace(";", " ")
 
 
+def _ensure_priority_filter(
+    sql: str, priority: Optional[Any], task_hint: Optional[Any]
+) -> str:
+    lowered = sql.lower()
+
+    p_val: Optional[int] = None
+    if priority is not None:
+        try:
+            p_val = int(priority)
+        except (TypeError, ValueError):
+            p_val = None
+    if p_val is None and ("高优" in sql and "p1" in lowered):
+        p_val = 1
+    if p_val is None:
+        return sql
+
+    if re.search(r"\bpriority\b", lowered):
+        return sql
+    clause = f"priority = {p_val}"
+
+    if "高优" in sql and "p1" in lowered:
+        pattern_and = re.compile(
+            r"\s+and\s+task\s*(?:=|like)\s*'%[^']*高优[^']*p1[^']*%?'\s*",
+            re.IGNORECASE,
+        )
+        sql = pattern_and.sub(" ", sql)
+
+    lowered = sql.lower()
+    where_idx = lowered.find(" where ")
+    if where_idx != -1:
+        insert_pos = where_idx + len(" where ")
+        existing = sql[insert_pos:].strip()
+        if existing:
+            sql = f"{sql[:insert_pos]}({clause}) AND ({existing})"
+        else:
+            sql = f"{sql[:insert_pos]}({clause})"
+        return sql
+
+    order_idx = lowered.find(" order by ")
+    limit_idx = lowered.find(" limit ")
+    insert_pos = len(sql)
+    for idx in (order_idx, limit_idx):
+        if idx != -1 and idx < insert_pos:
+            insert_pos = idx
+    suffix = sql[insert_pos:]
+    prefix = sql[:insert_pos]
+    if suffix.strip():
+        sql = f"{prefix} WHERE ({clause}) {suffix.lstrip()}"
+    else:
+        sql = f"{prefix} WHERE ({clause})"
+    return sql
+
+
+def _parse_sql_expression(sql: str, dialect: str = "sqlite") -> exp.Expression:
+    try:
+        return parse_one(sql, read=dialect)
+    except Exception as exc:  # pragma: no cover - defensive
+        raise Text2SQLValidationError(f"Failed to parse SQL: {exc}") from exc
+
+
+def _unwrap_select_expression(expression: exp.Expression) -> exp.Expression:
+    if isinstance(expression, exp.With):
+        return _unwrap_select_expression(expression.this)
+    if isinstance(expression, exp.Subquery):
+        return _unwrap_select_expression(expression.this)
+    paren_cls = getattr(exp, "Paren", None)
+    if paren_cls is not None and isinstance(expression, paren_cls):
+        return _unwrap_select_expression(expression.this)
+    return expression
+
+
+def _validate_select_expression(expr: exp.Expression) -> exp.Query:
+    target = _unwrap_select_expression(expr)
+    if not isinstance(target, exp.Query):
+        raise Text2SQLValidationError("Only SELECT statements are permitted.")
+    return target
+
+
+def _validate_allowed_tables(expression: exp.Expression) -> None:
+    for table in expression.find_all(exp.Table):
+        name = table.name
+        if not name:
+            raise Text2SQLValidationError("Query references an unnamed table.")
+        if name.lower() not in SQL_ALLOWED_TABLES:
+            raise Text2SQLValidationError(
+                f"Query references table '{name}' which is not allowed."
+            )
+
+
+def _ensure_limit_ast(select_expr: exp.Query, *, max_rows: int = 100) -> None:
+    limit = select_expr.args.get("limit")
+    capped_literal = exp.Literal.number(max_rows)
+    if limit is None:
+        select_expr.set("limit", exp.Limit(expression=capped_literal))
+        return
+    literal = getattr(limit, "expression", None)
+    if isinstance(literal, exp.Literal) and literal.is_number:
+        try:
+            value = int(literal.name)
+        except (TypeError, ValueError):
+            limit.set("expression", capped_literal)
+            return
+        if value > max_rows:
+            limit.set("expression", capped_literal)
+    else:
+        limit.set("expression", capped_literal)
+
+
 def _ensure_priority_filter(sql: str, priority: Optional[Any], task_hint: Optional[Any]) -> str:
     lowered = sql.lower()
 
@@ -1828,29 +1938,16 @@ def _rewrite_text2sql_query(sql: str, hint: Optional[Dict[str, Any]]) -> str:
     return updated
 
 
-def _normalize_and_validate_text2sql_query(sql: str) -> str:
+def _normalize_and_validate_text2sql_query(sql: str, *, dialect: str = "sqlite") -> str:
     if not sql or not sql.strip():
         raise Text2SQLValidationError("SQL query is empty.")
-    normalized = sql.strip()
-    if normalized.endswith(";"):
-        normalized = normalized[:-1].strip()
+    normalized = sql.strip().rstrip(";").strip()
+    ast = _parse_sql_expression(normalized, dialect=dialect)
+    _validate_allowed_tables(ast)
+    target = _validate_select_expression(ast)
+    _ensure_limit_ast(target, max_rows=100)
+    normalized = ast.sql(dialect="sqlite")
     lowered = normalized.lower()
-    if not lowered.startswith("select"):
-        raise Text2SQLValidationError("Only SELECT statements are permitted.")
-    if not any(snippet in lowered for snippet in TEXT2SQL_ALLOWED_TABLE_SNIPPETS):
-        raise Text2SQLValidationError("Query must reference task_latest or tasks.")
-    if not re.search(r"\blimit\b", lowered):
-        normalized = f"{normalized} LIMIT 100"
-        lowered = normalized.lower()
-    else:
-        limit_idx = lowered.rfind(" limit ")
-        order_idx = lowered.rfind(" order by ")
-        if limit_idx != -1 and order_idx != -1 and limit_idx < order_idx:
-            limit_clause = normalized[limit_idx:order_idx].strip()
-            head = normalized[:limit_idx].rstrip()
-            order_clause = normalized[order_idx:].strip()
-            normalized = f"{head} {order_clause} {limit_clause}".strip()
-            lowered = normalized.lower()
     if "?" in normalized:
         raise Text2SQLValidationError("Parameter placeholders are not allowed.")
     if re.search(r":(?!/)[A-Za-z_]\w*", normalized):

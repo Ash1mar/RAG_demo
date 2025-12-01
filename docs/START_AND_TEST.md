@@ -499,3 +499,68 @@ To keep the rule-based parser stable, we “froze” the heuristics layer at a s
 - limit/order sanity checks
 
 Everything else—including new aggregation modes like `person_summary_by_project`, `overdue_count_by_person`—must come from the LLM IR (`answer_mode`, `filters`, `time_range`, `due_range`, etc.). When you want new semantics, extend the IR/plan/formatter pipeline instead of adding more keyword rules.
+---
+
+### 12) Text2SQL 自测与调参（`/tasks/ask` + `scripts/batch_db_ask.py`）
+
+在完成 IR / SQL 快路径后，你可以进一步启用 Text2SQL 模式，用 LLM 直接生成 SQL，再由后端 AST 校验 + 重写后执行。本节给出一个最小自测与调参流程。
+
+#### 12.1) 启用 Text2SQL / hybrid_llm 模式
+
+1. 配置 LLM（以 Ollama 为例）  
+   ```bash
+   export LLM_ENABLED=true
+   export LLM_PROVIDER=ollama
+   export LLM_MODEL=deepseek-r1:7b    # or your own
+   export LLM_OLLAMA_BASE_URL=http://localhost:11434
+   ```
+2. 选择解析模式  
+   - 使用 `hybrid_llm` 作为解析器，并允许 NL→JSON→SQL 优先走 LLM：  
+     ```bash
+     export RESOLVER=hybrid_llm
+     export TASKS_NL2SQL_LLM=1
+     ```
+3. 启动 API：  
+   ```bash
+   uvicorn app.demo_app:app --host 0.0.0.0 --port 8000 --reload
+   ```
+
+#### 12.2) 使用 `scripts/batch_db_ask.py` 批量自测 `/tasks/ask`
+
+1. 准备一组 NL 问句（可参考 `scripts/questions.txt`），覆盖：  
+   - 单人 / 多人；  
+   - 标签 / 项目（tags / project）；  
+   - 时间范围（“最近一周 / 本周截止 / 最近 7 天”）；  
+   - 优先级（“高优 P1” 等）。  
+2. 用脚本连续请求 `/tasks/ask`：  
+   ```bash
+   python scripts/batch_db_ask.py --file scripts/questions.txt --endpoint http://localhost:8000/tasks/ask
+   ```
+3. 每个问题会打印：  
+   - `Answer`：自然语言回答；  
+   - `Resolver mode` / `Intent`；  
+   - 当 `resolver_mode="text2sql"` 时，还会额外打印：  
+     - `Text2SQL error`（如 `text2sql_invalid_sql` / `text2sql_db_query_failed` / `text2sql_llm_failed`）；  
+     - `Text2SQL reason`：AST / DB 的详细错误原因；  
+     - `Text2SQL SQL` / `Text2SQL params`：最终执行的 SQL 与参数；  
+     - `Text2SQL query #n`：每条 SQL 及其 `description` / `rows` 预览。
+
+#### 12.3) 如何根据输出调参
+
+- **SQL 正常执行但返回 0 行**  
+  - 检查 `Text2SQL SQL` 条件是否与当前 demo 数据匹配（例如时间窗口是否覆盖 `tasks.db` 中的 ts 范围，是否有对应的 TODO / BLOCKED 记录等）。  
+  - 如果 SQL 结构正确而数据条件过于苛刻，这是数据问题而非解析问题，可以通过调整 NL 问句或扩充 demo 数据来验证更多场景。
+
+- **`text2sql_invalid_sql` / AST 解析失败**  
+  - 核对 `Text2SQL reason` 和原始 `Text2SQL SQL`：  
+    - 常见情况包括：括号不匹配、引用非白名单表、出现 `DATE_SUB` / `CURDATE`、带 `?` 占位符等。  
+  - 根据原因调整 Text2SQL prompt：  
+    - 明确禁止某些函数 / 方言；  
+    - 强调“不要输出占位符，要输出具体时间表达式”；  
+    - 引导 LLM 优先使用 IR hint 中的 person / project / tags / time_range / priority。
+
+- **`text2sql_llm_failed` / `LLM output is not valid JSON`**  
+  - 查看 `text2sql_raw_response`：通常是 LLM 在 JSON 外多写了说明文字，或 JSON 内部引号/逗号缺失。  
+  - 对应处理：收紧系统 prompt，强调“只返回严格合法的 JSON，不要输出额外说明”，必要时更换或微调模型。
+
+通过上述流程，你可以在不修改后端代码的前提下，对 Text2SQL 行为进行迭代式的 prompt / 模型调优，同时利用 AST 层确保 SQL 始终安全、结构可控。

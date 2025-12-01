@@ -234,3 +234,38 @@ python scripts/init_tasks_sqlite.py
   - `RESOLVER=hybrid_llm`
   - `TASKS_NL2SQL_LLM=1`
   并结合 `/db/ask` 观察 IR / SQL / rows。
+---
+
+## Text2SQL 校验与 sqlglot AST（概览）
+
+在 `resolver_mode="text2sql"` 或 `hybrid_llm` 下，任务问答还会走一条“LLM 直接生成 SQL，再由后端校验”的 Text2SQL 管线。为避免 LLM 生成的 SQL 破坏安全性或因方言差异频繁报错，本项目使用 `sqlglot` 做 AST 级解析与校验：
+
+- **解析与白名单约束**
+  - 使用 `sqlglot.parse_one(sql, read="sqlite")` 将 LLM 返回的 SQL 解析为 AST。
+  - 只接受顶层为 `SELECT` 的语句（拒绝 UPDATE / INSERT / DELETE / DDL）。
+  - 通过遍历 AST 中的 `Table` 节点，强制要求只访问 `task_latest` / `tasks` 两张表。
+
+- **结构规范化**
+  - 在 AST 上自动补齐 / 裁剪 `LIMIT`：
+    - 未设置 `LIMIT` 时补 `LIMIT 100`；
+    - 超过 100 行时强制改成 `LIMIT 100`。
+  - 通过 AST 保证 `ORDER BY` 与 `LIMIT` 的位置合法，而不是用正则猜测。
+
+- **轻量重写**
+  - 对一些方言/语义小坑，结合 IR hint 做轻量重写（仍然保持只读语义不变）：
+    - 时间范围：将 IR 中的 `time_range` / `due_range` / `created_range`（如 `now-7d` / `start_of_week`）解析成当前时间对应的毫秒区间；
+    - 标签字段：在 IR `tags` 非空而 SQL 未使用 tags 时，自动注入 `tags LIKE '%...%'` 条件；
+    - 优先级：在 IR `priority` 或问句中出现“高优P1”等提示时，自动注入 `priority = 1`，并移除把“高优P1任务”当成 task 文本的等值匹配。
+
+- **安全守护与错误上报**
+  - 拒绝占位符 `?` 和命名参数（`:_name` 等），防止 LLM 生成“留给应用层填充”的未绑定 SQL。
+  - 拒绝跨方言函数（如 `DATE_SUB` / `CURDATE`）以及不合理的列比较（如 `ts > created_ts`）。
+  - 当 AST 解析失败或触发上述规则时，会抛出 `Text2SQLValidationError`，在 `/tasks/ask` 的响应中体现为：
+    - `error: "text2sql_invalid_sql"`；
+    - `reason`: 包含具体原因（例如 “Failed to parse SQL: ...” / “Query references table '...' which is not allowed” 等）；
+    - `invalid_sql` 或 `text2sql_raw_response`: 方便你直接复制 SQL / LLM 输出做进一步调试。
+
+建议在调优 Text2SQL 时配合以下工具使用：
+
+- `GET /db/ask?q=...`：对比 IR → SQL（`compile_tasks_sql`）路径与纯 Text2SQL 的差异。
+- `scripts/batch_db_ask.py`：批量跑一组 NL 问题，打印 `answer` / `resolver_mode` / `intent` / `error` / `reason` / `sql` / `text2sql`，快速定位是 JSON、SQL 还是数据本身的问题。

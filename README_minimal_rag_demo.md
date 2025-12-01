@@ -168,4 +168,33 @@ RAG_demo/
   - `app/services/nl2sql_engine.py`
   - `app/services/sql_compiler.py`
   - `app/services/llm_client.py`
+---
+
+## Text2SQL & SQL AST 概览
+
+本 demo 在任务子系统中还内置了一个可选的 Text2SQL 管线，用于“让 LLM 生成 SQL，但仍由后端严格控制 / 重写”：
+
+- **入口与模式**  
+  - `/tasks/ask` 在 `resolver_mode="text2sql"` 或 `hybrid_llm` 下，会走 Text2SQL 分支：  
+    1. `parse_task_query_nl` 生成 `TaskQuerySpec`（语义 IR）。  
+    2. 构造 Text2SQL prompt，将 schema + IR hint 一并交给 LLM，要求返回 `{"queries":[{"sql":...,"description":...}]}` 结构的 JSON。  
+    3. 对每条 SQL 先做 **重写 + AST 校验**，再交给 `SQLiteTasksStore.query(sql, params)` 执行。  
+
+- **安全校验与重写（`app/services/task_query.py`）**  
+  - 使用 `sqlglot` 将 LLM 返回的 SQL 解析成 AST：  
+    - 只允许只读 `SELECT`，且只允许访问 `task_latest` / `tasks` 两张表。  
+    - 自动补齐 / 裁剪 `LIMIT`（最多 100 行），并规范 `ORDER BY` 位置。  
+    - 拒绝危险关键字和跨方言函数（如 `DATE_SUB` / `CURDATE`）、占位符 `?`、命名参数等。  
+  - 在 AST 之外，对一些常见坑做轻量修正：  
+    - 时间窗口：将 `now-7d`、`start_of_week` 等符号解析成实际时间戳，修剪 `NOW() - 7d` 这类方言函数。  
+    - 标签（`tags`）：自动注入 `tags LIKE '%...%'` 条件，避免把标签词误当人名。  
+    - 优先级（`priority`）：将“高优P1任务”类问句映射到 `priority = 1`，并移除对“高优P1任务”作为任务名的硬匹配。  
+
+- **调试字段**  
+  - 当 Text2SQL 失败时，`/tasks/ask` 的 JSON 中会包含：  
+    - `error`：如 `text2sql_invalid_sql` / `text2sql_db_query_failed` / `text2sql_llm_failed`；  
+    - `reason`：AST 或 DB 抛出的详细错误信息；  
+    - `text2sql_raw_response`：LLM 原始输出（便于改 prompt）；  
+    - `text2sql`：每条 SQL 的执行结果（包括 `sql`、`description`、`rows`）。  
+  - 配合 `scripts/batch_db_ask.py` 可以批量跑一组自然语言问题，观察 Text2SQL 行为，并据此调优 prompt 与解析规则。
 
