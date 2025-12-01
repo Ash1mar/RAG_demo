@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from enum import Enum
 import json
 import logging
@@ -125,6 +125,48 @@ TEXT2SQL_DISALLOWED_COMPARISONS = (
     "due_ts < ts",
 )
 TEXT2SQL_SUSPICIOUS_LITERAL_THRESHOLD = 10_000_000_000
+_MILLIS_PER_SECOND = 1000
+_MILLIS_PER_DAY = 24 * 60 * 60 * _MILLIS_PER_SECOND
+
+
+def _resolve_symbolic_time(text: str) -> Optional[int]:
+    """Resolve tokens like now-7d, now, start_of_week into epoch millis."""
+    t = text.strip().lower()
+    if not t:
+        return None
+    now = datetime.now(timezone.utc)
+    if t == "now":
+        return int(now.timestamp() * 1000)
+    if t == "start_of_week":
+        start = now - timedelta(days=now.weekday())
+        start = start.replace(hour=0, minute=0, second=0, microsecond=0)
+        return int(start.timestamp() * 1000)
+    if t == "end_of_week":
+        start = now - timedelta(days=now.weekday())
+        end = start + timedelta(days=7, seconds=-1)
+        return int(end.timestamp() * 1000)
+    if t == "start_of_month":
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        return int(start.timestamp() * 1000)
+    if t == "end_of_month":
+        if now.month == 12:
+            next_month = now.replace(year=now.year + 1, month=1, day=1)
+        else:
+            next_month = now.replace(month=now.month + 1, day=1)
+        end = next_month - timedelta(seconds=1)
+        return int(end.timestamp() * 1000)
+    m = re.fullmatch(r"now-(\d+)([dwm])", t)
+    if m:
+        amount = int(m.group(1))
+        unit = m.group(2)
+        days = amount
+        if unit == "w":
+            days = amount * 7
+        elif unit == "m":
+            days = amount * 30
+        dt = now - timedelta(days=days)
+        return int(dt.timestamp() * 1000)
+    return None
 
 class Text2SQLQueryModel(BaseModel):
     sql: str
@@ -1578,6 +1620,10 @@ def _format_range_literal(value: Optional[Any]) -> Optional[str]:
     text = str(value).strip()
     if not text:
         return None
+    # try to resolve symbolic tokens like now-7d, now, start_of_week, etc.
+    resolved = _resolve_symbolic_time(text)
+    if resolved is not None:
+        return str(int(resolved))
     if re.fullmatch(r"-?\d+(\.\d+)?", text):
         return text
     escaped = text.replace("'", "''")
@@ -1618,6 +1664,18 @@ def _apply_range_hint(sql: str, column: str, range_hint: Optional[Dict[str, Any]
     )
     sql = placeholder_pattern.sub(lambda match: _replacement_clause("1=1"), sql)
 
+    interval_pattern = re.compile(
+        rf"{column}\s*(?:>=|>|<=|<)\s*now\(\)\s*-\s*\d+\s*[a-z]+",
+        re.IGNORECASE,
+    )
+    sql = interval_pattern.sub(_replacement_clause("1=1"), sql)
+
+    symbolic_pattern = re.compile(
+        rf"{column}\s*(?:>=|>|<=|<)\s*'[^']*'",
+        re.IGNORECASE,
+    )
+    sql = symbolic_pattern.sub(_replacement_clause("1=1"), sql)
+
     literal_pattern = re.compile(
         rf"{column}\s*(>=|>|<=|<)\s*(\d+)",
         re.IGNORECASE,
@@ -1643,13 +1701,25 @@ def _apply_range_hint(sql: str, column: str, range_hint: Optional[Dict[str, Any]
 
 
 def _ensure_tag_filters(sql: str, tags: Optional[List[str]]) -> str:
-    tag_values = [str(tag).strip() for tag in (tags or []) if str(tag).strip()]
+    def _clean(tag: str) -> str:
+        cleaned = str(tag or "").strip()
+        cleaned = cleaned.strip(" ，,;；、")
+        cleaned = re.sub(r"\s+", "", cleaned)
+        return cleaned
+
+    tag_values = [_clean(tag) for tag in (tags or []) if _clean(tag)]
     if not tag_values:
         return sql
     lowered = sql.lower()
     def _escape(tag: str) -> str:
         return tag.replace("'", "''")
-    clause_parts = [f"tags LIKE '%{_escape(tag)}%'" for tag in tag_values[:2]]
+    seen: List[str] = []
+    for tag in tag_values:
+        if tag not in seen:
+            seen.append(tag)
+        if len(seen) >= 2:
+            break
+    clause_parts = [f"tags LIKE '%{_escape(tag)}%'" for tag in seen]
     clause = " AND ".join(clause_parts)
     lowered = sql.lower()
     where_idx = lowered.find(" where ")
@@ -1686,6 +1756,63 @@ def _cleanup_invalid_order_tokens(sql: str) -> str:
     return pattern.sub(_repl, sql)
 
 
+def _strip_semicolons(sql: str) -> str:
+    if not sql:
+        return sql
+    return sql.replace(";", " ")
+
+
+def _ensure_priority_filter(sql: str, priority: Optional[Any], task_hint: Optional[Any]) -> str:
+    lowered = sql.lower()
+
+    p_val: Optional[int] = None
+    if priority is not None:
+        try:
+            p_val = int(priority)
+        except (TypeError, ValueError):
+            p_val = None
+    if p_val is None and ("高优" in sql and "p1" in lowered):
+        p_val = 1
+    if p_val is None:
+        return sql
+
+    if re.search(r"\bpriority\b", lowered):
+        return sql
+    clause = f"priority = {p_val}"
+
+    if "高优" in sql and "p1" in lowered:
+        pattern_and = re.compile(
+            r"\s+and\s+task\s*(?:=|like)\s*'%[^']*高优[^']*p1[^']*%?'\s*",
+            re.IGNORECASE,
+        )
+        sql = pattern_and.sub(" ", sql)
+
+    lowered = sql.lower()
+    where_idx = lowered.find(" where ")
+    if where_idx != -1:
+        insert_pos = where_idx + len(" where ")
+        existing = sql[insert_pos:].strip()
+        if existing:
+            sql = f"{sql[:insert_pos]}({clause}) AND ({existing})"
+        else:
+            sql = f"{sql[:insert_pos]}({clause})"
+        return sql
+
+    order_idx = lowered.find(" order by ")
+    limit_idx = lowered.find(" limit ")
+    insert_pos = len(sql)
+    for idx in (order_idx, limit_idx):
+        if idx != -1 and idx < insert_pos:
+            insert_pos = idx
+    suffix = sql[insert_pos:]
+    prefix = sql[:insert_pos]
+    if suffix.strip():
+        sql = f"{prefix} WHERE ({clause}) {suffix.lstrip()}"
+    else:
+        sql = f"{prefix} WHERE ({clause})"
+    return sql
+
+
 def _rewrite_text2sql_query(sql: str, hint: Optional[Dict[str, Any]]) -> str:
     if not sql:
         return sql
@@ -1696,6 +1823,8 @@ def _rewrite_text2sql_query(sql: str, hint: Optional[Dict[str, Any]]) -> str:
     updated = _apply_range_hint(updated, "due_ts", hint.get("due_range"))
     updated = _ensure_tag_filters(updated, hint.get("tags"))
     updated = _cleanup_invalid_order_tokens(updated)
+    updated = _strip_semicolons(updated)
+    updated = _ensure_priority_filter(updated, hint.get("priority"), hint.get("task"))
     return updated
 
 

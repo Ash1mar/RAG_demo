@@ -398,12 +398,10 @@ _PRIORITY_HINTS = [
     ("p1", 1),
     ("p2", 2),
     ("p3", 3),
-    ("?????", 1),
-    ("????", 1),
-    ("??p1", 1),
-    ("??", 1),
-    ("??", 2),
-    ("??", 3),
+    ("\u6700\u9ad8\u4f18\u5148\u7ea7", 1),  # 最高优先级
+    ("\u9ad8\u4f18\u5148\u7ea7", 1),        # 高优先级
+    ("\u9ad8\u4f18p1", 1),                 # 高优P1
+    ("\u9ad8\u4f18", 1),                   # 高优
 ]
 
 _ORDER_ASC_HINTS = ("最早", "时间升序", "按创建顺序")
@@ -755,6 +753,37 @@ def _post_process_intent(spec: TaskQuerySpec, text: str) -> None:
             spec.tags = _extract_tags(t)
         except Exception:
             pass
+
+    raw_text_lower = t_lower
+    if "p1" in raw_text_lower and ("高优" in t or "高优先级" in t):
+        if spec.priority is None:
+            spec.priority = 1
+        task_val = getattr(spec, "task", None)
+        if isinstance(task_val, str) and "高优" in task_val and "p1" in task_val.lower():
+            spec.task = None
+        filters = list(getattr(spec, "filters", []) or [])
+        cleaned_filters: List[QueryFilter] = []
+        for flt in filters:
+            try:
+                field = str(getattr(flt, "field", "") or "").lower()
+            except Exception:
+                field = ""
+            if field != "task":
+                cleaned_filters.append(flt)
+                continue
+            op = str(getattr(flt, "op", "") or "").lower()
+            if op == "in":
+                values = getattr(flt, "values", None) or []
+                remaining = [v for v in values if not (isinstance(v, str) and "高优" in v and "p1" in v.lower())]
+                if remaining:
+                    flt.values = remaining
+                    cleaned_filters.append(flt)
+                continue
+            value = getattr(flt, "value", None)
+            if isinstance(value, str) and "高优" in value and "p1" in value.lower():
+                continue
+            cleaned_filters.append(flt)
+        spec.filters = cleaned_filters
 
     intent = getattr(spec, "intent", None)
     status_kws = ("已完成", "未完成", "done", "todo", "搞定", "结束")

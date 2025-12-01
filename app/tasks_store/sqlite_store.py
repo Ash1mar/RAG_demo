@@ -141,13 +141,20 @@ class SQLiteTasksStore(TasksStore):
     # --- internal mapping ---
     def _row_to_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
         """Normalize SQLite row to a dict with optional extended fields."""
-        base = {
-            "id": int(row["id"]),
-            "person": row["person"],
-            "task": row["task"],
-            "status": row["status"],
-            "ts": int(row["ts"]),
-        }
+        keys = set(row.keys())
+        base: Dict[str, Any] = {}
+        base["id"] = int(row["id"]) if "id" in keys and row["id"] is not None else None
+        if "person" in keys:
+            base["person"] = row["person"]
+        if "task" in keys:
+            base["task"] = row["task"]
+        if "status" in keys:
+            base["status"] = row["status"]
+        if "ts" in keys:
+            try:
+                base["ts"] = int(row["ts"]) if row["ts"] is not None else None
+            except (TypeError, ValueError):
+                base["ts"] = row["ts"]
         # optional extended fields (absent in older schemas)
         for field in (
             "project",
