@@ -97,18 +97,34 @@ TEXT2SQL_SYSTEM_PROMPT = (
 TEXT2SQL_MAX_QUERIES = 2
 TEXT2SQL_ROW_PREVIEW = 3
 TEXT2SQL_FORBIDDEN_KEYWORDS = (
-    'insert',
-    'update',
-    'delete',
-    'drop',
-    'alter',
-    'truncate',
-    'create',
-    'attach',
-    'detach',
-    'pragma',
+    "insert",
+    "update",
+    "delete",
+    "drop",
+    "alter",
+    "truncate",
+    "create",
+    "attach",
+    "detach",
+    "pragma",
 )
 TEXT2SQL_ALLOWED_TABLE_SNIPPETS = (' from task_latest', ' from tasks')
+TEXT2SQL_DISALLOWED_FUNCTIONS = ('date_sub', 'curdate')
+TEXT2SQL_DISALLOWED_COMPARISONS = (
+    "ts > created_ts",
+    "ts < created_ts",
+    "ts >= created_ts",
+    "ts <= created_ts",
+    "created_ts > ts",
+    "created_ts < ts",
+    "created_ts >= ts",
+    "created_ts <= ts",
+    "ts > due_ts",
+    "ts < due_ts",
+    "due_ts > ts",
+    "due_ts < ts",
+)
+TEXT2SQL_SUSPICIOUS_LITERAL_THRESHOLD = 10_000_000_000
 
 class Text2SQLQueryModel(BaseModel):
     sql: str
@@ -1316,9 +1332,12 @@ class TaskQueryEngine:
         primary_rows: List[Dict[str, Any]] = []
         primary_sql: Optional[str] = None
 
+        hint = _make_text2sql_ir_hint(spec)
+
         for item in llm_result.queries[:TEXT2SQL_MAX_QUERIES]:
             try:
-                normalized_sql = _normalize_and_validate_text2sql_query(item.sql)
+                rewritten_sql = _rewrite_text2sql_query(item.sql, hint)
+                normalized_sql = _normalize_and_validate_text2sql_query(rewritten_sql)
             except Text2SQLValidationError as exc:
                 base["error"] = "text2sql_invalid_sql"
                 base["answer"] = "Generated SQL failed validation."
@@ -1377,6 +1396,16 @@ def _build_text2sql_prompt(question: str, spec: Optional[TaskQuerySpec]) -> str:
         "- ALWAYS include a LIMIT clause (<= 100 rows).\n"
         "- Do not invent tables or columns.\n"
         "- Do not use parameters; embed literal values directly in the SQL.\n"
+        "- 当 IR hint 提供了 person/task/project 等字段时，请优先使用 hint 中的值，不要从原始文本中重新猜测人名/项目名。\n"
+        "- If the IR hint lists multiple persons or tasks, use an IN (...) filter instead of re-parsing the question.\n"
+        "- Map IR hint tags to tags LIKE filters; do not treat tag keywords as person/task names.\n"
+        "- Translate time_range/due_range/created_range hints into comparisons on ts/due_ts/created_ts respectively, instead of inventing CURRENT_TIMESTAMP math.\n"
+        "- Do not compare ts with created_ts/due_ts directly; rely on the IR-provided ranges for each column.\n"
+        "- If a time/due/created range hint is missing, either omit that filter or choose an explicit literal (e.g., now-7d); never output placeholders or arbitrary constants.\n"
+        "- Honor hint.limit when present so LIMIT matches the user's request; otherwise keep LIMIT <= 100.\n"
+        "- Do not emit parameter placeholders (?) or MySQL-specific functions such as DATE_SUB/CURDATE; stick to SQLite expressions only.\n"
+        "- Return strictly valid JSON (no comments or explanations outside the JSON block, and ensure all quotes/brackets are balanced).\n"
+        "- If you cannot obtain a literal value for a filter, drop that filter instead of inventing placeholders.\n"
         "\n"
         "Return your answer as pure JSON matching this shape (no extra commentary):\n"
         '{"queries":[{"sql":"SELECT ...","description":"short natural language summary"}]}\n'
@@ -1455,19 +1484,30 @@ def _call_text2sql_llm(prompt: str) -> Text2SQLResponseModel:
             "Invalid response format from Ollama", raw_response=response_text
         ) from exc
 
-    try:
-        json_payload = _extract_json_payload(content)
-    except ValueError as exc:
-        raise Text2SQLGenerateError(
-            "LLM output is not valid JSON", raw_response=content
-        ) from exc
+    def _try_parse_raw_json(text: str) -> Optional[Dict[str, Any]]:
+        candidate = (text or "").strip()
+        if not candidate.startswith("{") or not candidate.endswith("}"):
+            return None
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            return None
 
-    try:
-        parsed = json.loads(json_payload)
-    except json.JSONDecodeError as exc:
-        raise Text2SQLGenerateError(
-            "LLM output is not valid JSON", raw_response=content
-        ) from exc
+    parsed: Optional[Dict[str, Any]] = _try_parse_raw_json(content)
+    if parsed is None:
+        try:
+            json_payload = _extract_json_payload(content)
+        except ValueError as exc:
+            raise Text2SQLGenerateError(
+                "LLM output is not valid JSON", raw_response=content
+            ) from exc
+
+        try:
+            parsed = json.loads(json_payload)
+        except json.JSONDecodeError as exc:
+            raise Text2SQLGenerateError(
+                "LLM output is not valid JSON", raw_response=content
+            ) from exc
 
     try:
         return Text2SQLResponseModel.parse_obj(parsed)
@@ -1494,22 +1534,169 @@ def _extract_json_payload(raw: str) -> str:
         inner = inner.lstrip()
         if inner.lower().startswith("json"):
             inner = inner[4:].lstrip()
-        return inner.strip()
+        s = inner.strip()
 
-    start = s.find("{")
-    end = s.find("}", start)
-    if start != -1 and end != -1:
-        candidate = s[start : s.rfind("}") + 1]
-        candidate = candidate.strip()
-        if candidate.endswith("```"):
-            candidate = candidate[:-3].strip()
-        tail = s[s.rfind("}") + 1 :].strip()
-        for marker in ("```", "^^^", "---"):
-            marker_pos = candidate.find(marker)
-            if marker_pos != -1:
-                candidate = candidate[:marker_pos].strip()
-        return candidate
+    def _extract_from(text: str, idx: int) -> Optional[str]:
+        depth = 0
+        in_string = False
+        escape = False
+        for pos in range(idx, len(text)):
+            ch = text[pos]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[idx : pos + 1].strip()
+        return None
+
+    for marker in ('{"queries"', "{"):
+        start = s.find(marker)
+        if start == -1:
+            continue
+        result = _extract_from(s, start)
+        if result:
+            return result.strip()
     raise ValueError("no JSON object found")
+
+
+def _format_range_literal(value: Optional[Any]) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return str(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    if re.fullmatch(r"-?\d+(\.\d+)?", text):
+        return text
+    escaped = text.replace("'", "''")
+    return f"'{escaped}'"
+
+
+def _build_range_clause(column: str, start_literal: Optional[str], end_literal: Optional[str]) -> str:
+    parts: List[str] = []
+    if start_literal:
+        parts.append(f"{column} >= {start_literal}")
+    if end_literal:
+        parts.append(f"{column} <= {end_literal}")
+    return " AND ".join(parts)
+
+
+def _apply_range_hint(sql: str, column: str, range_hint: Optional[Dict[str, Any]]) -> str:
+    if not sql:
+        return sql
+    hint = range_hint or {}
+    start_literal = _format_range_literal(hint.get("start"))
+    end_literal = _format_range_literal(hint.get("end"))
+    alias_pattern = re.compile(rf"\b[a-zA-Z0-9_]+\.(?={re.escape(column)}\b)", re.IGNORECASE)
+    sql = alias_pattern.sub("", sql)
+
+    def _replacement_clause(default: str) -> str:
+        clause = _build_range_clause(column, start_literal, end_literal)
+        return clause or default
+
+    between_pattern = re.compile(
+        rf"{column}\s*(?:>=|>)\s*(\?|\([^)]*now\(\)[^)]*\)|\d+)\s+and\s*{column}\s*(?:<=|<)\s*(\?|\([^)]*now\(\)[^)]*\)|\d+)",
+        re.IGNORECASE,
+    )
+    sql = between_pattern.sub(lambda _: _replacement_clause("1=1"), sql)
+
+    placeholder_pattern = re.compile(
+        rf"{column}\s*(?:>=|>|<=|<)\s*(\?|\([^)]*now\(\)[^)]*\))",
+        re.IGNORECASE,
+    )
+    sql = placeholder_pattern.sub(lambda match: _replacement_clause("1=1"), sql)
+
+    literal_pattern = re.compile(
+        rf"{column}\s*(>=|>|<=|<)\s*(\d+)",
+        re.IGNORECASE,
+    )
+
+    def _literal_repl(match: re.Match) -> str:
+        op = match.group(1)
+        value = match.group(2)
+        try:
+            num = int(value)
+        except ValueError:
+            return match.group(0)
+        if num >= TEXT2SQL_SUSPICIOUS_LITERAL_THRESHOLD:
+            return match.group(0)
+        if op in (">=", ">") and start_literal:
+            return f"{column} {op} {start_literal}"
+        if op in ("<=", "<") and end_literal:
+            return f"{column} {op} {end_literal}"
+        return "1=1"
+
+    sql = literal_pattern.sub(_literal_repl, sql)
+    return sql
+
+
+def _ensure_tag_filters(sql: str, tags: Optional[List[str]]) -> str:
+    tag_values = [str(tag).strip() for tag in (tags or []) if str(tag).strip()]
+    if not tag_values:
+        return sql
+    lowered = sql.lower()
+    def _escape(tag: str) -> str:
+        return tag.replace("'", "''")
+    clause_parts = [f"tags LIKE '%{_escape(tag)}%'" for tag in tag_values[:2]]
+    clause = " AND ".join(clause_parts)
+    lowered = sql.lower()
+    where_idx = lowered.find(" where ")
+    if where_idx != -1:
+        insert_pos = where_idx + len(" where ")
+        existing = sql[insert_pos:].strip()
+        if existing:
+            sql = f"{sql[:insert_pos]}({clause}) AND ({existing})"
+        else:
+            sql = f"{sql[:insert_pos]}({clause})"
+        return sql
+    order_idx = lowered.find(" order by ")
+    limit_idx = lowered.find(" limit ")
+    insert_pos = len(sql)
+    for idx in (order_idx, limit_idx):
+        if idx != -1 and idx < insert_pos:
+            insert_pos = idx
+    suffix = sql[insert_pos:]
+    prefix = sql[:insert_pos]
+    if suffix.strip():
+        sql = f"{prefix} WHERE ({clause}) {suffix.lstrip()}"
+    else:
+        sql = f"{prefix} WHERE ({clause})"
+    return sql
+
+
+def _cleanup_invalid_order_tokens(sql: str) -> str:
+    if not sql:
+        return sql
+    pattern = re.compile(r"(\b(?:and|where)\b)\s+[A-Za-z_][\w.]*\s+(?:asc|desc)\b", re.IGNORECASE)
+    def _repl(match: re.Match) -> str:
+        lead = match.group(1)
+        return " " if lead.lower() == "and" else f"{lead} "
+    return pattern.sub(_repl, sql)
+
+
+def _rewrite_text2sql_query(sql: str, hint: Optional[Dict[str, Any]]) -> str:
+    if not sql:
+        return sql
+    updated = sql
+    hint = hint or {}
+    updated = _apply_range_hint(updated, "ts", hint.get("time_range"))
+    updated = _apply_range_hint(updated, "created_ts", hint.get("created_range"))
+    updated = _apply_range_hint(updated, "due_ts", hint.get("due_range"))
+    updated = _ensure_tag_filters(updated, hint.get("tags"))
+    updated = _cleanup_invalid_order_tokens(updated)
+    return updated
 
 
 def _normalize_and_validate_text2sql_query(sql: str) -> str:
@@ -1524,9 +1711,39 @@ def _normalize_and_validate_text2sql_query(sql: str) -> str:
     if not any(snippet in lowered for snippet in TEXT2SQL_ALLOWED_TABLE_SNIPPETS):
         raise Text2SQLValidationError("Query must reference task_latest or tasks.")
     if not re.search(r"\blimit\b", lowered):
-        raise Text2SQLValidationError("Query must include a LIMIT clause.")
+        normalized = f"{normalized} LIMIT 100"
+        lowered = normalized.lower()
+    else:
+        limit_idx = lowered.rfind(" limit ")
+        order_idx = lowered.rfind(" order by ")
+        if limit_idx != -1 and order_idx != -1 and limit_idx < order_idx:
+            limit_clause = normalized[limit_idx:order_idx].strip()
+            head = normalized[:limit_idx].rstrip()
+            order_clause = normalized[order_idx:].strip()
+            normalized = f"{head} {order_clause} {limit_clause}".strip()
+            lowered = normalized.lower()
+    if "?" in normalized:
+        raise Text2SQLValidationError("Parameter placeholders are not allowed.")
+    if re.search(r":(?!/)[A-Za-z_]\w*", normalized):
+        raise Text2SQLValidationError("Named parameter placeholders are not allowed.")
+    for func in TEXT2SQL_DISALLOWED_FUNCTIONS:
+        if re.search(rf"\b{re.escape(func)}\b", lowered):
+            raise Text2SQLValidationError(f"Unsupported SQL function detected: {func}")
+    for comparison in TEXT2SQL_DISALLOWED_COMPARISONS:
+        if comparison in lowered:
+            raise Text2SQLValidationError(f"Unsupported column comparison detected: {comparison}")
+    literal_pattern = re.compile(r"\b(ts|created_ts|due_ts)\s*(>=|<=|=)\s*(\d+)")
+    for column, _, value in literal_pattern.findall(lowered):
+        try:
+            literal = int(value)
+        except ValueError:
+            continue
+        if literal < TEXT2SQL_SUSPICIOUS_LITERAL_THRESHOLD:
+            raise Text2SQLValidationError(
+                f"Suspicious literal detected for {column}: {value}"
+            )
     for keyword in TEXT2SQL_FORBIDDEN_KEYWORDS:
-        if keyword in lowered:
+        if re.search(rf"\b{re.escape(keyword)}\b", lowered):
             raise Text2SQLValidationError(f"Forbidden keyword detected: {keyword}")
     return normalized
 

@@ -327,6 +327,47 @@ _USE_LLM_FOR_NL2SQL = getenv("TASKS_NL2SQL_LLM", "0") == "1"
 
 _PERSON_SEPARATOR_CHARS = "、，,/和及与"
 _MULTI_ENTITY_SPLIT_RE = re.compile(f"[{_PERSON_SEPARATOR_CHARS}\+\s]+")
+_PERSON_SUFFIXES = (
+    "的任务",
+    "的情况",
+    "的状态",
+    "的项目",
+    "任务",
+    "情况",
+    "状态",
+    "列表",
+    "有哪些",
+    "还有",
+    "最近",
+    "里",
+    "在",
+    "的",
+)
+_PERSON_STOPWORDS = (
+    "\u5f53\u524d",  # 当前
+    "\u6240\u6709",  # 所有
+    "\u6700\u8fd1",  # 最近
+    "\u672c\u5468",  # 本周
+    "\u672c\u6708",  # 本月
+    "\u8fd8\u6709",  # 还有
+    "\u54ea\u4e9b",  # 哪些
+    "\u4ec0\u4e48",  # 什么
+    "\u60c5\u51b5",  # 情况
+    "\u4efb\u52a1",  # 任务
+    "\u72b6\u6001",  # 状态
+    "\u5217\u8868",  # 列表
+    "\u5168\u90e8",  # 全部
+    "\u5176\u4ed6",  # 其他
+    "\u6807\u7b7e",  # 标签
+    "\u6807\u7b7e\u5305\u542b",  # 标签包含
+    "\u6807\u7b7e\u91cc",  # 标签里
+    "\u6807\u7b7e\u4e2d",  # 标签中
+    "\u6807\u7b7e\u662f",  # 标签是
+    "\u9879\u76ee",  # 项目
+    "\u9879\u76ee\u91cc",  # 项目里
+    "\u9879\u76ee\u4e2d",  # 项目中
+    "\u9879\u76ee\u7684",  # 项目的
+)
 
 _TIME_RANGE_HINTS = [
     ("最近一周", ("now-7d", "now")),
@@ -347,6 +388,9 @@ _PROJECT_PATTERNS = [
 ]
 
 _TAG_PATTERN = re.compile(r"#([\w\u4e00-\u9fff-]+)")
+_TAG_PHRASE_PATTERN = re.compile(
+    r"\u6807\u7b7e(?:\u5305\u542b|\u6709|\u5e26|\u542b|\u662f)?\s*([#\w\u4e00-\u9fff-]+)"
+)
 
 _LIMIT_PATTERN = re.compile(r"(?:前|最近)?(\d{1,3})(?:条|个|项|行)")
 
@@ -354,11 +398,12 @@ _PRIORITY_HINTS = [
     ("p1", 1),
     ("p2", 2),
     ("p3", 3),
-    ("最高优先级", 1),
-    ("高优先级", 1),
-    ("高优", 1),
-    ("中优", 2),
-    ("低优", 3),
+    ("?????", 1),
+    ("????", 1),
+    ("??p1", 1),
+    ("??", 1),
+    ("??", 2),
+    ("??", 3),
 ]
 
 _ORDER_ASC_HINTS = ("最早", "时间升序", "按创建顺序")
@@ -411,6 +456,34 @@ def _split_multi_values(value: Optional[str]) -> List[str]:
     return [item.strip() for item in _MULTI_ENTITY_SPLIT_RE.split(value) if item.strip()]
 
 
+def _normalize_person_candidate(value: Optional[str]) -> str:
+    token = (value or "").strip()
+    if not token:
+        return ""
+    changed = True
+    while changed:
+        changed = False
+        for suffix in _PERSON_SUFFIXES:
+            if token.endswith(suffix):
+                token = token[: -len(suffix)].strip() if len(token) > len(suffix) else ""
+                changed = True
+                break
+    return token
+
+
+def _person_has_stopword(token: str) -> bool:
+    return any(stop in token for stop in _PERSON_STOPWORDS)
+
+
+def _sanitize_person_value(value: Optional[str]) -> Optional[str]:
+    token = _normalize_person_candidate(value)
+    if not token:
+        return None
+    if _person_has_stopword(token):
+        return None
+    return token
+
+
 def _extract_keywords(value: Optional[str]) -> List[str]:
     if not value:
         return []
@@ -437,6 +510,18 @@ def _detect_time_range(text: str) -> Optional[TimeRange]:
 
 
 
+def _detect_created_range(text: str) -> Optional[TimeRange]:
+    lower = text.lower()
+    if (
+        "\u521b\u5efa" not in text
+        and "\u65b0\u5efa" not in text
+        and "create" not in lower
+        and "created" not in lower
+    ):
+        return None
+    return _detect_time_range(text)
+
+
 def _detect_due_range(text: str) -> Optional[TimeRange]:
     due_kws = ("截止", "到期", "ddl")
     if not any(kw in text for kw in due_kws):
@@ -459,12 +544,15 @@ def _detect_due_range(text: str) -> Optional[TimeRange]:
     return None
 
 def _looks_like_person(token: str) -> bool:
-    if not token:
+    candidate = _normalize_person_candidate(token)
+    if not candidate:
         return False
-    if len(token) < 2 or len(token) > 4:
+    if _person_has_stopword(candidate):
         return False
-    cjk_chars = sum(1 for ch in token if "\u4e00" <= ch <= "\u9fff")
-    return cjk_chars >= len(token) - 1
+    if len(candidate) < 2 or len(candidate) > 4:
+        return False
+    cjk_chars = sum(1 for ch in candidate if "\u4e00" <= ch <= "\u9fff")
+    return cjk_chars >= len(candidate) - 1
 
 
 def _extract_person_tokens_from_text(text: str) -> List[str]:
@@ -474,15 +562,17 @@ def _extract_person_tokens_from_text(text: str) -> List[str]:
         if anchor in text:
             segments.append(text.split(anchor, 1)[0])
     segments.append(text)
+    trim_anchors = ("自己", "有关", "相关", "以及")
     for segment in segments:
         for token in _split_multi_values(segment):
             token = token.strip()
-            for anchor in ("最近", "任务", "还有", "以及"):
+            for anchor in trim_anchors:
                 if anchor in token:
                     token = token.split(anchor, 1)[0]
                     break
-            if _looks_like_person(token) and token not in persons:
-                persons.append(token)
+            normalized = _sanitize_person_value(token)
+            if normalized and _looks_like_person(normalized) and normalized not in persons:
+                persons.append(normalized)
         if len(persons) >= 2:
             break
     return persons
@@ -517,8 +607,29 @@ def _detect_priority(text: str) -> Optional[int]:
     return None
 
 
+def _normalize_tag_value(value: str) -> str:
+    token = (value or "").strip()
+    if not token:
+        return ""
+    token = token.lstrip("#")
+    token = token.rstrip("\u6807\u7b7e").rstrip("\u7684")
+    token = re.split(r"[，,。.;；、]+", token)[0]
+    token = re.sub(r"\s+", "", token)
+    return token.strip()
+
+
 def _extract_tags(text: str) -> List[str]:
-    return [match.group(1) for match in _TAG_PATTERN.finditer(text)]
+    tags: List[str] = [_normalize_tag_value(match.group(1)) for match in _TAG_PATTERN.finditer(text)]
+    phrase_hits: List[str] = []
+    for match in _TAG_PHRASE_PATTERN.finditer(text):
+        candidate = _normalize_tag_value(match.group(1))
+        if candidate:
+            phrase_hits.append(candidate)
+    ordered: List[str] = []
+    for tag in tags + phrase_hits:
+        if tag and tag not in ordered:
+            ordered.append(tag)
+    return ordered
 
 
 def _build_multi_filter(field: str, values: List[str]) -> Optional[QueryFilter]:
@@ -535,23 +646,27 @@ def _extract_person_task(text: str) -> Dict[str, Optional[str]]:
     match = _PERSON_TASK_STATUS_RE.search(text)
     if match:
         return {
-            "person": match.group("person").strip(),
+            "person": _sanitize_person_value(match.group("person")),
             "task": match.group("task").strip(),
         }
 
     match = _PERSON_TASK_GENERIC_RE.search(text)
     if match:
         return {
-            "person": match.group("person").strip(),
+            "person": _sanitize_person_value(match.group("person")),
             "task": match.group("task").strip(),
         }
 
-    # Pattern: "<person>现在有哪些任务"
-    if "有哪些任务" in text:
-        left, _, _ = text.partition("有哪些任务")
+    # Pattern: "<person>最近还有哪些任务"
+    recent_tasks_hint = "\u6700\u8fd1\u8fd8\u6709\u54ea\u4e9b\u4efb\u52a1"
+    if recent_tasks_hint in text:
+        left, _, _ = text.partition(recent_tasks_hint)
         left = left.strip()
         if left:
-            return {"person": left, "task": None}
+            return {"person": _sanitize_person_value(left), "task": None}
+
+    if "\u6807\u7b7e" in text or "#" in text:
+        return {"person": None, "task": text}
 
     return {"person": None, "task": None}
 
@@ -599,6 +714,47 @@ def _post_process_intent(spec: TaskQuerySpec, text: str) -> None:
         except Exception:
             answer_mode = TaskAnswerMode.default
     spec.answer_mode = answer_mode
+
+    if not getattr(spec, "tags", None):
+        try:
+            spec.tags = _extract_tags(t)
+        except Exception:
+            spec.tags = []
+    tags_normalized = [tag.strip() for tag in (getattr(spec, "tags", None) or []) if tag]
+    tag_set = set(tags_normalized)
+    if tag_set:
+        person_value = (getattr(spec, "person", None) or "").strip()
+        if person_value and person_value in tag_set:
+            spec.person = None
+        filters = list(getattr(spec, "filters", []) or [])
+        cleaned_filters: List[QueryFilter] = []
+        for flt in filters:
+            try:
+                field = str(getattr(flt, "field", "") or "").lower()
+            except Exception:
+                field = ""
+            if field != "person":
+                cleaned_filters.append(flt)
+                continue
+            op = str(getattr(flt, "op", "") or "").lower()
+            if op == "in":
+                values = getattr(flt, "values", None) or []
+                remaining = [v for v in values if str(v).strip() not in tag_set]
+                if remaining:
+                    flt.values = remaining
+                    cleaned_filters.append(flt)
+                continue
+            value = (getattr(flt, "value", None) or "").strip()
+            if value and value in tag_set:
+                continue
+            cleaned_filters.append(flt)
+        spec.filters = cleaned_filters
+
+    if not getattr(spec, "tags", None):
+        try:
+            spec.tags = _extract_tags(t)
+        except Exception:
+            pass
 
     intent = getattr(spec, "intent", None)
     status_kws = ("已完成", "未完成", "done", "todo", "搞定", "结束")
@@ -682,9 +838,8 @@ def _post_process_intent(spec: TaskQuerySpec, text: str) -> None:
                 spec.task = first_kw
 
     if getattr(spec, "person", None):
-        spec.person = str(spec.person).strip()
-        if spec.person.endswith("的") and len(spec.person) <= 4:
-            spec.person = spec.person[:-1]
+        sanitized_person = _sanitize_person_value(str(spec.person))
+        spec.person = sanitized_person
     if getattr(spec, "task", None):
         spec.task = str(spec.task).strip()
 
@@ -702,6 +857,11 @@ def _post_process_intent(spec: TaskQuerySpec, text: str) -> None:
         dr = _detect_due_range(t)
         if dr:
             spec.due_range = dr
+
+    if _range_is_empty(spec.created_range):
+        cr = _detect_created_range(t)
+        if cr:
+            spec.created_range = cr
 
     if spec.priority is None:
         pr = _detect_priority(t)
@@ -832,10 +992,18 @@ def _rule_based_parse_task_query_nl_v2(q: str) -> TaskQuerySpec:
 
     # 2) coarse entity extraction
     entities = _extract_person_task(text)
-    person = entities.get("person")
+    raw_person = entities.get("person")
+    person = _sanitize_person_value(raw_person)
     task = entities.get("task") or text or None
 
-    person_tokens = _split_multi_values(person)
+    person_tokens_raw = _split_multi_values(raw_person)
+    if not person_tokens_raw and person:
+        person_tokens_raw = [person]
+    person_tokens: List[str] = []
+    for token in person_tokens_raw:
+        normalized = _sanitize_person_value(token)
+        if normalized and _looks_like_person(normalized) and normalized not in person_tokens:
+            person_tokens.append(normalized)
     task_tokens = _split_multi_values(task)
     filters: List[QueryFilter] = []
     person_filter = _build_multi_filter("person", person_tokens)
@@ -868,12 +1036,16 @@ def _rule_based_parse_task_query_nl_v2(q: str) -> TaskQuerySpec:
 
     project = _detect_project(text)
     if project:
+        person_tokens = [tok for tok in person_tokens if tok and tok != project]
+        if person == project:
+            person = None
         filters.append(QueryFilter(field="project", op="eq", value=project))
 
     tags = _extract_tags(text)
     priority = _detect_priority(text)
     detected_limit = _detect_limit(text)
     time_range = _detect_time_range(text)
+    created_range = _detect_created_range(text)
 
     order_by = [
         OrderBySpec(field="ts", direction=OrderByDirection.desc),
@@ -909,6 +1081,7 @@ def _rule_based_parse_task_query_nl_v2(q: str) -> TaskQuerySpec:
         priority=priority,
         status=status,
         time_range=time_range,
+        created_range=created_range,
         order_by=order_by,
         limit=limit,
         filters=filters,

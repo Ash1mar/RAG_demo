@@ -98,6 +98,16 @@ def main() -> None:
                 print("--- NL2SQL LLM error:", extra.get("nl2sql_llm_error"))
 
         if payload.get("resolver_mode") == "text2sql":
+            err = payload.get("error")
+            if err:
+                print("--- Text2SQL error:", err)
+                if payload.get("reason"):
+                    print("--- Text2SQL reason:", payload.get("reason"))
+                if payload.get("sql"):
+                    print("--- Text2SQL SQL:", payload.get("sql"))
+                if "params" in payload:
+                    print("--- Text2SQL params:", payload.get("params"))
+
             if payload.get("error") == "text2sql_invalid_sql":
                 print("--- Invalid SQL:", payload.get("invalid_sql"))
             if payload.get("error") == "text2sql_llm_failed":
