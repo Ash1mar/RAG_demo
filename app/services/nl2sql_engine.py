@@ -681,6 +681,13 @@ def _post_process_intent(spec: TaskQuerySpec, text: str) -> None:
             if first_kw:
                 spec.task = first_kw
 
+    if getattr(spec, "person", None):
+        spec.person = str(spec.person).strip()
+        if spec.person.endswith("的") and len(spec.person) <= 4:
+            spec.person = spec.person[:-1]
+    if getattr(spec, "task", None):
+        spec.task = str(spec.task).strip()
+
     if spec.intent == TaskQueryIntent.task_list_by_person and not spec.person:
         spec.is_supported = False
         spec.extra.setdefault("unsupported_reason", "list_by_person_missing_person")

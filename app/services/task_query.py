@@ -1456,7 +1456,14 @@ def _call_text2sql_llm(prompt: str) -> Text2SQLResponseModel:
         ) from exc
 
     try:
-        parsed = json.loads(content)
+        json_payload = _extract_json_payload(content)
+    except ValueError as exc:
+        raise Text2SQLGenerateError(
+            "LLM output is not valid JSON", raw_response=content
+        ) from exc
+
+    try:
+        parsed = json.loads(json_payload)
     except json.JSONDecodeError as exc:
         raise Text2SQLGenerateError(
             "LLM output is not valid JSON", raw_response=content
@@ -1468,6 +1475,41 @@ def _call_text2sql_llm(prompt: str) -> Text2SQLResponseModel:
         raise Text2SQLGenerateError(
             f"LLM JSON does not match expected schema: {exc}", raw_response=content
         ) from exc
+
+
+def _extract_json_payload(raw: str) -> str:
+    if not raw:
+        raise ValueError("empty response")
+    s = raw.strip()
+    if not s:
+        raise ValueError("empty response")
+
+    if s.startswith("```"):
+        # Strip leading ```lang(optional)\n
+        end_fence = s.find("```", 3)
+        if end_fence == -1:
+            raise ValueError("unterminated markdown fence")
+        inner = s[3:end_fence]
+        # remove optional language tag (e.g., 'json')
+        inner = inner.lstrip()
+        if inner.lower().startswith("json"):
+            inner = inner[4:].lstrip()
+        return inner.strip()
+
+    start = s.find("{")
+    end = s.find("}", start)
+    if start != -1 and end != -1:
+        candidate = s[start : s.rfind("}") + 1]
+        candidate = candidate.strip()
+        if candidate.endswith("```"):
+            candidate = candidate[:-3].strip()
+        tail = s[s.rfind("}") + 1 :].strip()
+        for marker in ("```", "^^^", "---"):
+            marker_pos = candidate.find(marker)
+            if marker_pos != -1:
+                candidate = candidate[:marker_pos].strip()
+        return candidate
+    raise ValueError("no JSON object found")
 
 
 def _normalize_and_validate_text2sql_query(sql: str) -> str:
