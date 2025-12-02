@@ -118,10 +118,12 @@ RAG_demo/
   - `TASKS_DB`：SQLite 文件路径，默认 `data/tasks.db`。
 
 - **LLM / NL2SQL 相关**
-  - `LLM_ENABLED=true|false`
-  - `LLM_PROVIDER=dummy|ollama`
-  - `LLM_MODEL`：如 `deepseek-r1:7b`
-  - `LLM_OLLAMA_BASE_URL`：Ollama HTTP 端点（默认 `http://localhost:11434`）
+- `LLM_ENABLED=true|false`
+- `LLM_PROVIDER=dummy|ollama|openai`（`openai` 代表所有 OpenAI-Compatible 服务，如通义千问 DashScope）
+- `LLM_MODEL`：默认 `qwen2.5-coder:7b`，也可指定其他模型
+- `LLM_OLLAMA_BASE_URL`：Ollama HTTP 端点（默认 `http://localhost:11434`）
+- `LLM_OPENAI_BASE_URL`：OpenAI-Compatible API 根路径（默认 `https://dashscope.aliyuncs.com/compatible-mode/v1`）
+- `LLM_API_KEY`：当 `LLM_PROVIDER=openai`/`dashscope` 时必填，用于鉴权
   - `TASKS_NL2SQL_LLM=1`：在 NL→JSON→SQL 流程中优先使用 LLM 抽取 `TaskQuerySpec`，失败时自动回退规则解析。
 
 ---
@@ -197,4 +199,3 @@ RAG_demo/
     - `text2sql_raw_response`：LLM 原始输出（便于改 prompt）；  
     - `text2sql`：每条 SQL 的执行结果（包括 `sql`、`description`、`rows`）。  
   - 配合 `scripts/batch_db_ask.py` 可以批量跑一组自然语言问题，观察 Text2SQL 行为，并据此调优 prompt 与解析规则。
-

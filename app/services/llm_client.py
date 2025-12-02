@@ -1,7 +1,7 @@
 ﻿from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Protocol
+from typing import Any, Dict, Optional, Protocol
 
 import httpx
 from pydantic import ValidationError
@@ -114,6 +114,65 @@ class OllamaLLMClient:
         return spec.dict()
 
 
+@dataclass
+class OpenAICompatibleLLMClient:
+    """LLM client talking to OpenAI-compatible chat completion APIs (DashScope, etc.)."""
+
+    base_url: str
+    api_key: str
+    model: str
+    timeout: float = 45.0
+
+    def _endpoint(self) -> str:
+        return f"{self.base_url.rstrip('/')}/chat/completions"
+
+    def generate_task_query_spec(self, q: str) -> Dict[str, Any]:
+        if not self.api_key:
+            raise LLMParseError("LLM_API_KEY is required for provider 'openai'")
+
+        from app.services.nl2sql_engine import TaskQuerySpec
+
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": TASK_QUERY_SYSTEM_PROMPT},
+                {"role": "user", "content": build_task_query_user_prompt(q)},
+            ],
+            "temperature": 0.0,
+        }
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            resp = httpx.post(self._endpoint(), headers=headers, json=payload, timeout=self.timeout)
+            resp.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise LLMParseError(f"Failed to call OpenAI-compatible API: {exc}") from exc
+
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise LLMParseError("OpenAI-compatible response is not valid JSON") from exc
+
+        try:
+            content: Optional[str] = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise LLMParseError("OpenAI-compatible response missing choices[0].message.content") from exc
+
+        try:
+            if isinstance(content, str):
+                spec = TaskQuerySpec.parse_raw(content)
+            else:
+                spec = TaskQuerySpec.parse_obj(content)
+        except (ValueError, TypeError, ValidationError) as exc:
+            raise LLMParseError(f"Failed to parse TaskQuerySpec from OpenAI-compatible output: {exc}") from exc
+
+        return spec.dict()
+
+
 def build_task_query_user_prompt(q: str) -> str:
     """Build the user prompt for TaskQuerySpec generation."""
 
@@ -196,5 +255,11 @@ def get_llm_client() -> LLMClient:
             model=llm_settings.model,
         )
 
-    # TODO: add support for other providers (OpenAI / DeepSeek / etc.)
+    if llm_settings.provider in {"openai", "dashscope"}:
+        return OpenAICompatibleLLMClient(
+            base_url=llm_settings.openai_base_url,
+            api_key=llm_settings.api_key,
+            model=llm_settings.model,
+        )
+
     raise NotImplementedError(f"Unsupported LLM provider: {llm_settings.provider}")

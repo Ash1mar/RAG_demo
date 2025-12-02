@@ -1495,10 +1495,18 @@ def _make_text2sql_ir_hint(spec: Optional[TaskQuerySpec]) -> Dict[str, Any]:
 def _call_text2sql_llm(prompt: str) -> Text2SQLResponseModel:
     if not llm_settings.enabled or llm_settings.provider == "dummy":
         raise Text2SQLGenerateError("LLM provider is not configured")
-    if llm_settings.provider != "ollama":
-        raise Text2SQLGenerateError(
-            f"Provider {llm_settings.provider} is not supported for Text2SQL"
-        )
+
+    provider = llm_settings.provider
+    if provider == "ollama":
+        return _call_text2sql_via_ollama(prompt)
+    if provider in {"openai", "dashscope"}:
+        return _call_text2sql_via_openai(prompt)
+
+    raise Text2SQLGenerateError(f"Provider {provider} is not supported for Text2SQL")
+
+
+def _call_text2sql_via_ollama(prompt: str) -> Text2SQLResponseModel:
+    """Call Ollama's /api/chat endpoint for Text2SQL."""
 
     payload: Dict[str, Any] = {
         "model": llm_settings.model,
@@ -1559,6 +1567,77 @@ def _call_text2sql_llm(prompt: str) -> Text2SQLResponseModel:
         raise Text2SQLGenerateError(
             f"LLM JSON does not match expected schema: {exc}", raw_response=content
         ) from exc
+
+
+def _call_text2sql_via_openai(prompt: str) -> Text2SQLResponseModel:
+    """Call an OpenAI-compatible chat completion API for Text2SQL."""
+
+    if not llm_settings.api_key:
+        raise Text2SQLGenerateError("LLM_API_KEY is required for provider 'openai'")
+
+    payload: Dict[str, Any] = {
+        "model": llm_settings.model,
+        "messages": [
+            {"role": "system", "content": TEXT2SQL_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.0,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {llm_settings.api_key}",
+        "Content-Type": "application/json",
+    }
+
+    url = f"{llm_settings.openai_base_url.rstrip('/')}/chat/completions"
+    try:
+        resp = httpx.post(url, headers=headers, json=payload, timeout=60.0)
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise Text2SQLGenerateError(f"OpenAI-compatible request failed: {exc}") from exc
+
+    response_text = resp.text
+    try:
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+    except (ValueError, KeyError, TypeError, IndexError) as exc:
+        raise Text2SQLGenerateError(
+            "Invalid response format from OpenAI-compatible API", raw_response=response_text
+        ) from exc
+
+    parsed: Optional[Dict[str, Any]] = None
+    if isinstance(content, dict):
+        parsed = content
+    elif isinstance(content, str):
+        parsed = _try_parse_json_text(content)
+
+    if parsed is None:
+        raise Text2SQLGenerateError(
+            "LLM output is not valid JSON", raw_response=response_text
+        )
+
+    try:
+        return Text2SQLResponseModel.parse_obj(parsed)
+    except ValidationError as exc:
+        raise Text2SQLGenerateError(
+            f"LLM JSON does not match expected schema: {exc}", raw_response=response_text
+        ) from exc
+
+
+def _try_parse_json_text(text: str) -> Optional[Dict[str, Any]]:
+    candidate = (text or "").strip()
+    if not candidate:
+        return None
+    if candidate.startswith("{") and candidate.endswith("}"):
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            return None
+    try:
+        json_payload = _extract_json_payload(candidate)
+        return json.loads(json_payload)
+    except (ValueError, json.JSONDecodeError):
+        return None
 
 
 def _extract_json_payload(raw: str) -> str:

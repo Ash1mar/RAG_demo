@@ -11,8 +11,13 @@ class LLMSettings(BaseModel):
 
     enabled: bool = Field(True, alias="LLM_ENABLED")
     provider: str = Field("dummy", alias="LLM_PROVIDER")
-    model: str = Field("deepseek-r1:7b", alias="LLM_MODEL")
+    model: str = Field("qwen2.5-coder:7b", alias="LLM_MODEL")
     ollama_base_url: str = Field("http://localhost:11434", alias="LLM_OLLAMA_BASE_URL")
+    openai_base_url: str = Field(
+        "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        alias="LLM_OPENAI_BASE_URL",
+    )
+    api_key: str = Field("", alias="LLM_API_KEY")
 
 
 def _load_llm_settings() -> LLMSettings:
@@ -34,6 +39,14 @@ def _load_llm_settings() -> LLMSettings:
     if v is not None:
         raw["LLM_OLLAMA_BASE_URL"] = v
 
+    v = getenv("LLM_OPENAI_BASE_URL")
+    if v is not None:
+        raw["LLM_OPENAI_BASE_URL"] = v
+
+    v = getenv("LLM_API_KEY")
+    if v is not None:
+        raw["LLM_API_KEY"] = v
+
     # Backward compatibility with earlier TASKS_NL2SQL_* env vars
     if "LLM_PROVIDER" not in raw:
         legacy_provider = getenv("TASKS_NL2SQL_LLM_PROVIDER")
@@ -49,4 +62,3 @@ def _load_llm_settings() -> LLMSettings:
 
 
 llm_settings = _load_llm_settings()
-

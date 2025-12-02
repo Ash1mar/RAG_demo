@@ -290,9 +290,11 @@ Feel free to extend the table with more domain-specific prompts (e.g., tags per 
 - `EMB_URL` = `http://localhost:8080/embeddings` (use containerized embedder)
 - `MODEL_NAME` / `EMB_DIM` (e.g., `BAAI/bge-small-zh-v1.5` + `512`)
 - `LLM_ENABLED` = `true` / `false` (enable LLM client factory)
-- `LLM_PROVIDER` = `dummy` (default) or `ollama`
-- `LLM_MODEL` = Ollama model tag (e.g., `deepseek-r1:7b`)
+- `LLM_PROVIDER` = `dummy` / `ollama` / `openai`（`openai`=OpenAI-Compatible，如 DashScope）
+- `LLM_MODEL` = 模型名称（默认 `qwen2.5-coder:7b`，或任意 Ollama/DashScope tag）
 - `LLM_OLLAMA_BASE_URL` = Ollama HTTP endpoint (default `http://localhost:11434`)
+- `LLM_OPENAI_BASE_URL` = OpenAI-Compatible base URL (default `https://dashscope.aliyuncs.com/compatible-mode/v1`)
+- `LLM_API_KEY` = API key for `openai`/`dashscope` provider
 - `TASKS_NL2SQL_LLM` = `1` to enable LLM‑first NL→JSON parsing for `/db/ask` and `hybrid_llm` (falls back to rules on failure)
 
 ---
@@ -303,14 +305,24 @@ This section summarizes how to wire the NL→JSON→SQL pipeline with a local LL
 
 ### 11.1) Enable the LLM client
 
-1. Install and run Ollama locally, and pull a compatible model (for example `deepseek-r1:7b`).
+1. Install and run Ollama locally, and pull a compatible model (for example `qwen2.5-coder:7b` / `deepseek-r1:8b` 等).
 2. Configure LLM environment variables:
 
 ```powershell
 $env:LLM_ENABLED='true'
 $env:LLM_PROVIDER='ollama'
-$env:LLM_MODEL='deepseek-r1:7b'          # or other model
+$env:LLM_MODEL='qwen2.5-coder:7b'  # or other model tag in Ollama
 $env:LLM_OLLAMA_BASE_URL='http://localhost:11434'
+```
+
+若使用 OpenAI-Compatible 平台（例如通义千问 DashScope 的 `qwen2.5-coder:7b` 云端接口），可以改用：
+
+```powershell
+$env:LLM_ENABLED='true'
+$env:LLM_PROVIDER='openai'
+$env:LLM_MODEL='qwen2.5-coder:7b'
+$env:LLM_OPENAI_BASE_URL='https://dashscope.aliyuncs.com/compatible-mode/v1'
+$env:LLM_API_KEY='your_dashscope_api_key'
 ```
 
 3. Optionally, enable LLM‑first NL→JSON parsing in the NL→SQL pipeline:
@@ -511,8 +523,16 @@ Everything else—including new aggregation modes like `person_summary_by_projec
    ```bash
    export LLM_ENABLED=true
    export LLM_PROVIDER=ollama
-   export LLM_MODEL=deepseek-r1:7b    # or your own
+   export LLM_MODEL=qwen2.5-coder:7b    # or other local tag
    export LLM_OLLAMA_BASE_URL=http://localhost:11434
+   ```
+   若调用 DashScope / 其他 OpenAI-Compatible 云端模型：
+   ```bash
+   export LLM_ENABLED=true
+   export LLM_PROVIDER=openai
+   export LLM_MODEL=qwen2.5-coder:7b
+   export LLM_OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+   export LLM_API_KEY=your_dashscope_api_key
    ```
 2. 选择解析模式  
    - 使用 `hybrid_llm` 作为解析器，并允许 NL→JSON→SQL 优先走 LLM：  
