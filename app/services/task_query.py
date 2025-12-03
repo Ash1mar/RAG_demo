@@ -97,6 +97,7 @@ TEXT2SQL_SYSTEM_PROMPT = (
 
 TEXT2SQL_MAX_QUERIES = 2
 TEXT2SQL_ROW_PREVIEW = 3
+TEXT2SQL_ANSWER_MAX_ROWS = 5
 TEXT2SQL_FORBIDDEN_KEYWORDS = (
     "insert",
     "update",
@@ -129,6 +130,12 @@ TEXT2SQL_SUSPICIOUS_LITERAL_THRESHOLD = 10_000_000_000
 _MILLIS_PER_SECOND = 1000
 _MILLIS_PER_DAY = 24 * 60 * 60 * _MILLIS_PER_SECOND
 SQL_ALLOWED_TABLES = {"task_latest", "tasks"}
+TEXT2SQL_ANSWER_SYSTEM_PROMPT = (
+    "You are a precise assistant for summarizing SQL query results about task statuses. "
+    "Use the provided rows to answer the user's question in Chinese. "
+    "Base the answer strictly on the rows; if no relevant data is provided, say that no matching records were found. "
+    "Be concise and do not invent information beyond the rows or obvious aggregations."
+)
 
 
 def _resolve_symbolic_time(text: str) -> Optional[int]:
@@ -1351,7 +1358,7 @@ class TaskQueryEngine:
 
         prompt = _build_text2sql_prompt(q, spec)
         try:
-            llm_result = _call_text2sql_llm(prompt)
+            llm_result, llm_runtime = _call_text2sql_llm(prompt)
         except Text2SQLGenerateError as exc:
             base["error"] = "text2sql_llm_failed"
             base["answer"] = "Failed to generate SQL from the LLM."
@@ -1420,7 +1427,20 @@ class TaskQueryEngine:
         base.pop("error", None)
         base.pop("reason", None)
 
+        if llm_runtime and llm_runtime.get("model"):
+            base["text2sql_model"] = llm_runtime["model"]
+            base["text2sql_provider"] = llm_runtime.get("provider")
+
+        natural_answer: Optional[str] = None
         if primary_rows:
+            try:
+                natural_answer = _generate_text2sql_answer(q, primary_rows, llm_runtime)
+            except Text2SQLGenerateError as exc:
+                base["text2sql_answer_error"] = str(exc)
+
+        if natural_answer:
+            base["answer"] = natural_answer
+        elif primary_rows:
             base["answer"] = _summarize_text2sql_rows(primary_rows)
         else:
             base["answer"] = "Text2SQL query returned no rows."
@@ -1492,24 +1512,72 @@ def _make_text2sql_ir_hint(spec: Optional[TaskQuerySpec]) -> Dict[str, Any]:
     return hint
 
 
-def _call_text2sql_llm(prompt: str) -> Text2SQLResponseModel:
+def _call_text2sql_llm(prompt: str) -> Tuple[Text2SQLResponseModel, Dict[str, str]]:
     if not llm_settings.enabled or llm_settings.provider == "dummy":
         raise Text2SQLGenerateError("LLM provider is not configured")
 
-    provider = llm_settings.provider
+    runtime = _resolve_text2sql_settings()
+    provider = runtime["provider"]
     if provider == "ollama":
-        return _call_text2sql_via_ollama(prompt)
+        response = _call_text2sql_via_ollama(
+            prompt, runtime["model"], runtime["base_url"]
+        )
+        return response, runtime
     if provider in {"openai", "dashscope"}:
-        return _call_text2sql_via_openai(prompt)
+        response = _call_text2sql_via_openai(
+            prompt,
+            runtime["model"],
+            runtime["base_url"],
+            runtime["api_key"],
+        )
+        return response, runtime
 
     raise Text2SQLGenerateError(f"Provider {provider} is not supported for Text2SQL")
 
+def _resolve_text2sql_settings() -> Dict[str, str]:
+    provider = llm_settings.text2sql_provider or llm_settings.provider
+    if not provider or provider == "dummy":
+        provider = llm_settings.provider
 
-def _call_text2sql_via_ollama(prompt: str) -> Text2SQLResponseModel:
+    model = llm_settings.text2sql_model or llm_settings.model
+
+    if provider == "ollama":
+        base_url = (
+            llm_settings.text2sql_ollama_base_url or llm_settings.ollama_base_url
+        )
+        return {
+            "provider": "ollama",
+            "model": model,
+            "base_url": base_url,
+            "api_key": "",
+        }
+
+    if provider in {"openai", "dashscope"}:
+        base_url = (
+            llm_settings.text2sql_openai_base_url or llm_settings.openai_base_url
+        )
+        api_key = llm_settings.text2sql_api_key or llm_settings.api_key
+        return {
+            "provider": provider,
+            "model": model,
+            "base_url": base_url,
+            "api_key": api_key,
+        }
+
+    return {
+        "provider": provider,
+        "model": model,
+        "base_url": llm_settings.ollama_base_url,
+        "api_key": llm_settings.api_key,
+    }
+
+def _call_text2sql_via_ollama(
+    prompt: str, model: str, base_url: str
+) -> Text2SQLResponseModel:
     """Call Ollama's /api/chat endpoint for Text2SQL."""
 
     payload: Dict[str, Any] = {
-        "model": llm_settings.model,
+        "model": model,
         "messages": [
             {"role": "system", "content": TEXT2SQL_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
@@ -1520,7 +1588,7 @@ def _call_text2sql_via_ollama(prompt: str) -> Text2SQLResponseModel:
         },
     }
 
-    url = f"{llm_settings.ollama_base_url.rstrip('/')}/api/chat"
+    url = f"{base_url.rstrip('/')}/api/chat"
     try:
         resp = httpx.post(url, json=payload, timeout=60.0)
         resp.raise_for_status()
@@ -1569,14 +1637,16 @@ def _call_text2sql_via_ollama(prompt: str) -> Text2SQLResponseModel:
         ) from exc
 
 
-def _call_text2sql_via_openai(prompt: str) -> Text2SQLResponseModel:
+def _call_text2sql_via_openai(
+    prompt: str, model: str, base_url: str, api_key: str
+) -> Text2SQLResponseModel:
     """Call an OpenAI-compatible chat completion API for Text2SQL."""
 
-    if not llm_settings.api_key:
+    if not api_key:
         raise Text2SQLGenerateError("LLM_API_KEY is required for provider 'openai'")
 
     payload: Dict[str, Any] = {
-        "model": llm_settings.model,
+        "model": model,
         "messages": [
             {"role": "system", "content": TEXT2SQL_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
@@ -1585,11 +1655,11 @@ def _call_text2sql_via_openai(prompt: str) -> Text2SQLResponseModel:
     }
 
     headers = {
-        "Authorization": f"Bearer {llm_settings.api_key}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
 
-    url = f"{llm_settings.openai_base_url.rstrip('/')}/chat/completions"
+    url = f"{base_url.rstrip('/')}/chat/completions"
     try:
         resp = httpx.post(url, headers=headers, json=payload, timeout=60.0)
         resp.raise_for_status()
@@ -1622,6 +1692,102 @@ def _call_text2sql_via_openai(prompt: str) -> Text2SQLResponseModel:
         raise Text2SQLGenerateError(
             f"LLM JSON does not match expected schema: {exc}", raw_response=response_text
         ) from exc
+
+
+def _generate_text2sql_answer(
+    question: str,
+    rows: List[Dict[str, Any]],
+    runtime: Optional[Dict[str, str]],
+) -> Optional[str]:
+    if not rows or not runtime:
+        return None
+    preview = rows[:TEXT2SQL_ANSWER_MAX_ROWS]
+    prompt = _build_text2sql_answer_prompt(question, preview)
+    content = _call_text2sql_answer_llm(prompt, runtime)
+    return content.strip() if content else None
+
+
+def _build_text2sql_answer_prompt(
+    question: str, rows: List[Dict[str, Any]]
+) -> str:
+    rows_json = json.dumps(rows, ensure_ascii=False, indent=2)
+    return (
+        "用户问题：\n"
+        f"{question}\n\n"
+        "SQL 查询返回的记录（仅展示前几条）：\n"
+        f"{rows_json}\n\n"
+        "请根据这些记录，给出简洁、准确的中文回答。如果记录为空或缺少答案所需信息，请明确说明未找到匹配的任务或数据不足。"
+    )
+
+
+def _call_text2sql_answer_llm(prompt: str, runtime: Dict[str, str]) -> str:
+    provider = runtime.get("provider")
+    model = runtime.get("model")
+    if not provider or not model:
+        raise Text2SQLGenerateError("Text2SQL answer LLM runtime is incomplete")
+    if provider == "ollama":
+        return _call_text2sql_answer_via_ollama(prompt, runtime)
+    if provider in {"openai", "dashscope"}:
+        return _call_text2sql_answer_via_openai(prompt, runtime)
+    raise Text2SQLGenerateError(f"Unsupported provider for Text2SQL answer: {provider}")
+
+
+def _call_text2sql_answer_via_ollama(
+    prompt: str, runtime: Dict[str, str]
+) -> str:
+    base_url = runtime.get("base_url") or llm_settings.ollama_base_url
+    payload = {
+        "model": runtime.get("model"),
+        "messages": [
+            {"role": "system", "content": TEXT2SQL_ANSWER_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "stream": False,
+        "options": {"temperature": 0.0},
+    }
+    url = f"{base_url.rstrip('/')}/api/chat"
+    try:
+        resp = httpx.post(url, json=payload, timeout=60.0)
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise Text2SQLGenerateError(f"Ollama answer request failed: {exc}") from exc
+    try:
+        data = resp.json()
+        return str(data["message"]["content"]).strip()
+    except (ValueError, KeyError, TypeError) as exc:
+        raise Text2SQLGenerateError("Invalid Ollama answer response") from exc
+
+
+def _call_text2sql_answer_via_openai(
+    prompt: str, runtime: Dict[str, str]
+) -> str:
+    base_url = runtime.get("base_url") or llm_settings.openai_base_url
+    api_key = runtime.get("api_key") or llm_settings.api_key
+    if not api_key:
+        raise Text2SQLGenerateError("LLM_API_KEY is required for answer generation")
+    payload = {
+        "model": runtime.get("model"),
+        "messages": [
+            {"role": "system", "content": TEXT2SQL_ANSWER_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.0,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    url = f"{base_url.rstrip('/')}/chat/completions"
+    try:
+        resp = httpx.post(url, headers=headers, json=payload, timeout=60.0)
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise Text2SQLGenerateError(f"OpenAI-compatible answer request failed: {exc}") from exc
+    try:
+        data = resp.json()
+        return str(data["choices"][0]["message"]["content"]).strip()
+    except (ValueError, KeyError, TypeError, IndexError) as exc:
+        raise Text2SQLGenerateError("Invalid OpenAI-compatible answer response") from exc
 
 
 def _try_parse_json_text(text: str) -> Optional[Dict[str, Any]]:

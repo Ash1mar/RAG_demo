@@ -121,6 +121,8 @@ RAG_demo/
 - `LLM_ENABLED=true|false`
 - `LLM_PROVIDER=dummy|ollama|openai`（`openai` 代表所有 OpenAI-Compatible 服务，如通义千问 DashScope）
 - `LLM_MODEL`：默认 `qwen2.5-coder:7b`，也可指定其他模型
+- `LLM_TEXT2SQL_MODEL`：单独指定 Text2SQL 使用的模型（默认 `qwen3-coder:480b-cloud`）
+- `LLM_TEXT2SQL_PROVIDER` / `LLM_TEXT2SQL_OLLAMA_BASE_URL` / `LLM_TEXT2SQL_OPENAI_BASE_URL` / `LLM_TEXT2SQL_API_KEY`：若 Text2SQL 需要独立的 provider 或端点，可通过这些变量覆盖，未设置时沿用 `LLM_PROVIDER` 对应配置
 - `LLM_OLLAMA_BASE_URL`：Ollama HTTP 端点（默认 `http://localhost:11434`）
 - `LLM_OPENAI_BASE_URL`：OpenAI-Compatible API 根路径（默认 `https://dashscope.aliyuncs.com/compatible-mode/v1`）
 - `LLM_API_KEY`：当 `LLM_PROVIDER=openai`/`dashscope` 时必填，用于鉴权

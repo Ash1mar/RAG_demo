@@ -290,8 +290,10 @@ Feel free to extend the table with more domain-specific prompts (e.g., tags per 
 - `EMB_URL` = `http://localhost:8080/embeddings` (use containerized embedder)
 - `MODEL_NAME` / `EMB_DIM` (e.g., `BAAI/bge-small-zh-v1.5` + `512`)
 - `LLM_ENABLED` = `true` / `false` (enable LLM client factory)
-- `LLM_PROVIDER` = `dummy` / `ollama` / `openai`（`openai`=OpenAI-Compatible，如 DashScope）
-- `LLM_MODEL` = 模型名称（默认 `qwen2.5-coder:7b`，或任意 Ollama/DashScope tag）
+- `LLM_PROVIDER` = `dummy` / `ollama` / `openai`?`openai`=OpenAI-Compatible?? DashScope?
+- `LLM_MODEL` = ??????? `qwen2.5-coder:7b`???? Ollama/DashScope tag?
+- `LLM_TEXT2SQL_MODEL` = Text2SQL ??????? `qwen3-coder:480b-cloud`?
+- `LLM_TEXT2SQL_PROVIDER` / `LLM_TEXT2SQL_OLLAMA_BASE_URL` / `LLM_TEXT2SQL_OPENAI_BASE_URL` / `LLM_TEXT2SQL_API_KEY` = ??? Text2SQL ???? provider/??/????????????????????????
 - `LLM_OLLAMA_BASE_URL` = Ollama HTTP endpoint (default `http://localhost:11434`)
 - `LLM_OPENAI_BASE_URL` = OpenAI-Compatible base URL (default `https://dashscope.aliyuncs.com/compatible-mode/v1`)
 - `LLM_API_KEY` = API key for `openai`/`dashscope` provider
@@ -312,6 +314,7 @@ This section summarizes how to wire the NL→JSON→SQL pipeline with a local LL
 $env:LLM_ENABLED='true'
 $env:LLM_PROVIDER='ollama'
 $env:LLM_MODEL='qwen2.5-coder:7b'  # or other model tag in Ollama
+$env:LLM_TEXT2SQL_MODEL='qwen3-coder:480b-cloud'  # optional: Text2SQL uses bigger model
 $env:LLM_OLLAMA_BASE_URL='http://localhost:11434'
 ```
 
@@ -321,8 +324,10 @@ $env:LLM_OLLAMA_BASE_URL='http://localhost:11434'
 $env:LLM_ENABLED='true'
 $env:LLM_PROVIDER='openai'
 $env:LLM_MODEL='qwen2.5-coder:7b'
+$env:LLM_TEXT2SQL_MODEL='qwen3-coder:480b-cloud'
 $env:LLM_OPENAI_BASE_URL='https://dashscope.aliyuncs.com/compatible-mode/v1'
 $env:LLM_API_KEY='your_dashscope_api_key'
+$env:LLM_TEXT2SQL_API_KEY='your_dashscope_api_key'   # or另设独立 key
 ```
 
 3. Optionally, enable LLM‑first NL→JSON parsing in the NL→SQL pipeline:
@@ -524,6 +529,7 @@ Everything else—including new aggregation modes like `person_summary_by_projec
    export LLM_ENABLED=true
    export LLM_PROVIDER=ollama
    export LLM_MODEL=qwen2.5-coder:7b    # or other local tag
+   export LLM_TEXT2SQL_MODEL=qwen3-coder:480b-cloud   # optional
    export LLM_OLLAMA_BASE_URL=http://localhost:11434
    ```
    若调用 DashScope / 其他 OpenAI-Compatible 云端模型：
@@ -531,8 +537,10 @@ Everything else—including new aggregation modes like `person_summary_by_projec
    export LLM_ENABLED=true
    export LLM_PROVIDER=openai
    export LLM_MODEL=qwen2.5-coder:7b
+   export LLM_TEXT2SQL_MODEL=qwen3-coder:480b-cloud
    export LLM_OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
    export LLM_API_KEY=your_dashscope_api_key
+   export LLM_TEXT2SQL_API_KEY=your_dashscope_api_key   # 或另设独立 key
    ```
 2. 选择解析模式  
    - 使用 `hybrid_llm` 作为解析器，并允许 NL→JSON→SQL 优先走 LLM：  

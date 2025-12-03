@@ -99,6 +99,13 @@ def main() -> None:
                 print("--- NL2SQL LLM error:", extra.get("nl2sql_llm_error"))
 
         if payload.get("resolver_mode") == "text2sql":
+            model = payload.get("text2sql_model")
+            if model:
+                provider = payload.get("text2sql_provider")
+                if provider:
+                    print(f"--- Text2SQL model: {model} (provider={provider})")
+                else:
+                    print(f"--- Text2SQL model: {model}")
             err = payload.get("error")
             if err:
                 print("--- Text2SQL error:", err)
