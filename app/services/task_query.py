@@ -1792,6 +1792,9 @@ def _ensure_tag_filters(sql: str, tags: Optional[List[str]]) -> str:
     if not tag_values:
         return sql
     lowered = sql.lower()
+    if re.search(r"\btags\s+(?:like|=|in)\b", lowered):
+        return sql
+
     def _escape(tag: str) -> str:
         return tag.replace("'", "''")
     seen: List[str] = []
@@ -1802,16 +1805,22 @@ def _ensure_tag_filters(sql: str, tags: Optional[List[str]]) -> str:
             break
     clause_parts = [f"tags LIKE '%{_escape(tag)}%'" for tag in seen]
     clause = " AND ".join(clause_parts)
-    lowered = sql.lower()
     where_idx = lowered.find(" where ")
     if where_idx != -1:
         insert_pos = where_idx + len(" where ")
-        existing = sql[insert_pos:].strip()
+        end_idx = len(sql)
+        for keyword in (" order by ", " limit "):
+            idx = lowered.find(keyword, insert_pos)
+            if idx != -1 and idx < end_idx:
+                end_idx = idx
+        existing = sql[insert_pos:end_idx].strip()
+        suffix = sql[end_idx:]
         if existing:
-            sql = f"{sql[:insert_pos]}({clause}) AND ({existing})"
+            sql = f"{sql[:insert_pos]}({clause}) AND ({existing}){suffix}"
         else:
-            sql = f"{sql[:insert_pos]}({clause})"
+            sql = f"{sql[:insert_pos]}({clause}){suffix}"
         return sql
+
     order_idx = lowered.find(" order by ")
     limit_idx = lowered.find(" limit ")
     insert_pos = len(sql)
@@ -1846,7 +1855,28 @@ def _strip_semicolons(sql: str) -> str:
 def _ensure_priority_filter(
     sql: str, priority: Optional[Any], task_hint: Optional[Any]
 ) -> str:
+    def _normalize_priority_literals(text: str) -> Tuple[str, bool]:
+        pattern = re.compile(
+            r"priority\s*(?:in\s*\([^\)]*\)|=\s*'[^']*')", re.IGNORECASE
+        )
+        changed = False
+
+        def _repl(match: re.Match) -> str:
+            nonlocal changed
+            chunk = match.group(0)
+            if re.search(r"p\s*1|高优|高優", chunk, re.IGNORECASE):
+                changed = True
+                return "priority = 1"
+            return chunk
+
+        new_text = pattern.sub(_repl, text)
+        return new_text, changed
+
+    sql, normalized_priority = _normalize_priority_literals(sql)
     lowered = sql.lower()
+
+    if normalized_priority:
+        return sql
 
     p_val: Optional[int] = None
     if priority is not None:
