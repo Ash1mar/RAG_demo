@@ -2203,10 +2203,20 @@ def _rewrite_text2sql_query(sql: str, hint: Optional[Dict[str, Any]]) -> str:
         return sql
     updated = sql
     hint = hint or {}
+
+    # Align time-related literals with IR hint (ts/created_ts/due_ts).
     updated = _apply_range_hint(updated, "ts", hint.get("time_range"))
     updated = _apply_range_hint(updated, "created_ts", hint.get("created_range"))
     updated = _apply_range_hint(updated, "due_ts", hint.get("due_range"))
+
+    # Ensure tag filters reflect IR/KG tags when LLM forgot to use them.
     updated = _ensure_tag_filters(updated, hint.get("tags"))
+
+    # Normalize person/project literals to canonical values from IR/KG.
+    updated = _apply_scalar_hint(updated, "person", hint.get("person"))
+    updated = _apply_scalar_hint(updated, "project", hint.get("project"))
+
+    # Cleanup and safety-normalization.
     updated = _cleanup_invalid_order_tokens(updated)
     updated = _strip_semicolons(updated)
     updated = _ensure_priority_filter(updated, hint.get("priority"), hint.get("task"))
@@ -2272,3 +2282,42 @@ def _summarize_text2sql_rows(rows: List[Dict[str, Any]]) -> str:
     if remainder > 0:
         summary += f" (+{remainder} more)"
     return summary
+
+
+def _apply_scalar_hint(sql: str, column: str, value: Optional[Any]) -> str:
+    """Rewrite simple column literals (person/project) to canonical hint value.
+
+    This is intentionally conservative and only touches common patterns like:
+      - column = '...'
+      - column IN ('a', 'b', ...)
+    so that Text2SQL output is nudged towards IR/KG without heavy AST surgery.
+    """
+    if not sql or value in (None, ""):
+        return sql
+
+    val = str(value)
+    # basic SQL string escaping
+    val_escaped = val.replace("'", "''")
+
+    lowered = sql.lower()
+    if column.lower() not in lowered:
+        return sql
+
+    # Pattern 1: column = '...'
+    pattern_eq = re.compile(
+        rf"(\b{re.escape(column)}\b\s*=\s*)'[^']*'", re.IGNORECASE
+    )
+    if pattern_eq.search(sql):
+        return pattern_eq.sub(rf"\1'{val_escaped}'", sql)
+
+    # Pattern 2: column IN ('a', 'b', ...)
+    pattern_in = re.compile(
+        rf"(\b{re.escape(column)}\b\s+in\s*\()([^)]+)(\))", re.IGNORECASE
+    )
+
+    def _repl_in(match: re.Match) -> str:
+        prefix = match.group(1)
+        suffix = match.group(3)
+        return f"{prefix}'{val_escaped}'{suffix}"
+
+    return pattern_in.sub(_repl_in, sql)

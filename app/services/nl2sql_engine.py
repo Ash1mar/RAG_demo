@@ -9,6 +9,7 @@ import re
 from pydantic import BaseModel, Field
 
 from app.services.llm_client import get_llm_client
+from app.services import kg_lite
 
 
 class TaskQueryIntent(str, Enum):
@@ -753,6 +754,46 @@ def _post_process_intent(spec: TaskQuerySpec, text: str) -> None:
             spec.tags = _extract_tags(t)
         except Exception:
             pass
+
+    # KG-lite: track whether any KG resolution is applied for this spec.
+    kg_used = False
+
+    # KG-lite person normalization
+    if getattr(spec, "person", None):
+        original_person = str(spec.person)
+        resolved_person = kg_lite.resolve_person(original_person)
+        if resolved_person and resolved_person != original_person:
+            spec.extra.setdefault("kg_person_source", original_person)
+            spec.person = resolved_person
+            kg_used = True
+
+    # KG-lite project normalization (from project field or full text).
+    original_project = getattr(spec, "project", None)
+    resolved_project = kg_lite.resolve_project(original_project, t)
+    if resolved_project and resolved_project != original_project:
+        if original_project:
+            spec.extra.setdefault("kg_project_source", original_project)
+        else:
+            spec.extra.setdefault("kg_project_source", t)
+        spec.project = resolved_project
+        kg_used = True
+
+    # KG-lite category -> tags expansion from text (even if tags already exist, we can enrich).
+    kg_tags = kg_lite.resolve_category_tags(t)
+    if kg_tags:
+        existing_tags = getattr(spec, "tags", None) or []
+        merged = list(existing_tags)
+        for tag in kg_tags:
+            if tag not in merged:
+                merged.append(tag)
+        if merged != existing_tags:
+            spec.tags = merged
+            spec.extra.setdefault("kg_category_source", t)
+            kg_used = True
+
+    if kg_used:
+        spec.extra["kg_enabled"] = True
+
 
     raw_text_lower = t_lower
     if "p1" in raw_text_lower and ("高优" in t or "高优先级" in t):

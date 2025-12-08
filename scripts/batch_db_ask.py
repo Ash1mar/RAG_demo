@@ -90,11 +90,16 @@ def main() -> None:
         print("--- Answer:", payload.get("answer"))
         print("--- Resolver mode:", payload.get("resolver_mode"))
         print("--- Intent:", payload.get("intent"))
+        print("--- KG enabled:", payload.get("kg_enabled"))
 
         nl_ir = payload.get("nl_ir") or {}
         extra = nl_ir.get("extra") or {}
         if extra:
             print("--- NL IR source:", extra.get("nl2sql_source"))
+            if "kg_person_source" in extra:
+                print("--- KG person source:", extra.get("kg_person_source"))
+            if "kg_category_source" in extra:
+                print("--- KG category source:", extra.get("kg_category_source"))
             if "nl2sql_llm_error" in extra:
                 print("--- NL2SQL LLM error:", extra.get("nl2sql_llm_error"))
 

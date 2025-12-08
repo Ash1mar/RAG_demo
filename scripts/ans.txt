@@ -1,0 +1,158 @@
+=== Q1: 张三的 提交9月周报 这个任务什么时候完成的？
+--- Answer: 根据提供的记录，任务“提交9月周报”由张三完成的时间是：2024年9月30日（时间戳 1727719200000 对应的日期）。
+--- Resolver mode: text2sql
+--- Intent: task_history
+--- NL IR source: llm
+--- Text2SQL model: qwen3-coder:480b-cloud (provider=ollama)
+--- Text2SQL query #1:
+    SQL: SELECT ts FROM task_latest WHERE person = '张三' AND task = '提交9月周报' AND status = 'DONE' ORDER BY ts DESC LIMIT 1
+    Description: 查询张三完成“提交9月周报”任务的时间
+
+=== Q2: 把芯片项目里带#安全整改标签的任务都列出来
+--- Answer: Text2SQL query returned no rows.
+--- Resolver mode: text2sql
+--- Intent: status_query
+--- NL IR source: llm
+--- Text2SQL model: qwen3-coder:480b-cloud (provider=ollama)
+--- Text2SQL query #1:
+    SQL: SELECT * FROM task_latest WHERE project = '芯片项目' AND tags LIKE '%#安全整改%' ORDER BY ts DESC, priority ASC LIMIT 10
+    Description: 列出芯片项目中带#安全整改标签的任务，按时间倒序和优先级升序排列
+
+=== Q3: 标签包含 文档 的任务有哪些？
+--- Answer: 标签包含“文档”的任务有：
+
+- **整理工艺包V2**，状态为 **DONE**，负责人为 **李四**，项目为 **工艺**，标签为 **整理,文档**。
+--- Resolver mode: text2sql
+--- Intent: status_query
+--- NL IR source: llm
+--- Text2SQL model: qwen3-coder:480b-cloud (provider=ollama)
+--- Text2SQL query #1:
+    SQL: SELECT * FROM task_latest WHERE tags LIKE '%文档%' ORDER BY ts DESC, priority ASC LIMIT 10
+    Description: 查找标签包含“文档”的任务，按时间倒序和优先级升序排列，最多返回10条记录
+
+=== Q4: 张三在上周还有多少没完成的任务?
+--- Answer: Text2SQL query returned no rows.
+--- Resolver mode: text2sql
+--- Intent: status_query
+--- NL IR source: llm
+--- Text2SQL model: qwen3-coder:480b-cloud (provider=ollama)
+--- Text2SQL query #1:
+    SQL: SELECT * FROM task_latest WHERE person = '张三' AND status = 'TODO' AND created_ts >= 1764123479406 AND created_ts <= 1764641879406 ORDER BY ts DESC, priority ASC LIMIT 50
+    Description: 查找张三在上周创建的未完成任务
+
+=== Q5: 列出李四本周截止的高优P1任务
+--- Answer: Text2SQL query returned no rows.
+--- Resolver mode: text2sql
+--- Intent: task_list
+--- NL IR source: llm
+--- Text2SQL model: qwen3-coder:480b-cloud (provider=ollama)
+--- Text2SQL query #1:
+    SQL: SELECT * FROM task_latest WHERE person = '李四' AND priority = 1 AND due_ts >= STRFTIME('%s', 'now', '-7 days') * 1000 AND due_ts <= STRFTIME('%s', 'now') * 1000 ORDER BY priority DESC, ts DESC LIMIT 50
+    Description: 列出李四本周截止的高优P1任务
+
+=== Q6: 张三现在有哪些 TODO 状态的任务？
+--- Answer: Text2SQL query returned no rows.
+--- Resolver mode: text2sql
+--- Intent: status_query
+--- NL IR source: llm
+--- Text2SQL model: qwen3-coder:480b-cloud (provider=ollama)
+--- Text2SQL query #1:
+    SQL: SELECT * FROM task_latest WHERE person = '张三' AND status = 'TODO' ORDER BY ts DESC, priority ASC LIMIT 10        
+    Description: 张三的 TODO 状态任务，按时间倒序和优先级正序排列
+
+=== Q7: 优先级为 1 的所有任务按最新更新时间倒序排列。
+--- Answer: 优先级为 1 的任务按最新更新时间倒序排列如下：
+
+1. **任务名称**：E3D接口联调
+   **负责人**：张三
+   **状态**：IN_PROGRESS
+   **更新时间**：2024-10-08 14:40:00（根据 updated_ts 字段转换）
+   **项目**：E3D
+   **标签**：接口,联调
+   **状态说明**：已打通鉴权
+
+（注：仅显示一条记录，如需更多结果请提供完整数据。）
+--- Resolver mode: text2sql
+--- Intent: task_list
+--- NL IR source: llm
+--- Text2SQL model: qwen3-coder:480b-cloud (provider=ollama)
+--- Text2SQL query #1:
+    SQL: SELECT * FROM task_latest WHERE priority = 1 ORDER BY ts DESC LIMIT 50
+    Description: 获取优先级为1的所有任务，按最新更新时间倒序排列，限制50条记录
+
+=== Q8: 给我张三和李四的任务状态汇总
+--- Answer: 根据现有记录，张三和李四的任务状态汇总如下：
+
+- 张三：有1个任务已完成（DONE），1个任务正在进行中（IN_PROGRESS）。
+- 李四：有1个任务已完成（DONE）。
+
+由于记录不完整，可能还有其他任务未列出。请提供完整数据以获得更准确的汇总。
+--- Resolver mode: text2sql
+--- Intent: person_summary
+--- NL IR source: llm
+--- Text2SQL model: qwen3-coder:480b-cloud (provider=ollama)
+--- Text2SQL query #1:
+    SQL: SELECT person, status, COUNT(*) AS count FROM task_latest WHERE person IN ('张三', '李四') GROUP BY person, status ORDER BY person, status LIMIT 50
+    Description: 汇总张三和李四的任务状态分布
+--- Text2SQL query #2:
+    SQL: SELECT person, COUNT(*) AS total_tasks, SUM(CASE WHEN status = 'DONE' THEN 1 ELSE 0 END) AS completed_tasks FROM task_latest WHERE person IN ('张三', '李四') GROUP BY person ORDER BY person LIMIT 50
+    Description: 统计张三和李四的总任务数及完成任务数
+
+=== Q9: 王五名下所有 BLOCKED 状态的任务有哪些？
+--- Answer: Text2SQL query returned no rows.
+--- Resolver mode: text2sql
+--- Intent: task_list
+--- NL IR source: llm
+--- Text2SQL model: qwen3-coder:480b-cloud (provider=ollama)
+--- Text2SQL query #1:
+    SQL: SELECT * FROM task_latest WHERE person = '王五' AND status = 'BLOCKED' ORDER BY ts DESC, priority ASC LIMIT 50     
+    Description: 查询王五名下所有状态为BLOCKED的任务，按时间倒序和优先级升序排列
+
+=== Q10: 张三在 交付 项目下的所有任务最新状态是什么？
+--- Answer: 张三在“交付”项目下的任务“提交9月周报”的最新状态是“DONE”，状态说明为“邮件已发”。
+--- Resolver mode: text2sql
+--- Intent: status_query
+--- NL IR source: llm
+--- Text2SQL model: qwen3-coder:480b-cloud (provider=ollama)
+--- Text2SQL query #1:
+    SQL: SELECT * FROM task_latest WHERE person = '张三' AND project = '交付' ORDER BY ts DESC, priority ASC LIMIT 10
+    Description: 张三在交付项目下的所有任务最新状态，按时间倒序和优先级升序排列
+
+=== Q11: 最近 7 天内创建的任务按时间倒序列出前 10 条。
+--- Answer: Text2SQL query returned no rows.
+--- Resolver mode: text2sql
+--- Answer: Text2SQL query returned no rows.
+--- Resolver mode: text2sql
+--- Resolver mode: text2sql
+--- Intent: status_query
+--- Intent: status_query
+--- NL IR source: llm
+--- Text2SQL model: qwen3-coder:480b-cloud (provider=ollama)
+--- NL IR source: llm
+--- Text2SQL model: qwen3-coder:480b-cloud (provider=ollama)
+--- Text2SQL model: qwen3-coder:480b-cloud (provider=ollama)
+--- Text2SQL query #1:
+--- Text2SQL query #1:
+    SQL: SELECT * FROM task_latest WHERE created_ts >= STRFTIME('%s', 'now', '-7 days') * 1000 ORDER BY ts DESC LIMIT 10      
+    Description: 列出最近 7 天内创建的任务，按时间倒序排列，限制 10 条。
+    Description: 列出最近 7 天内创建的任务，按时间倒序排列，限制 10 条。
+
+=== Q12: 当前所有 TODO 状态的任务列表给我看一下
+--- Answer: Text2SQL query returned no rows.
+--- Resolver mode: text2sql
+--- Intent: task_list
+--- NL IR source: llm
+--- Text2SQL model: qwen3-coder:480b-cloud (provider=ollama)
+--- Text2SQL query #1:
+    SQL: SELECT * FROM task_latest WHERE status = 'TODO' ORDER BY ts DESC, priority ASC LIMIT 10
+    Description: 查看当前所有 TODO 状态的任务列表，按时间倒序和优先级升序排列，限制10条记录
+
+=== Q13: 张三和李四最近一周的任务列表还有哪些？
+--- Answer: Text2SQL query returned no rows.
+--- Resolver mode: text2sql
+--- Intent: task_list
+--- NL IR source: llm
+--- Text2SQL model: qwen3-coder:480b-cloud (provider=ollama)
+--- Text2SQL query #1:
+    SQL: SELECT * FROM task_latest WHERE person IN ('张三', '李四') AND ts >= CAST((JULIANDAY('now') - 7) * 86400000 AS INTEGER) AND ts <= CAST(JULIANDAY('now') * 86400000 AS INTEGER) AND status IN ('DONE', 'TODO') ORDER BY ts DESC, priority ASC LIMIT 50
+    Description: 查询张三和李四最近一周内状态为DONE或TODO的任务，并按时间倒序、优先级升序排列

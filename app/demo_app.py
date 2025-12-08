@@ -176,6 +176,18 @@ def tasks_ask(q: str, topk: int = 3, thresh: Optional[float] = None) -> Dict[str
                 payload["nl_ir"] = spec.dict()
             if "ir" not in payload:
                 payload["ir"] = build_task_query_plan(spec)
+            extra = spec.extra or {}
+            if extra.get("kg_enabled"):
+                payload["kg_enabled"] = True
+        else:
+            # When nl_ir is already provided by the engine, try to read KG flag from it.
+            try:
+                nl_ir = payload.get("nl_ir") or {}
+                extra = nl_ir.get("extra") or {}
+                if extra.get("kg_enabled"):
+                    payload["kg_enabled"] = True
+            except Exception:
+                pass
     except Exception:
         if "nl_ir" not in payload:
             payload["nl_ir"] = {"raw_query": q, "error": "failed_to_serialize_ir"}
@@ -226,6 +238,7 @@ def db_ask(q: str = Query(..., description="Natural language task query for dire
         "sql": compiled.sql,
         "params": compiled.params,
         "rows": rows,
+        "kg_enabled": bool((spec.extra or {}).get("kg_enabled")),
     }
 
 
