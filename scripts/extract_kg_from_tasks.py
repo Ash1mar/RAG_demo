@@ -15,7 +15,7 @@ import json
 import os
 import sqlite3
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Any, Dict, List, Set
 
 
 def _connect_tasks_db() -> sqlite3.Connection:
@@ -33,12 +33,16 @@ def _distinct_values(conn: sqlite3.Connection, column: str, table: str = "tasks"
     return [str(row[0]) for row in rows if row and row[0] is not None]
 
 
-def preview_kg_candidates() -> Dict[str, List[str]]:
-    """Return a preview of candidate KG values from the demo DB."""
+def preview_kg_candidates() -> Dict[str, Any]:
+    """Return a KG-lite candidate structure (canonical values only)."""
     conn = _connect_tasks_db()
     try:
-        persons = _distinct_values(conn, "person")
-        projects = _distinct_values(conn, "project")
+        persons = sorted({value for value in _distinct_values(conn, "person") if value})
+        projects = sorted({value for value in _distinct_values(conn, "project") if value})
+        statuses = sorted({value.upper() for value in _distinct_values(conn, "status") if value})
+        priority_values = sorted(
+            {value for value in _distinct_values(conn, "priority") if value not in (None, "")}
+        )
         raw_tags = _distinct_values(conn, "tags")
     finally:
         conn.close()
@@ -52,23 +56,49 @@ def preview_kg_candidates() -> Dict[str, List[str]]:
             if token:
                 tags.add(token)
 
-    return {
-        "persons": sorted(set(persons)),
-        "projects": sorted(set(p for p in projects if p)),
-        "tags": sorted(tags),
+    categories = [
+        {
+            "name": tag,
+            "aliases": [],
+            "tags": [tag],
+        }
+        for tag in sorted(tags)
+    ]
+
+    def _wrap_entries(values: List[str]) -> List[Dict[str, Any]]:
+        return [{"canonical": value, "aliases": []} for value in values]
+
+    def _wrap_priorities(values: List[str]) -> List[Dict[str, Any]]:
+        entries: List[Dict[str, Any]] = []
+        for value in values:
+            try:
+                canonical = int(value)
+            except ValueError:
+                continue
+            entries.append({"canonical": canonical, "aliases": []})
+        return entries
+
+    candidates = {
+        "persons": _wrap_entries(persons),
+        "projects": _wrap_entries(projects),
+        "categories": categories,
+        "statuses": [{"canonical": value, "aliases": []} for value in statuses],
+        "priorities": _wrap_priorities(priority_values),
     }
+    return candidates
 
 
 def main() -> None:
     preview = preview_kg_candidates()
-    print("# KG-lite candidate values extracted from tasks DB")
+    print("# KG-lite candidate data extracted from tasks DB")
     print(json.dumps(preview, ensure_ascii=False, indent=2))
     print(
-        "\n# TODO: map these canonical values and aliases into data/kg_data.json\n"
-        "# so that KG-lite can use real data instead of demo entries."
+        "\n# NOTE:\n"
+        "# - This script only emits canonical values with empty alias lists.\n"
+        "# - Review and merge the output into data/kg_data.json manually (or via a dedicated script).\n"
+        "# - Categories are generated from existing tags as one-to-one drafts; adjust/merge as needed."
     )
 
 
 if __name__ == "__main__":
     main()
-

@@ -285,27 +285,34 @@ These are ideal for verifying KG-lite behavior:
 
 ### 10.2 Preview candidates for KG-lite from tasks DB
 
-When moving beyond the demo DB, you should populate `data/kg_data.json` from actual task data rather than hand‑coding all entries.
-
-`scripts/extract_kg_from_tasks.py` provides a minimal ETL preview:
+When moving beyond the demo DB, you should populate `data/kg_data.json` from actual task data rather than hand‑coding entries. The helper script `scripts/extract_kg_from_tasks.py` produces a KG-compatible candidate structure (canonical values only, alias lists left empty on purpose):
 
 ```bash
-python scripts/extract_kg_from_tasks.py
+python scripts/extract_kg_from_tasks.py > kg_data.generated.json
 ```
 
-It connects to `TASKS_DB` (default `data/tasks.db`) and prints:
+The output JSON mirrors the KG schema:
 
-- distinct `person` values,
-- distinct `project` values,
-- distinct tag tokens split from the `tags` column.
+- `persons`: `{canonical, aliases: []}` for each distinct `person` value.
+- `projects`: `{canonical, aliases: []}` for distinct `project` values.
+- `categories`: draft entries built from distinct tags (each tag becomes `{"name": tag, "aliases": [], "tags": [tag]}` to be merged manually later).
+- `statuses`: distinct status values from the DB (upper‑cased).
+- `priorities`: distinct numeric priority values.
 
-You can use this preview to decide:
+Use this generated file as a staging area; you still need to review & merge aliases/tags manually.
 
-- which canonical person/project names to keep;
-- which aliases should be added;
-- which categories/tags should be grouped together in `data/kg_data.json`.
+### 10.3 Recommended KG update workflow
 
-Later, you can replace or extend `kg_data.json` programmatically, or implement a graph‑backed `KGBackend` without touching the NL→IR→SQL code.
+1. **When new canonical names appear** (e.g. new project or system):
+   - Use the new name in the task system.
+   - Periodically run `scripts/extract_kg_from_tasks.py` to produce `kg_data.generated.json`.
+   - Review/merge canonical names and desired aliases into `data/kg_data.json` (commit changes along with any relevant docs).
+2. **When you start collecting real query logs**:
+   - Add a lightweight script that scans queries which did not map to canonical persons/projects.
+   - Output “candidate aliases” for manual review.
+   - Approved aliases can then be added to `kg_data.json` (or a future backend).
+
+This keeps the KG-lite layer data-driven and ready for eventual migration to a graph backend without changing the NL→IR→SQL code.
 
 ---
 
@@ -330,4 +337,3 @@ Later, you can replace or extend `kg_data.json` programmatically, or implement a
   - If they are always absent/false, verify `data/kg_data.json` entries and the exact wording of queries.
 
 If you run into anything unclear, `docs/INSTRUCTIONS_TASKS.md` + the service code under `app/services/` are the best place to understand the full pipeline end‑to‑end.
-

@@ -784,12 +784,46 @@ def _post_process_intent(spec: TaskQuerySpec, text: str) -> None:
         existing_tags = getattr(spec, "tags", None) or []
         merged = list(existing_tags)
         for tag in kg_tags:
-            if tag not in merged:
+            if tag and tag not in merged:
                 merged.append(tag)
         if merged != existing_tags:
             spec.tags = merged
             spec.extra.setdefault("kg_category_source", t)
             kg_used = True
+
+    # KG-lite status normalization (LLM outputs may use synonyms).
+    status_list = getattr(spec, "status", None) or []
+    if status_list:
+        normalized: List[TaskStatus] = []
+        seen: set[TaskStatus] = set()
+        for raw_status in status_list:
+            if isinstance(raw_status, TaskStatus):
+                candidate = raw_status.value
+            else:
+                candidate = str(raw_status or "")
+            if not candidate:
+                continue
+            canonical = kg_lite.resolve_status_value(candidate) or candidate.upper()
+            try:
+                enum_value = TaskStatus(canonical)
+            except ValueError:
+                continue
+            if enum_value not in seen:
+                seen.add(enum_value)
+                normalized.append(enum_value)
+        if normalized:
+            spec.status = normalized
+            kg_used = True
+
+    # KG-lite priority normalization.
+    if getattr(spec, "priority", None) is not None:
+        resolved_priority = kg_lite.resolve_priority_value(spec.priority)
+        if resolved_priority is not None:
+            if resolved_priority != spec.priority:
+                kg_used = True
+            spec.priority = resolved_priority
+        else:
+            spec.priority = None
 
     if kg_used:
         spec.extra["kg_enabled"] = True
