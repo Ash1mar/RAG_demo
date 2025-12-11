@@ -135,3 +135,25 @@ def compile_tasks_sql(spec: TaskQuerySpec) -> CompiledSql:
 
     # ---- Unknown or unsupported intent ----
     raise TaskSqlCompileError(f"unsupported intent for tasks SQL compile: {intent}")
+
+
+def compile_tasks_sql_v2(spec: TaskQuerySpec) -> CompiledSql:
+    """
+    Multi-table-ready compiler entry point.
+
+    Today this is a thin wrapper around `compile_tasks_sql(...)` and therefore
+    generates the same single-table / single-view SQL (against `tasks` and
+    `task_latest`).
+
+    In the future, this function will be the place where we plug in a richer
+    IR→plan→SQL pipeline that can:
+    - join `tasks` with dimension tables such as `persons`, `projects`, `tags`, etc.;
+    - keep the TaskQuerySpec IR and KG-lite resolution logic stable;
+    - evolve the physical schema without touching the NL→IR layer.
+
+    Callers that want to opt into the multi-table / multi-view world should use
+    this v2 entry point instead of `compile_tasks_sql(...)`.
+    """
+    # For now, delegate to the v1 single-table implementation to avoid any
+    # behavioral changes.
+    return compile_tasks_sql(spec)

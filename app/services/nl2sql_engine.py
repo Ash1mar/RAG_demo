@@ -1381,5 +1381,17 @@ def build_task_query_plan(spec: TaskQuerySpec) -> Dict[str, Any]:
     }
 
 
+def build_query_plan_v2(spec: TaskQuerySpec) -> Dict[str, Any]:
+    """
+    Experimental multi-table-ready query planner.
 
+    For now this is a thin wrapper around `build_task_query_plan(...)` and
+    produces the same single-table / single-view query-plan IR.
+
+    In the future, this function will be the only place where we introduce
+    multi-table / multi-view semantics (joins to `persons`, `projects`, `tags`,
+    etc.). The TaskQuerySpec IR shape and the KG-lite resolution APIs are
+    intentionally kept stable and should not depend on the physical schema.
+    """
+    return build_task_query_plan(spec)
 
