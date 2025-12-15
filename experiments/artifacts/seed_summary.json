@@ -1,0 +1,23 @@
+{
+  "items": 500,
+  "people": 24,
+  "projects": 6,
+  "aliases": 138,
+  "status_distribution": {
+    "DONE": 235,
+    "IN_PROGRESS": 133,
+    "BLOCKED": 54,
+    "TODO": 48,
+    "CANCELED": 30
+  },
+  "date_distribution": {
+    "range_start": "2024-09-01T03:24:53.212348+00:00",
+    "range_end": "2024-11-29T19:36:03.757384+00:00",
+    "by_month": {
+      "2024-09": 156,
+      "2024-10": 177,
+      "2024-11": 167
+    }
+  },
+  "seed": 42
+}

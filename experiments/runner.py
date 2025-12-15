@@ -22,6 +22,9 @@ except ImportError:  # pragma: no cover - optional dependency guard
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = Path(__file__).with_name("config.yaml")
 
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 
 def _strip_inline_comment(value: str) -> str:
     result: List[str] = []
@@ -171,15 +174,56 @@ def read_jsonl(path: Path) -> List[dict]:
 
 def seed_database(args: argparse.Namespace, config: Dict[str, Any]) -> None:
     seed_cfg = config.get("seed", {})
-    script_location = resolve_path(args.script or seed_cfg.get("script", "scripts/init_tasks_sqlite.py"))
-    if not script_location.exists():
-        raise SystemExit(f"Seed script not found: {script_location}")
+    script_path_value = args.script or seed_cfg.get("script")
+    use_script = args.use_script or seed_cfg.get("use_script", False)
 
-    env = os.environ.copy()
-    configured_env = seed_cfg.get("env", {})
-    for key, value in configured_env.items():
-        env[key] = str(value)
-    run_subprocess([sys.executable, str(script_location)], env=env)
+    if script_path_value and (use_script or args.script):
+        script_location = resolve_path(script_path_value)
+        if not script_location.exists():
+            raise SystemExit(f"Seed script not found: {script_location}")
+        env = os.environ.copy()
+        configured_env = seed_cfg.get("env", {})
+        for key, value in configured_env.items():
+            env[key] = str(value)
+        run_subprocess([sys.executable, str(script_location)], env=env)
+        return
+
+    generator_cfg = seed_cfg.get("generator", {})
+    db_path = resolve_path(config.get("database", {}).get("sqlite_path", "data/tasks.db"))
+    summary_path = resolve_path(
+        args.summary or config.get("artifacts", {}).get("seed_summary_path", "experiments/artifacts/seed_summary.json")
+    )
+
+    items = args.items or generator_cfg.get("items", 200)
+    people = args.people or generator_cfg.get("people")
+    projects = args.projects or generator_cfg.get("projects")
+    random_seed = args.seed or generator_cfg.get("random_seed", 7)
+    start_date_value = args.start_date or generator_cfg.get("start_date", "2024-09-01")
+    end_date_value = args.end_date or generator_cfg.get("end_date", "2024-11-30")
+    start_date = str(start_date_value)
+    end_date = str(end_date_value)
+
+    from experiments import seed as seed_module
+
+    start_dt = seed_module.parse_date(start_date)
+    end_dt = seed_module.parse_date(end_date)
+    if end_dt <= start_dt:
+        raise SystemExit("end-date must be greater than start-date")
+
+    options = seed_module.SeedOptions(
+        db_path=db_path,
+        summary_path=summary_path,
+        items=items,
+        people=people,
+        projects=projects,
+        random_seed=random_seed,
+        start_date=start_dt,
+        end_date=end_dt,
+    )
+    generator = seed_module.SeedGenerator(options)
+    summary = generator.run()
+    print(f"Seeded DB at {db_path} (items={summary['items']}, people={summary['people']})")
+    print(f"Summary saved to {summary_path}")
 
 
 def run_baseline(args: argparse.Namespace, config: Dict[str, Any]) -> None:
@@ -444,7 +488,15 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     seed_cmd = subparsers.add_parser("seed", help="Reinitialize the SQLite demo database.")
-    seed_cmd.add_argument("--script", help="Override seed script path")
+    seed_cmd.add_argument("--script", help="Override seed script path.")
+    seed_cmd.add_argument("--use-script", action="store_true", help="Force running the legacy script workflow.")
+    seed_cmd.add_argument("--items", type=int, help="Number of items/tasks to generate when using the generator.")
+    seed_cmd.add_argument("--people", type=int, help="Number of people to generate.")
+    seed_cmd.add_argument("--projects", type=int, help="Number of projects to generate.")
+    seed_cmd.add_argument("--seed", type=int, dest="seed", help="Random seed for generator runs.")
+    seed_cmd.add_argument("--start-date", help="Start date (YYYY-MM-DD) for generated timestamps.")
+    seed_cmd.add_argument("--end-date", help="End date (YYYY-MM-DD) for generated timestamps.")
+    seed_cmd.add_argument("--summary", help="Override seed summary output path.")
     seed_cmd.set_defaults(func=seed_database)
 
     base_cmd = subparsers.add_parser("run_baseline", help="Execute the configured baseline pipeline.")

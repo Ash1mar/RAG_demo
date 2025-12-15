@@ -10,7 +10,7 @@ This directory hosts the reproducible experimentation stack for the NL->IR->SQL-
 
 ## Workflow
 1. **Seed data** - `python experiments/runner.py seed`
-   - Rebuilds `data/tasks.db` through `scripts/init_tasks_sqlite.py`, keeping SQLite as the canonical demo store.
+   - By default `experiments/seed.py` generates multi-table demo data (people/projects/items/status_history plus alias dictionary) into `experiments/artifacts/experiments.db` and emits `experiments/artifacts/seed_summary.json`. Use `--seed/--items/--start-date/--end-date` for deterministic control; switch back to the legacy single-table seed via `--use-script` or `--script scripts/init_tasks_sqlite.py`.
 2. **Run baseline** - `python experiments/runner.py run_baseline`
    - Stub by default; configure `baseline.command` in `config.yaml` to point at your classical baseline (for example, deterministic SQL template or zero-shot LLM prompt). The runner exports JSONL predictions to `artifacts/baseline_latest.jsonl` when the command is provided.
 3. **Run system** - `python experiments/runner.py run_system`
