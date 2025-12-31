@@ -2,17 +2,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import sqlite3
 
 from app.tasks_store.base import TasksStore
+from app.tasks_schema import TasksSchemaConfig, get_tasks_schema_config
 
 
 @dataclass
 class SQLiteTasksConfig:
     db_path: str = "data/tasks.db"  # default location under project data/
     timeout_sec: float = 2.0         # read-only connect timeout
+    latest_relation: Optional[str] = None
+    history_relation: Optional[str] = None
+    allowed_relations: Optional[Sequence[str]] = None
 
 
 class SQLiteTasksStore(TasksStore):
@@ -38,6 +42,7 @@ class SQLiteTasksStore(TasksStore):
         self._db_path = Path(cfg.db_path)
         self._timeout = float(getattr(cfg, "timeout_sec", 2.0))
         self._conn: Optional[sqlite3.Connection] = None
+        self._schema = self._resolve_schema(cfg)
 
     # --- metadata helpers ---
     def _has_table_or_view(self, name: str) -> bool:
@@ -48,9 +53,30 @@ class SQLiteTasksStore(TasksStore):
         )
         return cur.fetchone() is not None
 
+    def _resolve_schema(self, cfg: SQLiteTasksConfig) -> TasksSchemaConfig:
+        base = get_tasks_schema_config()
+        latest = (cfg.latest_relation or base.latest_relation).strip()
+        history = (cfg.history_relation or base.history_relation).strip()
+        allowed = cfg.allowed_relations or base.allowed_relations
+        # Normalize
+        allowed_norm = tuple(str(a).strip() for a in allowed if str(a).strip())
+        if not allowed_norm:
+            allowed_norm = (latest, history)
+        return TasksSchemaConfig(
+            latest_relation=latest,
+            history_relation=history,
+            allowed_relations=allowed_norm,
+        )
+
     def _latest_table(self) -> str:
-        # Prefer the `task_latest` view when present (deduped by latest ts per person+task)
-        return "task_latest" if self._has_table_or_view("task_latest") else "tasks"
+        # Prefer configured latest relation when present; fallback to the legacy names.
+        if self._has_table_or_view(self._schema.latest_relation):
+            return self._schema.latest_relation
+        if self._has_table_or_view("task_latest"):
+            return "task_latest"
+        if self._has_table_or_view(self._schema.history_relation):
+            return self._schema.history_relation
+        return "tasks"
 
     # --- internal helpers ---
     def _connect_ro(self) -> sqlite3.Connection:
@@ -68,7 +94,9 @@ class SQLiteTasksStore(TasksStore):
     def ready(self) -> bool:
         try:
             _ = self._connect_ro()
-            return self._has_table_or_view("tasks")
+            return self._has_table_or_view(self._schema.history_relation) or self._has_table_or_view(
+                self._schema.latest_relation
+            )
         except Exception:
             return False
 
@@ -129,9 +157,9 @@ class SQLiteTasksStore(TasksStore):
         s = (sql or "").strip().lower()
         if not s.startswith("select"):
             raise ValueError("only SELECT statements are allowed in SQLiteTasksStore.query")
-        allowed_targets = (" from task_latest", " from tasks")
+        allowed_targets = tuple(f" from {name.lower()}" for name in self._schema.allowed_relations)
         if not any(t in s for t in allowed_targets):
-            raise ValueError("query must target task_latest or tasks table")
+            raise ValueError(f"query must target one of: {', '.join(self._schema.allowed_relations)}")
 
         conn = self._connect_ro()
         cur = conn.execute(sql, params)

@@ -57,6 +57,52 @@ python scripts/init_tasks_sqlite.py
 
 This creates and populates `data/tasks.db` with a handful of demo tasks for 张三 / 李四 and a few projects/tags.
 
+### 2.1) (Optional) Import Enterprise Tasks (FACT_TASK_ASSIGN) into SQLite
+
+If you have an enterprise single-table fact like `data/FACT_TASK_ASSIGN.csv`, import it into a separate SQLite DB and expose the canonical views (`tasks`, `task_latest`) so the existing pipeline can keep working without code changes.
+
+PowerShell:
+
+```powershell
+# Input CSV (default: data/FACT_TASK_ASSIGN.csv)
+$env:FACT_TASK_ASSIGN_CSV = 'data/FACT_TASK_ASSIGN.csv'
+
+# Output SQLite DB (default: data/fact_tasks.db)
+$env:TASKS_DB = 'data/fact_tasks.db'
+
+python scripts/import_fact_task_assign_sqlite.py
+```
+
+Expected output:
+
+- `Imported ...FACT_TASK_ASSIGN.csv into ...fact_tasks.db`
+- `Created views: tasks, task_latest`
+
+Notes:
+
+- The importer creates a physical table `FACT_TASK_ASSIGN` and two compatibility views: `tasks` and `task_latest`.
+- To switch between demo DB and enterprise DB, you only need to change `TASKS_DB` and restart the API.
+
+### 2.2) Switch Tasks DB (Demo vs Enterprise)
+
+The task pipeline reads the SQLite path from `TASKS_DB`.
+
+- Demo: `TASKS_DB=data/tasks.db` (created by `scripts/init_tasks_sqlite.py`)
+- Enterprise: `TASKS_DB=data/fact_tasks.db` (created by `scripts/import_fact_task_assign_sqlite.py`)
+
+Always restart `uvicorn` after changing env vars.
+
+### 2.3) (Optional) Portability via `TASKS_COL_*` field mapping
+
+Most datasets should expose compatibility views named `tasks` / `task_latest` with the canonical columns (`person`, `task`, `status`, `ts`, `project`, `tags`, ...).
+
+If your dataset uses different column names and you prefer not to create views, you can map logical fields to physical columns via env vars:
+
+- `TASKS_COL_PERSON`, `TASKS_COL_TASK`, `TASKS_COL_STATUS`, `TASKS_COL_TS`, `TASKS_COL_PROJECT`, `TASKS_COL_TAGS`, ...
+- Enterprise extensions: `TASKS_COL_OWNER`, `TASKS_COL_DIVISION_NAME`, `TASKS_COL_IS_READ`, `TASKS_COL_IS_DELEGATED`, ...
+
+This is intended to reduce future migrations to "new DB + a few env vars" instead of code changes.
+
 ---
 
 ## 3) Quick Run – FAISS + Mock Embeddings (Recommended Start)
@@ -257,6 +303,18 @@ Example (PowerShell):
 
 ```powershell
 python scripts/batch_db_ask.py --file scripts/questions.txt
+```
+
+To run the same question set against different SQLite DBs, set `TASKS_DB` before starting the API:
+
+```powershell
+# Demo DB (initialized by scripts/init_tasks_sqlite.py)
+$env:TASKS_DB = 'data/tasks.db'
+uvicorn app.demo_app:app --host 0.0.0.0 --port 8000 --reload
+
+# Enterprise DB (imported from FACT_TASK_ASSIGN.csv)
+$env:TASKS_DB = 'data/fact_tasks.db'
+uvicorn app.demo_app:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 Each question prints:

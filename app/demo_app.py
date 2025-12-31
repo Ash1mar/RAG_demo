@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import os
 from os import getenv
+import sys
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
@@ -23,9 +25,17 @@ from app.tasks_store.sqlite_store import SQLiteTasksStore, SQLiteTasksConfig
 app = FastAPI(title="Minimal RAG Demo", version="0.1.0")
 
 # ---- Global singletons (demo 级；生产迁移) ----
+def _running_under_pytest() -> bool:
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return True
+    if "pytest" in sys.modules:
+        return True
+    return any("pytest" in arg.lower() for arg in sys.argv)
+
+
 EMBEDDER = Embedder(
     model_name=getenv("MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2"),
-    use_mock=getenv("MOCK_EMB", "0") == "1",
+    use_mock=(getenv("MOCK_EMB", "0") == "1") or _running_under_pytest(),
     dim=int(getenv("EMB_DIM", "384")),
 )
 

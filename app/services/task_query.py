@@ -30,6 +30,7 @@ from app.services.nl2sql_engine import (
 )
 from app.services.sql_compiler import TaskSqlCompileError, compile_tasks_sql
 from app.tasks_store.base import TasksStore
+from app.tasks_schema import get_tasks_schema_config
 
 
 def _norm_text(s: str) -> str:
@@ -55,42 +56,66 @@ INTENT_STATUS_KWS = [
 
 logger = logging.getLogger(__name__)
 
-TEXT2SQL_SCHEMA = """
-table task_latest (
+_TASKS_SCHEMA = get_tasks_schema_config()
+
+
+def _build_text2sql_schema(latest_relation: str, history_relation: str) -> str:
+    # Keep the column contract stable; only table/view names change.
+    return f"""
+table {latest_relation} (
   id INTEGER PRIMARY KEY,
   person TEXT NOT NULL,
+  owner TEXT,
   task TEXT NOT NULL,
   status TEXT NOT NULL,        -- DONE | TODO | IN_PROGRESS | BLOCKED
   ts INTEGER NOT NULL,         -- epoch milliseconds
   project TEXT,
   tags TEXT,                   -- comma-separated strings
+  org_name TEXT,
+  division_name TEXT,
+  post_name TEXT,
+  is_read INTEGER,             -- 0/1
+  is_delegated INTEGER,        -- 0/1
   priority INTEGER,            -- 1 = highest priority
   due_ts INTEGER,
   created_ts INTEGER,
   updated_ts INTEGER,
-  status_note TEXT
+  status_note TEXT,
+  description TEXT
 );
 
-table tasks (
+table {history_relation} (
   id INTEGER PRIMARY KEY,
   person TEXT NOT NULL,
+  owner TEXT,
   task TEXT NOT NULL,
   status TEXT NOT NULL,
   ts INTEGER NOT NULL,
   project TEXT,
   tags TEXT,
+  org_name TEXT,
+  division_name TEXT,
+  post_name TEXT,
+  is_read INTEGER,
+  is_delegated INTEGER,
   priority INTEGER,
   due_ts INTEGER,
   created_ts INTEGER,
   updated_ts INTEGER,
-  status_note TEXT
+  status_note TEXT,
+  description TEXT
 );
 """
+
+
+TEXT2SQL_SCHEMA = _build_text2sql_schema(_TASKS_SCHEMA.latest_relation, _TASKS_SCHEMA.history_relation)
 
 TEXT2SQL_SYSTEM_PROMPT = (
     "You are a precise Text-to-SQL assistant for a SQLite database that tracks task status updates. "
     "You must only emit read-only SELECT statements that reference the task_latest or tasks tables described in the schema. "
     "Never produce DML/DDL (INSERT/UPDATE/DELETE/ALTER/etc.), and always include a LIMIT of at most 100 rows. "
+    "When the question explicitly says \"executor\"/\"执行\"/\"执行人\", filter by the `person` column. "
+    "When it says \"owner\"/\"发起人\"/\"负责人\" (or similar), filter by the `owner` column. "
     "Return only JSON with the structure {\"queries\":[{\"sql\":\"...\",\"description\":\"...\"}]}. "
     "If the request needs multiple SQL statements, include up to two queries in the JSON array."
 )
@@ -110,7 +135,7 @@ TEXT2SQL_FORBIDDEN_KEYWORDS = (
     "detach",
     "pragma",
 )
-TEXT2SQL_ALLOWED_TABLE_SNIPPETS = (' from task_latest', ' from tasks')
+TEXT2SQL_ALLOWED_TABLE_SNIPPETS = tuple(f" from {name.lower()}" for name in _TASKS_SCHEMA.allowed_relations)
 TEXT2SQL_DISALLOWED_FUNCTIONS = ('date_sub', 'curdate')
 TEXT2SQL_DISALLOWED_COMPARISONS = (
     "ts > created_ts",
@@ -129,7 +154,7 @@ TEXT2SQL_DISALLOWED_COMPARISONS = (
 TEXT2SQL_SUSPICIOUS_LITERAL_THRESHOLD = 10_000_000_000
 _MILLIS_PER_SECOND = 1000
 _MILLIS_PER_DAY = 24 * 60 * 60 * _MILLIS_PER_SECOND
-SQL_ALLOWED_TABLES = {"task_latest", "tasks"}
+SQL_ALLOWED_TABLES = {name.lower() for name in _TASKS_SCHEMA.allowed_relations}
 TEXT2SQL_ANSWER_SYSTEM_PROMPT = (
     "You are a precise assistant for summarizing SQL query results about task statuses. "
     "Use the provided rows to answer the user's question in Chinese. "
@@ -1387,7 +1412,7 @@ class TaskQueryEngine:
 
         for item in llm_result.queries[:TEXT2SQL_MAX_QUERIES]:
             try:
-                rewritten_sql = _rewrite_text2sql_query(item.sql, hint)
+                rewritten_sql = _rewrite_text2sql_query(item.sql, hint, question=q)
                 normalized_sql = _normalize_and_validate_text2sql_query(rewritten_sql)
             except Text2SQLValidationError as exc:
                 base["error"] = "text2sql_invalid_sql"
@@ -1496,6 +1521,7 @@ def _make_text2sql_ir_hint(spec: Optional[TaskQuerySpec]) -> Dict[str, Any]:
         "intent": _enum_to_str(getattr(spec.intent, "value", spec.intent))
         if getattr(spec, "intent", None) is not None
         else None,
+        "raw_query": getattr(spec, "raw_query", None),
         "person": spec.person,
         "task": spec.task,
         "project": spec.project,
@@ -2198,7 +2224,121 @@ def _ensure_priority_filter(sql: str, priority: Optional[Any], task_hint: Option
     return sql
 
 
-def _rewrite_text2sql_query(sql: str, hint: Optional[Dict[str, Any]]) -> str:
+def _inject_where_clause(sql: str, clause: str) -> str:
+    if not sql or not clause:
+        return sql
+    lowered = sql.lower()
+    where_idx = lowered.find(" where ")
+    if where_idx != -1:
+        insert_pos = where_idx + len(" where ")
+        end_idx = len(sql)
+        for keyword in (" order by ", " limit "):
+            idx = lowered.find(keyword, insert_pos)
+            if idx != -1 and idx < end_idx:
+                end_idx = idx
+        existing = sql[insert_pos:end_idx].strip()
+        suffix = sql[end_idx:]
+        if existing:
+            return f"{sql[:insert_pos]}({clause}) AND ({existing}){suffix}"
+        return f"{sql[:insert_pos]}({clause}){suffix}"
+
+    order_idx = lowered.find(" order by ")
+    limit_idx = lowered.find(" limit ")
+    insert_pos = len(sql)
+    for idx in (order_idx, limit_idx):
+        if idx != -1 and idx < insert_pos:
+            insert_pos = idx
+    suffix = sql[insert_pos:]
+    prefix = sql[:insert_pos]
+    if suffix.strip():
+        return f"{prefix} WHERE ({clause}) {suffix.lstrip()}"
+    return f"{prefix} WHERE ({clause})"
+
+
+def _rewrite_flow_filter(sql: str, *, question: str, project_hint: Optional[str]) -> str:
+    if not sql:
+        return sql
+    project = (project_hint or "").strip()
+    if not project:
+        return sql
+    if "flow_name" not in (question or "") and "流程" not in (question or ""):
+        return sql
+
+    lowered = sql.lower()
+    if re.search(r"\bproject\s*(=|like|in)\b", lowered):
+        return sql
+
+    escaped_project = project.replace("'", "''")
+    escaped = re.escape(project)
+    tags_like_pat = re.compile(
+        rf"\btags\s+like\s+(['\"])%{escaped}%\1", re.IGNORECASE
+    )
+    if tags_like_pat.search(sql):
+        return tags_like_pat.sub(f"project = '{escaped_project}'", sql)
+
+    return _inject_where_clause(sql, f"project = '{escaped_project}'")
+
+
+def _remove_predicate(sql: str, predicate_pattern: re.Pattern[str]) -> str:
+    if not sql:
+        return sql
+    updated = sql
+
+    # AND <pred>
+    updated = re.sub(
+        rf"\s+AND\s+\(?{predicate_pattern.pattern}\)?",
+        "",
+        updated,
+        flags=re.IGNORECASE,
+    )
+    # <pred> AND
+    updated = re.sub(
+        rf"\(?{predicate_pattern.pattern}\)?\s+AND\s+",
+        "",
+        updated,
+        flags=re.IGNORECASE,
+    )
+    # WHERE <pred> (remove to WHERE 1=1)
+    updated = re.sub(
+        rf"\bWHERE\s+\(?{predicate_pattern.pattern}\)?\s*(?=(ORDER\s+BY|LIMIT|$))",
+        "WHERE 1=1 ",
+        updated,
+        flags=re.IGNORECASE,
+    )
+    return updated
+
+
+_FLOW_VALUE_PATTERN = re.compile(
+    r"(?:流程|flow_name)\s*(?:（[^）]*）)?\s*(?:=|为)\s*([^\s，。,?？]+)",
+    re.IGNORECASE,
+)
+
+
+def _extract_flow_value(question: str) -> Optional[str]:
+    text = (question or "").strip()
+    if not text:
+        return None
+    match = _FLOW_VALUE_PATTERN.search(text)
+    if not match:
+        return None
+    value = (match.group(1) or "").strip()
+    return value or None
+
+
+def _rewrite_status_overconstraint(sql: str, *, question: str, status_hint: Optional[List[str]]) -> str:
+    if not sql:
+        return sql
+    # Drop a spurious "status = 'BLOCKED'" predicate when the user did not ask for it.
+    q = (question or "").lower()
+    if "blocked" in q or "阻塞" in (question or ""):
+        return sql
+    pred = re.compile(r"status\s*=\s*(['\"])BLOCKED\1", re.IGNORECASE)
+    if not pred.search(sql):
+        return sql
+    return _remove_predicate(sql, pred)
+
+
+def _rewrite_text2sql_query(sql: str, hint: Optional[Dict[str, Any]], *, question: str = "") -> str:
     if not sql:
         return sql
     updated = sql
@@ -2215,6 +2355,15 @@ def _rewrite_text2sql_query(sql: str, hint: Optional[Dict[str, Any]]) -> str:
     # Normalize person/project literals to canonical values from IR/KG.
     updated = _apply_scalar_hint(updated, "person", hint.get("person"))
     updated = _apply_scalar_hint(updated, "project", hint.get("project"))
+
+    # Domain-specific corrections (lightweight; prefer improving correctness over
+    # relying purely on prompt compliance).
+    flow_value = _extract_flow_value(question or "")
+    project_hint = hint.get("project")
+    if not project_hint and flow_value:
+        project_hint = flow_value
+    updated = _rewrite_flow_filter(updated, question=question or "", project_hint=project_hint)
+    updated = _rewrite_status_overconstraint(updated, question=question or "", status_hint=hint.get("status"))
 
     # Cleanup and safety-normalization.
     updated = _cleanup_invalid_order_tokens(updated)

@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from app.services.llm_client import get_llm_client
 from app.services import kg_lite
+from app.tasks_schema import get_tasks_schema_config
 
 
 class TaskQueryIntent(str, Enum):
@@ -81,6 +82,85 @@ class OrderBySpec(BaseModel):
     )
 
 
+_SQL_PARAM_SCALAR_TYPES = (str, int, float, bytes, bool)
+_SAFE_FIELD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_ALLOWED_FILTER_OPS = {"eq", "in", "like", "gte", "lte", "between"}
+_PRIORITY_TOKEN_RE = re.compile(r"^P(?P<num>[1-9][0-9]*)$", re.IGNORECASE)
+
+
+def _coerce_sql_param_scalar(value: Any) -> Any:
+    """Coerce a value into a safe SQLite bind parameter (or None if impossible).
+
+    This prevents sqlite3 binding failures when upstream structured outputs
+    accidentally emit dict/list payloads (e.g., {"tag": "..."}).
+    """
+
+    if value is None:
+        return None
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, _SQL_PARAM_SCALAR_TYPES):
+        return value
+    if isinstance(value, dict):
+        for key in ("tag", "value", "name", "id", "code"):
+            if key in value:
+                coerced = _coerce_sql_param_scalar(value.get(key))
+                if coerced is not None:
+                    return coerced
+        if len(value) == 1:
+            coerced = _coerce_sql_param_scalar(next(iter(value.values())))
+            if coerced is not None:
+                return coerced
+        return None
+    return None
+
+
+def _validate_filter_field(field: Any) -> str:
+    name = str(field or "").strip()
+    if not name or not _SAFE_FIELD_RE.match(name):
+        raise ValueError(f"unsafe filter field: {field!r}")
+    return name
+
+
+def _normalize_filter_op(op: Any) -> str:
+    normalized = str(op or "eq").lower().strip()
+    if normalized not in _ALLOWED_FILTER_OPS:
+        return "eq"
+    return normalized
+
+
+def _coerce_priority_value(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.isdigit():
+            return int(text)
+        match = _PRIORITY_TOKEN_RE.match(text)
+        if match:
+            return int(match.group("num"))
+        return None
+    if isinstance(value, dict):
+        for key in value.keys():
+            key_text = str(key or "").strip()
+            match = _PRIORITY_TOKEN_RE.match(key_text)
+            if match:
+                return int(match.group("num"))
+        for key in ("priority", "p", "level"):
+            if key in value:
+                return _coerce_priority_value(value.get(key))
+        return None
+    return None
+
+
 class QueryFilter(BaseModel):
     """Flexible filter definition for advanced queries."""
 
@@ -94,24 +174,49 @@ class QueryFilter(BaseModel):
     )
 
     def to_plan_filter(self) -> Dict[str, Any]:
-        op = (self.op or "eq").lower()
-        payload: Dict[str, Any] = {"field": self.field, "op": op}
+        field = _validate_filter_field(self.field)
+        op = _normalize_filter_op(self.op)
+        payload: Dict[str, Any] = {"field": field, "op": op}
+
         if op == "in":
-            vals: List[Any] = []
+            raw_vals: List[Any] = []
             if self.values:
-                vals = list(self.values)
+                raw_vals = list(self.values)
             elif self.value is not None:
-                vals = [self.value]
+                raw_vals = [self.value]
+            vals: List[Any] = []
+            for item in raw_vals:
+                if field == "priority":
+                    coerced = _coerce_priority_value(item)
+                else:
+                    coerced = _coerce_sql_param_scalar(item)
+                if coerced is not None:
+                    vals.append(coerced)
+            if not vals:
+                raise ValueError("empty/invalid IN values")
             payload["value"] = vals
-        elif op == "between":
-            vals = list(self.values or [])
-            if len(vals) < 2 and self.value is not None:
-                vals.append(self.value)
-            while len(vals) < 2:
-                vals.append(None)
-            payload["value"] = vals[:2]
+            return payload
+
+        if op == "between":
+            raw_vals = list(self.values or [])
+            if len(raw_vals) < 2 and self.value is not None:
+                raw_vals.append(self.value)
+            while len(raw_vals) < 2:
+                raw_vals.append(None)
+            start = _coerce_sql_param_scalar(raw_vals[0])
+            end = _coerce_sql_param_scalar(raw_vals[1])
+            if start is None and end is None and self.value is not None:
+                raise ValueError("invalid BETWEEN values")
+            payload["value"] = [start, end]
+            return payload
+
+        if field == "priority":
+            coerced = _coerce_priority_value(self.value)
         else:
-            payload["value"] = self.value
+            coerced = _coerce_sql_param_scalar(self.value)
+        if coerced is None and self.value is not None:
+            raise ValueError("invalid scalar value")
+        payload["value"] = coerced
         return payload
 
 
@@ -674,6 +779,45 @@ def _range_is_empty(value: Optional[TimeRange]) -> bool:
     return value is None or (not value.start and not value.end)
 
 
+def _is_list_style_question(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    # Keep it lightweight: detect "list tasks" queries.
+    if "任务" not in t:
+        return False
+    return any(
+        kw in t
+        for kw in (
+            "有哪些",
+            "都有哪些",
+            "哪些任务",
+            "列出",
+            "列出来",
+            "给我",
+            "任务列表",
+            "都列出来",
+        )
+    )
+
+
+def _prune_filters_by_field(spec: TaskQuerySpec, field_name: str) -> None:
+    filters = list(getattr(spec, "filters", []) or [])
+    if not filters:
+        return
+    normalized = field_name.lower()
+    kept: List[QueryFilter] = []
+    for flt in filters:
+        try:
+            flt_field = str(getattr(flt, "field", "") or "").lower()
+        except Exception:
+            flt_field = ""
+        if flt_field == normalized:
+            continue
+        kept.append(flt)
+    spec.filters = kept
+
+
 def _ensure_person_filter_from_text(spec: TaskQuerySpec, text: str) -> None:
     persons = _extract_person_tokens_from_text(text)
     if len(persons) < 2:
@@ -689,7 +833,14 @@ def _ensure_person_filter_from_text(spec: TaskQuerySpec, text: str) -> None:
         return
     filters.append(QueryFilter(field="person", op="in", values=persons))
     spec.filters = filters
-    spec.person = None
+    existing = (getattr(spec, "person", None) or "").strip()
+    if existing in {"??", "?", "unknown", "UNKNOWN"}:
+        spec.person = None
+        return
+    if not existing:
+        # Keep a representative person for downstream heuristics/UI, while the
+        # actual SQL should use the IN filter for correctness.
+        spec.person = persons[0]
 
 
 def _post_process_intent(spec: TaskQuerySpec, text: str) -> None:
@@ -713,6 +864,16 @@ def _post_process_intent(spec: TaskQuerySpec, text: str) -> None:
         except Exception:
             answer_mode = TaskAnswerMode.default
     spec.answer_mode = answer_mode
+
+    list_style = _is_list_style_question(t)
+    enterprise_user_match = re.search(r"\bUser_\d+\b", t, flags=re.IGNORECASE)
+    enterprise_user = enterprise_user_match.group(0) if enterprise_user_match else None
+    enterprise_division_match = re.search(r"\bDivision_\d+\b", t, flags=re.IGNORECASE)
+    enterprise_division = enterprise_division_match.group(0) if enterprise_division_match else None
+    enterprise_org_match = re.search(r"\bOrg_\d+\b", t, flags=re.IGNORECASE)
+    enterprise_org = enterprise_org_match.group(0) if enterprise_org_match else None
+    enterprise_post_match = re.search(r"\bPost_\d+\b", t, flags=re.IGNORECASE)
+    enterprise_post = enterprise_post_match.group(0) if enterprise_post_match else None
 
     if not getattr(spec, "tags", None):
         try:
@@ -897,6 +1058,97 @@ def _post_process_intent(spec: TaskQuerySpec, text: str) -> None:
     if "都是什么状态" in t or ("历史" in t and "状态" in t):
         spec.intent = TaskQueryIntent.task_history
 
+    # List-style queries ("有哪些/列出...任务") should not be forced into
+    # task_status_single by spurious LLM guesses for person/task.
+    if list_style and getattr(spec, "intent", None) == TaskQueryIntent.task_status_single:
+        person_tokens = _extract_person_tokens_from_text(t)
+        if len(person_tokens) == 1 and ("有哪些" in t or "列表" in t or "列出" in t):
+            spec.intent = TaskQueryIntent.task_list_by_person
+        else:
+            spec.intent = TaskQueryIntent.task_status_list
+
+    # Enterprise hint: "User_14 ..." often refers to owner_name rather than executor.
+    # Only apply when the token exists in the text and the question does not say "执行".
+    if list_style and enterprise_user and "执行" not in t and "执行人" not in t:
+        person_value = (getattr(spec, "person", None) or "").strip()
+        if person_value and person_value.lower() == enterprise_user.lower():
+            _prune_filters_by_field(spec, "person")
+            spec.filters = list(getattr(spec, "filters", []) or []) + [
+                QueryFilter(field="owner", op="eq", value=enterprise_user)
+            ]
+            spec.person = None
+
+    # Enterprise hint: Org_/Division_/Post_ tokens map to organization fields, not project/person.
+    if enterprise_division:
+        project_value = (getattr(spec, "project", None) or "").strip()
+        if project_value and project_value.lower() == enterprise_division.lower():
+            spec.project = None
+        spec.filters = list(getattr(spec, "filters", []) or []) + [
+            QueryFilter(field="division_name", op="eq", value=enterprise_division)
+        ]
+    if enterprise_org:
+        project_value = (getattr(spec, "project", None) or "").strip()
+        if project_value and project_value.lower() == enterprise_org.lower():
+            spec.project = None
+        spec.filters = list(getattr(spec, "filters", []) or []) + [
+            QueryFilter(field="org_name", op="eq", value=enterprise_org)
+        ]
+    if enterprise_post:
+        project_value = (getattr(spec, "project", None) or "").strip()
+        if project_value and project_value.lower() == enterprise_post.lower():
+            spec.project = None
+        spec.filters = list(getattr(spec, "filters", []) or []) + [
+            QueryFilter(field="post_name", op="eq", value=enterprise_post)
+        ]
+
+    # Enterprise hint: read/delegated flags.
+    if "阅读" in t or "已读" in t or "未读" in t:
+        if "尚未阅读" in t or "未阅读" in t or "未读" in t:
+            spec.filters = list(getattr(spec, "filters", []) or []) + [
+                QueryFilter(field="is_read", op="eq", value=0)
+            ]
+        elif "已经被阅读" in t or "已阅读" in t or "已读" in t:
+            spec.filters = list(getattr(spec, "filters", []) or []) + [
+                QueryFilter(field="is_read", op="eq", value=1)
+            ]
+    if "委托" in t:
+        if "未被委托" in t or "未委托" in t:
+            spec.filters = list(getattr(spec, "filters", []) or []) + [
+                QueryFilter(field="is_delegated", op="eq", value=0)
+            ]
+        elif "已经被委托" in t or "已被委托" in t or "已委托" in t:
+            spec.filters = list(getattr(spec, "filters", []) or []) + [
+                QueryFilter(field="is_delegated", op="eq", value=1)
+            ]
+
+    # If the text does not contain an explicit person/task mention, prefer
+    # clearing guessed entities so the query can be answered as a list.
+    if list_style and getattr(spec, "intent", None) in (
+        TaskQueryIntent.task_status_list,
+        TaskQueryIntent.task_list_by_person,
+    ):
+        person_tokens = _extract_person_tokens_from_text(t)
+        kg_person_source = None
+        try:
+            kg_person_source = (getattr(spec, "extra", {}) or {}).get("kg_person_source")
+        except Exception:
+            kg_person_source = None
+        person_value = (getattr(spec, "person", None) or "").strip()
+        is_placeholder_person = person_value in {"??", "?", "unknown", "UNKNOWN"}
+        if getattr(spec, "person", None) and not is_placeholder_person:
+            if person_tokens and (
+                str(spec.person) not in person_tokens
+                and (not kg_person_source or str(kg_person_source) not in person_tokens)
+            ):
+                spec.person = None
+                _prune_filters_by_field(spec, "person")
+            elif not person_tokens:
+                spec.person = None
+                _prune_filters_by_field(spec, "person")
+        if getattr(spec, "task", None) and str(spec.task) not in t:
+            spec.task = None
+            _prune_filters_by_field(spec, "task")
+
     completion_mode = any(kw in t for kw in _COMPLETION_TIME_HINTS)
     if completion_mode:
         spec.intent = TaskQueryIntent.task_history
@@ -928,11 +1180,38 @@ def _post_process_intent(spec: TaskQuerySpec, text: str) -> None:
     _ensure_person_filter_from_text(spec, t)
     entity_guess = _extract_person_task(t)
     person_tokens_hint = _extract_person_tokens_from_text(t)
-    if not person_tokens_hint and entity_guess.get("person"):
-        person_tokens_hint = [entity_guess["person"]]
-    if not getattr(spec, "person", None) and len(person_tokens_hint) == 1:
+    guessed_person = entity_guess.get("person")
+    if not person_tokens_hint and guessed_person:
+        try:
+            candidate = _sanitize_person_value(str(guessed_person))
+        except Exception:
+            candidate = None
+        if candidate and _looks_like_person(candidate):
+            person_tokens_hint = [candidate]
+
+    has_person_scope_filter = any(
+        str(getattr(f, "field", "") or "").lower() == "person"
+        and str(getattr(f, "op", "") or "").lower() == "in"
+        and getattr(f, "values", None)
+        for f in (getattr(spec, "filters", None) or [])
+        if isinstance(f, QueryFilter)
+    )
+
+    if (
+        not getattr(spec, "person", None)
+        and len(person_tokens_hint) == 1
+        and not has_person_scope_filter
+        and not (
+            list_style
+            and getattr(spec, "intent", None)
+            in (TaskQueryIntent.task_status_list, TaskQueryIntent.task_list_by_person)
+        )
+    ):
         spec.person = person_tokens_hint[0]
-    if not getattr(spec, "task", None):
+    if not getattr(spec, "task", None) and spec.intent in (
+        TaskQueryIntent.task_status_single,
+        TaskQueryIntent.task_history,
+    ):
         guessed_task = entity_guess.get("task")
         if guessed_task:
             spec.task = guessed_task.strip()
@@ -1212,22 +1491,45 @@ def build_task_query_plan(spec: TaskQuerySpec) -> Dict[str, Any]:
         except Exception:
             answer_mode = TaskAnswerMode.default
 
-    table = "tasks" if spec.intent == TaskQueryIntent.task_history else "task_latest"
+    schema = get_tasks_schema_config()
+    table = schema.history_relation if spec.intent == TaskQueryIntent.task_history else schema.latest_relation
     target: Dict[str, Any] = {"table": table}
+
+    def _translate_ident(value: str) -> str:
+        name = (value or "").strip()
+        if not name:
+            return name
+        if _SAFE_FIELD_RE.match(name):
+            return schema.translate_field(name)
+        return name
+
+    def _translate_projection(expr: str) -> str:
+        token = (expr or "").strip()
+        if not token:
+            return token
+        # Keep aggregates/aliases intact (e.g. COUNT(*) AS task_count).
+        if "(" in token or " " in token:
+            return token
+        return _translate_ident(token)
 
     filters: List[Dict[str, Any]] = []
     group_by: List[str] = []
-    if spec.person:
-        filters.append({"field": "person", "op": "eq", "value": spec.person})
+    has_person_filter = any(
+        str(getattr(flt, "field", "") or "").lower() == "person"
+        for flt in (getattr(spec, "filters", None) or [])
+        if isinstance(flt, QueryFilter)
+    )
+    if spec.person and not has_person_filter:
+        filters.append({"field": schema.translate_field("person"), "op": "eq", "value": spec.person})
     if spec.task:
-        filters.append({"field": "task", "op": "eq", "value": spec.task})
+        filters.append({"field": schema.translate_field("task"), "op": "eq", "value": spec.task})
     if spec.project:
-        filters.append({"field": "project", "op": "eq", "value": spec.project})
+        filters.append({"field": schema.translate_field("project"), "op": "eq", "value": spec.project})
     if spec.priority is not None:
-        filters.append({"field": "priority", "op": "eq", "value": spec.priority})
+        filters.append({"field": schema.translate_field("priority"), "op": "eq", "value": spec.priority})
     if spec.tags:
         for tag in spec.tags:
-            filters.append({"field": "tags", "op": "like", "value": f"%{tag}%"})
+            filters.append({"field": schema.translate_field("tags"), "op": "like", "value": f"%{tag}%"})
     if spec.status:
         concrete = [
             s for s in spec.status if not isinstance(s, TaskStatus) or s != TaskStatus.ANY
@@ -1235,7 +1537,7 @@ def build_task_query_plan(spec: TaskQuerySpec) -> Dict[str, Any]:
         if concrete:
             filters.append(
                 {
-                    "field": "status",
+                    "field": schema.translate_field("status"),
                     "op": "in",
                     "value": [
                         s.value if isinstance(s, TaskStatus) else str(s)
@@ -1246,57 +1548,87 @@ def build_task_query_plan(spec: TaskQuerySpec) -> Dict[str, Any]:
     if spec.time_range:
         if spec.time_range.start:
             filters.append(
-                {"field": "ts", "op": "gte", "value": spec.time_range.start}
+                {"field": schema.translate_field("ts"), "op": "gte", "value": spec.time_range.start}
             )
         if spec.time_range.end:
             filters.append(
-                {"field": "ts", "op": "lte", "value": spec.time_range.end}
+                {"field": schema.translate_field("ts"), "op": "lte", "value": spec.time_range.end}
             )
     if spec.due_range:
         if spec.due_range.start:
             filters.append(
-                {"field": "due_ts", "op": "gte", "value": spec.due_range.start}
+                {"field": schema.translate_field("due_ts"), "op": "gte", "value": spec.due_range.start}
             )
         if spec.due_range.end:
-            filters.append({"field": "due_ts", "op": "lte", "value": spec.due_range.end})
+            filters.append({"field": schema.translate_field("due_ts"), "op": "lte", "value": spec.due_range.end})
     if spec.created_range:
         if spec.created_range.start:
             filters.append(
-                {"field": "created_ts", "op": "gte", "value": spec.created_range.start}
+                {"field": schema.translate_field("created_ts"), "op": "gte", "value": spec.created_range.start}
             )
         if spec.created_range.end:
             filters.append(
-                {"field": "created_ts", "op": "lte", "value": spec.created_range.end}
+                {"field": schema.translate_field("created_ts"), "op": "lte", "value": spec.created_range.end}
             )
     if spec.filters:
+        invalid_filters: List[Dict[str, Any]] = []
         for flt in spec.filters:
             try:
                 normalized = flt.to_plan_filter()
-            except Exception:
+            except Exception as exc:
+                invalid_filters.append(
+                    {
+                        "field": getattr(flt, "field", None),
+                        "op": getattr(flt, "op", None),
+                        "value": getattr(flt, "value", None),
+                        "values": getattr(flt, "values", None),
+                        "error": str(exc),
+                    }
+                )
                 continue
-            if normalized.get("field"):
+            field = _translate_ident(str(normalized.get("field") or ""))
+            op = str(normalized.get("op") or "").lower()
+            if field and op == "in" and field == schema.translate_field("tags") and isinstance(
+                normalized.get("value"), (list, tuple)
+            ):
+                for tag in normalized.get("value") or []:
+                    if tag is None:
+                        continue
+                    filters.append(
+                        {"field": schema.translate_field("tags"), "op": "like", "value": f"%{tag}%"}
+                    )
+            elif normalized.get("field"):
+                normalized["field"] = field
                 filters.append(normalized)
+        if invalid_filters:
+            try:
+                extra = spec.extra or {}
+                extra.setdefault("invalid_filters", [])
+                extra["invalid_filters"].extend(invalid_filters)
+                spec.extra = extra
+            except Exception:
+                pass
 
     if answer_mode == TaskAnswerMode.task_count_by_status:
         projections: List[str] = [
-            "status",
+            _translate_ident("status"),
             "COUNT(*) AS task_count",
         ]
-        group_by = ["status"]
+        group_by = [_translate_ident("status")]
     elif answer_mode == TaskAnswerMode.person_summary_by_project:
         projections = [
-            "project",
-            "person",
-            "status",
+            _translate_ident("project"),
+            _translate_ident("person"),
+            _translate_ident("status"),
             "COUNT(*) AS task_count",
         ]
-        group_by = ["project", "person", "status"]
+        group_by = [_translate_ident("project"), _translate_ident("person"), _translate_ident("status")]
     elif answer_mode == TaskAnswerMode.overdue_count_by_person:
         projections = [
-            "person",
+            _translate_ident("person"),
             "COUNT(*) AS overdue_count",
         ]
-        group_by = ["person"]
+        group_by = [_translate_ident("person")]
     elif spec.intent in (
         TaskQueryIntent.task_status_single,
         TaskQueryIntent.task_status_list,
@@ -1304,32 +1636,32 @@ def build_task_query_plan(spec: TaskQuerySpec) -> Dict[str, Any]:
         TaskQueryIntent.task_history,
     ):
         projections = [
-            "id",
-            "person",
-            "task",
-            "status",
-            "ts",
-            "project",
-            "tags",
-            "priority",
-            "due_ts",
-            "created_ts",
-            "updated_ts",
-            "status_note",
+            _translate_ident("id"),
+            _translate_ident("person"),
+            _translate_ident("task"),
+            _translate_ident("status"),
+            _translate_ident("ts"),
+            _translate_ident("project"),
+            _translate_ident("tags"),
+            _translate_ident("priority"),
+            _translate_ident("due_ts"),
+            _translate_ident("created_ts"),
+            _translate_ident("updated_ts"),
+            _translate_ident("status_note"),
         ]
     elif spec.intent == TaskQueryIntent.person_summary:
         projections = [
-            "person",
-            "status",
+            _translate_ident("person"),
+            _translate_ident("status"),
             "COUNT(*) AS task_count",
         ]
-        group_by = ["person", "status"]
+        group_by = [_translate_ident("person"), _translate_ident("status")]
     else:
         projections = ["*"]
 
     sort: List[Dict[str, Any]] = [
         {
-            "field": ob.field,
+            "field": _translate_ident(ob.field),
             "direction": (
                 ob.direction.value
                 if isinstance(ob.direction, OrderByDirection)
@@ -1341,34 +1673,56 @@ def build_task_query_plan(spec: TaskQuerySpec) -> Dict[str, Any]:
     if answer_mode == TaskAnswerMode.task_count_by_status:
         sort = [
             {"field": "task_count", "direction": "DESC"},
-            {"field": "status", "direction": "ASC"},
+            {"field": _translate_ident("status"), "direction": "ASC"},
         ]
     elif answer_mode == TaskAnswerMode.person_summary_by_project:
         sort = [
-            {"field": "project", "direction": "ASC"},
-            {"field": "person", "direction": "ASC"},
-            {"field": "status", "direction": "ASC"},
+            {"field": _translate_ident("project"), "direction": "ASC"},
+            {"field": _translate_ident("person"), "direction": "ASC"},
+            {"field": _translate_ident("status"), "direction": "ASC"},
         ]
     elif answer_mode == TaskAnswerMode.overdue_count_by_person:
         sort = [
             {"field": "overdue_count", "direction": "DESC"},
-            {"field": "person", "direction": "ASC"},
+            {"field": _translate_ident("person"), "direction": "ASC"},
         ]
     elif not sort:
         if spec.intent == TaskQueryIntent.person_summary:
             sort = [
                 {"field": "task_count", "direction": "DESC"},
-                {"field": "person", "direction": "ASC"},
+                {"field": _translate_ident("person"), "direction": "ASC"},
             ]
         else:
             # Default to latest-first on ts, then id for deterministic ordering.
             sort = [
-                {"field": "ts", "direction": "DESC"},
-                {"field": "priority", "direction": "ASC"},
-                {"field": "id", "direction": "DESC"},
+                {"field": _translate_ident("ts"), "direction": "DESC"},
+                {"field": _translate_ident("priority"), "direction": "ASC"},
+                {"field": _translate_ident("id"), "direction": "DESC"},
             ]
 
     limit = spec.limit or 10
+
+    # De-duplicate filters to avoid accidental over-constraint from mixed
+    # "dedicated fields" + "filters" (especially after LLM post-processing).
+    deduped: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for flt in filters:
+        try:
+            field = str(flt.get("field") or "")
+            op = str(flt.get("op") or "")
+            value = flt.get("value")
+            if isinstance(value, list):
+                value_key = tuple(value)
+            else:
+                value_key = value
+            key = repr((field, op, value_key))
+        except Exception:
+            key = repr(flt)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(flt)
+    filters = deduped
 
     return {
         "intent": intent,

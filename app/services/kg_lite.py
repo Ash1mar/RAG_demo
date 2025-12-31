@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol
@@ -310,7 +311,7 @@ class KGResolver:
         return self._backend.snapshot()
 
 
-KG_DATA_PATH = Path("data") / "kg_data.json"
+KG_DATA_PATH = Path(os.getenv("KG_DATA_PATH", str(Path("data") / "kg_data.json")))
 KG_BACKEND = InMemoryKGBackend(_build_kg_data(_load_raw_kg(KG_DATA_PATH)))
 KG_RESOLVER = KGResolver(KG_BACKEND)
 
@@ -337,4 +338,3 @@ def resolve_priority_value(value: Any) -> Optional[int]:
 
 def get_debug_snapshot() -> Dict[str, List[str]]:
     return KG_RESOLVER.debug_snapshot()
-

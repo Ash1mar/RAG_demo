@@ -57,6 +57,12 @@ def main() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 person_id INTEGER NOT NULL,
                 person TEXT NOT NULL,           -- denormalized for quick lookups
+                owner TEXT,                     -- optional "owner"/requester for enterprise datasets
+                org_name TEXT,
+                division_name TEXT,
+                post_name TEXT,
+                is_read INTEGER,
+                is_delegated INTEGER,
                 task TEXT NOT NULL,
                 project TEXT,
                 tags TEXT,                      -- comma-separated for demo
@@ -131,6 +137,12 @@ def main() -> None:
             return (
                 pid,
                 name,
+                name,  # owner mirrors assignee for demo data
+                None,  # org_name
+                None,  # division_name
+                None,  # post_name
+                0,     # is_read
+                0,     # is_delegated
                 task,
                 project,
                 tags,
@@ -244,10 +256,11 @@ def main() -> None:
             conn,
             """
             INSERT INTO tasks(
-                person_id, person, task, project, tags, priority, status, status_note,
+                person_id, person, owner, org_name, division_name, post_name, is_read, is_delegated,
+                task, project, tags, priority, status, status_note,
                 description, created_ts, due_ts, ts, updated_ts
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )

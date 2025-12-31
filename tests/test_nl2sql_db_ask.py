@@ -19,6 +19,7 @@ from app.services.nl2sql_engine import (
     _post_process_intent,
 )
 from app.services.sql_compiler import compile_tasks_sql, TaskSqlCompileError, CompiledSql
+from app.services.task_query import _rewrite_text2sql_query
 
 STATUS_QUERY = "\u5f20\u4e09\u7684E3D\u63a5\u53e3\u8054\u8c03\u73b0\u5728\u4ec0\u4e48\u72b6\u6001\uff1f"
 MULTI_PERSON_QUERY = "\u5f20\u4e09\u548c\u674e\u56db\u6700\u8fd1\u4e00\u5468\u7684\u4efb\u52a1\u5217\u8868\u8fd8\u6709\u54ea\u4e9b\uff1f"
@@ -161,6 +162,31 @@ def test_post_process_detects_due_range_and_priority_keywords() -> None:
     assert spec.priority == 1
 
 
+def test_post_process_list_style_query_does_not_force_single_task() -> None:
+    q = "E3D系统中安全专项相关的高优P1任务有哪些？"
+    spec = TaskQuerySpec(
+        intent=TaskQueryIntent.task_status_single,
+        raw_query=q,
+        person="张三",
+        task="E3D接口联调",
+        project="E3D",
+        priority=1,
+        tags=["整改", "安全整改"],
+        filters=[
+            QueryFilter(field="tags", op="in", values=[{"tag": "安全专项"}]),
+            QueryFilter(field="priority", op="eq", value={"P1": "high"}),
+        ],
+        limit=50,
+    )
+    _post_process_intent(spec, q)
+    assert spec.intent in (
+        TaskQueryIntent.task_status_list,
+        TaskQueryIntent.task_list_by_person,
+    )
+    assert spec.task is None
+    assert spec.person is None
+
+
 def test_build_plan_respects_custom_filters() -> None:
     spec = TaskQuerySpec(
         intent=TaskQueryIntent.task_status_list,
@@ -176,6 +202,51 @@ def test_build_plan_respects_custom_filters() -> None:
     assert "person" in fields
     assert "project" in fields
     assert any(f["op"] == "in" and f["field"] == "person" for f in plan["filters"])
+
+
+def test_compile_sql_sanitizes_structured_filter_values() -> None:
+    spec = TaskQuerySpec(
+        intent=TaskQueryIntent.task_status_list,
+        raw_query="structured filters from llm",
+        project="E3D",
+        priority=1,
+        tags=["整改", "安全整改"],
+        filters=[
+            QueryFilter(field="tags", op="in", values=[{"tag": "安全专项"}]),
+            QueryFilter(field="priority", op="eq", value={"P1": "high"}),
+        ],
+        limit=50,
+    )
+    compiled = compile_tasks_sql(spec)
+    assert isinstance(compiled, CompiledSql)
+    assert all(not isinstance(p, dict) for p in compiled.params)
+
+
+def test_text2sql_rewrite_flow_uses_project_not_tags() -> None:
+    q = "流程（flow_name）为 部门任务流程 下有哪些任务？"
+    sql = "SELECT task, status, ts FROM task_latest WHERE tags LIKE '%部门任务流程%' ORDER BY ts DESC LIMIT 10"
+    hint = {"project": "部门任务流程"}
+    rewritten = _rewrite_text2sql_query(sql, hint, question=q)
+    lowered = rewritten.lower()
+    assert "project = '部门任务流程'".lower() in lowered
+    assert "tags like '%部门任务流程%'" not in lowered
+
+
+def test_text2sql_rewrite_flow_can_infer_from_question() -> None:
+    q = "流程（flow_name）为 部门任务流程 下有哪些任务？"
+    sql = "SELECT task, status, ts FROM task_latest WHERE tags LIKE '%部门任务流程%' ORDER BY ts DESC LIMIT 10"
+    rewritten = _rewrite_text2sql_query(sql, {}, question=q)
+    lowered = rewritten.lower()
+    assert "project = '部门任务流程'".lower() in lowered
+    assert "tags like '%部门任务流程%'" not in lowered
+
+
+def test_text2sql_rewrite_drops_spurious_blocked_status() -> None:
+    q = "流程（flow_name）为 部门任务流程 中即将到期的任务有哪些？"
+    sql = "SELECT * FROM task_latest WHERE project = '部门任务流程' AND status = 'BLOCKED' AND due_ts < 9999999999999 LIMIT 10"
+    hint = {"project": "部门任务流程", "status": []}
+    rewritten = _rewrite_text2sql_query(sql, hint, question=q)
+    assert "BLOCKED" not in rewritten
 
 
 def test_compile_sql_person_summary_requires_scope() -> None:

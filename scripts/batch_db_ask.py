@@ -9,6 +9,7 @@ Batch helper to sequentially query /tasks/ask.
   # 从文件读取问题（每行一个，自然语言中文）
   python scripts/batch_db_ask.py --file scripts/questions.txt
   python scripts/batch_db_ask.py --file scripts/qs_old.txt
+  python scripts/batch_db_ask.py --file scripts/FACT_TASK_ASSIGN_questions_real.txt
 
   # 自定义服务地址
   python scripts/batch_db_ask.py --endpoint http://localhost:8000/tasks/ask --file questions.txt
