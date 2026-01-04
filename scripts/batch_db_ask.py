@@ -16,6 +16,7 @@ Batch helper to sequentially query /tasks/ask.
 """
 import argparse
 from pathlib import Path
+from urllib.parse import urlparse, urlunparse
 from typing import Iterable, List
 
 import requests
@@ -44,6 +45,21 @@ def iter_questions(args: argparse.Namespace) -> Iterable[str]:
 
 def ask(endpoint: str, question: str, timeout: int) -> dict:
     resp = requests.get(endpoint, params={"q": question}, timeout=timeout)
+    resp.raise_for_status()
+    return resp.json()
+
+def fetch_health(endpoint: str, timeout: int) -> dict:
+    parsed = urlparse(endpoint)
+    path = parsed.path or ""
+    for suffix in ("/tasks/ask", "/db/ask", "/tasks/ask/", "/db/ask/"):
+        if path.endswith(suffix):
+            path = path[: -len(suffix)] or "/"
+            break
+    if not path.endswith("/"):
+        path = path + "/"
+    health_path = f"{path}health"
+    health_url = urlunparse(parsed._replace(path=health_path, query="", params="", fragment=""))
+    resp = requests.get(health_url, timeout=timeout)
     resp.raise_for_status()
     return resp.json()
 
@@ -78,6 +94,15 @@ def main() -> None:
         questions = list(iter_questions(args))
     except Exception as exc:
         raise SystemExit(str(exc))
+
+    try:
+        health = fetch_health(args.endpoint, args.timeout)
+        tasks_store = health.get("tasks_store")
+        tasks_ready = health.get("tasks_ready")
+        print(f"--- Tasks store: {tasks_store}")
+        print(f"--- Tasks ready: {tasks_ready}")
+    except Exception as exc:
+        print(f"Health check failed: {exc}")
 
     for idx, question in enumerate(questions, start=1):
         print(f"\n=== Q{idx}: {question}")

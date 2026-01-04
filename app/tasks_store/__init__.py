@@ -7,3 +7,15 @@ __all__ = [
     "SQLiteTasksConfig",
 ]
 
+try:
+    from .mssql_store import MSSQLTasksStore, MSSQLTasksConfig
+
+    __all__.extend(
+        [
+            "MSSQLTasksStore",
+            "MSSQLTasksConfig",
+        ]
+    )
+except Exception:
+    pass
+

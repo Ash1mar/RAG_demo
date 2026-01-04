@@ -47,7 +47,29 @@ export MOCK_EMB=1
 
 ---
 
-## 2) Initialize Demo Tasks DB
+## 2) Centralized Config (Optional, Recommended)
+
+The API can load a single env file at startup.
+
+Default file:
+
+- `config/app.env`
+
+Override path:
+
+- `APP_CONFIG=path/to/your.env`
+
+PowerShell example:
+
+```powershell
+$env:APP_CONFIG = 'config/app.env'
+```
+
+Environment variables still override values in the file.
+
+---
+
+## 3) Initialize Demo Tasks DB
 
 The task Q&A endpoints use a small SQLite DB (`data/tasks.db`). Initialize it once:
 
@@ -57,7 +79,7 @@ python scripts/init_tasks_sqlite.py
 
 This creates and populates `data/tasks.db` with a handful of demo tasks for 张三 / 李四 and a few projects/tags.
 
-### 2.1) (Optional) Import Enterprise Tasks (FACT_TASK_ASSIGN) into SQLite
+### 3.1) (Optional) Import Enterprise Tasks (FACT_TASK_ASSIGN) into SQLite
 
 If you have an enterprise single-table fact like `data/FACT_TASK_ASSIGN.csv`, import it into a separate SQLite DB and expose the canonical views (`tasks`, `task_latest`) so the existing pipeline can keep working without code changes.
 
@@ -83,7 +105,7 @@ Notes:
 - The importer creates a physical table `FACT_TASK_ASSIGN` and two compatibility views: `tasks` and `task_latest`.
 - To switch between demo DB and enterprise DB, you only need to change `TASKS_DB` and restart the API.
 
-### 2.2) Switch Tasks DB (Demo vs Enterprise)
+### 3.2) Switch Tasks DB (Demo vs Enterprise)
 
 The task pipeline reads the SQLite path from `TASKS_DB`.
 
@@ -92,7 +114,7 @@ The task pipeline reads the SQLite path from `TASKS_DB`.
 
 Always restart `uvicorn` after changing env vars.
 
-### 2.3) (Optional) Portability via `TASKS_COL_*` field mapping
+### 3.3) (Optional) Portability via `TASKS_COL_*` field mapping
 
 Most datasets should expose compatibility views named `tasks` / `task_latest` with the canonical columns (`person`, `task`, `status`, `ts`, `project`, `tags`, ...).
 
@@ -105,7 +127,24 @@ This is intended to reduce future migrations to "new DB + a few env vars" instea
 
 ---
 
-## 3) Quick Run – FAISS + Mock Embeddings (Recommended Start)
+### 3.4) (Optional) Use SQL Server Tasks DB
+
+If you have initialized SQL Server (see `docs/VM_SQLServer_Docker_Setup.md`), set the following in `config/app.env`:
+
+```env
+TASKS_BACKEND=mssql
+TASKS_DIALECT=mssql
+TASKS_MSSQL_SERVER=127.0.0.1,1433
+TASKS_MSSQL_DATABASE=fact_tasks
+TASKS_MSSQL_USER=sa
+TASKS_MSSQL_PASSWORD=your_password
+```
+
+Restart the API after changing the config.
+
+---
+
+## 4) Quick Run – FAISS + Mock Embeddings (Recommended Start)
 
 FAISS is the default vector store and works well on Windows/macOS/Linux.
 
@@ -134,7 +173,7 @@ Expected fields include:
 
 ---
 
-## 4) Ingest Sample Text and Test RAG
+## 5) Ingest Sample Text and Test RAG
 
 With the API running:
 
@@ -163,7 +202,7 @@ If you see documents in `results`, the RAG part is working.
 
 ---
 
-## 5) Task Status – Non‑LLM Ask (Baseline)
+## 6) Task Status – Non‑LLM Ask (Baseline)
 
 With `data/tasks.db` initialized, you can query task status using only rules/embeddings (no LLM).
 
@@ -189,7 +228,7 @@ You should see answers like “已完成 / TODO / IN_PROGRESS” along with the 
 
 ---
 
-## 6) Enable Small Model – Hybrid / Hybrid_LLM
+## 7) Enable Small Model – Hybrid / Hybrid_LLM
 
 To compare with a real Chinese embedding model, start the Dockerized bge-small-zh embedder:
 
@@ -213,7 +252,7 @@ Re‑run the same `/tasks/ask` queries and observe:
 
 ---
 
-## 7) NL→JSON→SQL Experiments (`/db/ask`)
+## 8) NL→JSON→SQL Experiments (`/db/ask`)
 
 To inspect the full NL→IR→SQL pipeline for tasks, use `/db/ask`:
 
@@ -233,7 +272,7 @@ If the IR is incomplete or unsafe (e.g., missing person/task), `/db/ask` will re
 
 ---
 
-## 8) Text2SQL – Config and Basic Test
+## 9) Text2SQL – Config and Basic Test
 
 Text2SQL is optional and requires an LLM provider configured via `LLM_*` env vars.
 
@@ -277,7 +316,7 @@ and repeat the query. The pipeline will be:
 
 ---
 
-## 9) Pytest – NL→JSON→SQL End‑to‑End
+## 10) Pytest – NL→JSON→SQL End‑to‑End
 
 There is a minimal pytest module to validate the NL→IR→SQL pipeline, independent of the UI:
 
@@ -293,9 +332,9 @@ It covers three layers:
 
 ---
 
-## 10) KG-lite & Batch Experiments
+## 11) KG-lite & Batch Experiments
 
-### 10.1 Batch‑run `/tasks/ask` and inspect KG flags
+### 11.1 Batch‑run `/tasks/ask` and inspect KG flags
 
 `scripts/batch_db_ask.py` helps you run a list of questions through `/tasks/ask` and print key debug fields, including KG-lite usage.
 
@@ -341,7 +380,7 @@ These are ideal for verifying KG-lite behavior:
 - Project aliases: `"芯片平台"` / `"交付项目组"` normalized to `"芯片"` / `"交付"`.
 - Category→tags: `"安全专项"` expands to tags like `"整改"` / `"安全整改"` in SQL filters.
 
-### 10.2 Preview candidates for KG-lite from tasks DB
+### 11.2 Preview candidates for KG-lite from tasks DB
 
 When moving beyond the demo DB, you should populate `data/kg_data.json` from actual task data rather than hand‑coding entries. The helper script `scripts/extract_kg_from_tasks.py` produces a KG-compatible candidate structure (canonical values only, alias lists left empty on purpose):
 
@@ -359,7 +398,7 @@ The output JSON mirrors the KG schema:
 
 Use this generated file as a staging area; you still need to review & merge aliases/tags manually.
 
-### 10.3 Recommended KG update workflow
+### 11.3 Recommended KG update workflow
 
 1. **When new canonical names appear** (e.g. new project or system):
    - Use the new name in the task system.
@@ -374,7 +413,7 @@ This keeps the KG-lite layer data-driven and ready for eventual migration to a g
 
 ---
 
-## 11) Troubleshooting
+## 12) Troubleshooting
 
 - **No results from `/search` or `/search_hybrid`**
   - Ingest some docs via `/ingest` first.

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class TasksStore(ABC):
@@ -37,6 +37,11 @@ class TasksStore(ABC):
     @abstractmethod
     def list_tasks(self) -> List[str]:
         """Return distinct task names available in the backend."""
+        ...
+
+    @abstractmethod
+    def query(self, sql: str, params: Tuple[Any, ...]) -> List[Dict[str, Any]]:
+        """Execute a read-only SELECT against the tasks backend."""
         ...
 
     def search(self, *, person: Optional[str] = None, task: Optional[str] = None, limit: int = 10) -> List[Dict[str, Any]]:

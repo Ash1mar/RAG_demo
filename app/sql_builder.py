@@ -63,7 +63,7 @@ def _render_order_by(sort: List[Dict[str, Any]]) -> str:
     return " ORDER BY " + ", ".join(parts)
 
 
-def build_sql_from_ir(ir: Dict[str, Any]) -> str:
+def build_sql_from_ir(ir: Dict[str, Any], *, dialect: str = "sqlite") -> str:
     """Build a SQL string from a normalized query-plan IR.
 
     The IR is expected to follow the shape produced by
@@ -101,14 +101,17 @@ def build_sql_from_ir(ir: Dict[str, Any]) -> str:
     if group_by:
         group_sql = " GROUP BY " + ", ".join(group_by)
     order_sql = _render_order_by(sort)
+    limit_sql = ""
+    dialect_norm = (dialect or "sqlite").strip().lower()
+    if limit is not None:
+        if dialect_norm == "mssql":
+            if not order_sql:
+                order_sql = " ORDER BY 1"
+            limit_sql = " OFFSET 0 ROWS FETCH NEXT ? ROWS ONLY"
+        else:
+            limit_sql = " LIMIT ?"
 
     # Intent-level branching is intentionally minimal; both status queries
     # and task lists share the same basic SELECT/WHERE/ORDER/LIMIT shape.
     base = f"SELECT {cols} FROM {table}{where_sql}{group_sql}{order_sql}"
-
-    # Always use a positional placeholder for LIMIT when present so that
-    # callers can clamp and bind the concrete value themselves.
-    if limit is not None:
-        base += " LIMIT ?"
-
-    return base
+    return base + limit_sql

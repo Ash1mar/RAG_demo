@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
+import os
+from typing import Any, Dict, List, Tuple, Optional
 
 from app.services.nl2sql_engine import TaskQuerySpec, TaskQueryIntent, TaskStatus, build_task_query_plan
 from app.sql_builder import build_sql_from_ir
@@ -63,7 +64,15 @@ def _spec_has_field_filter(spec: TaskQuerySpec, field: str) -> bool:
     return False
 
 
-def compile_tasks_sql(spec: TaskQuerySpec) -> CompiledSql:
+def _default_dialect() -> str:
+    raw = os.getenv("TASKS_DIALECT")
+    if raw:
+        return raw.strip().lower() or "sqlite"
+    backend = os.getenv("TASKS_BACKEND", "sqlite").strip().lower()
+    return "mssql" if backend == "mssql" else "sqlite"
+
+
+def compile_tasks_sql(spec: TaskQuerySpec, *, dialect: Optional[str] = None) -> CompiledSql:
     """Compile TaskQuerySpec (NL semantic IR) into a safe, read‑only SQL for `tasks` table.
 
     Notes:
@@ -77,6 +86,7 @@ def compile_tasks_sql(spec: TaskQuerySpec) -> CompiledSql:
     """
 
     intent = spec.intent
+    dialect_norm = (dialect or _default_dialect()).strip().lower()
 
     # ---- Single task status: person + task -> latest row ----
     if intent == TaskQueryIntent.task_status_single:
@@ -87,7 +97,7 @@ def compile_tasks_sql(spec: TaskQuerySpec) -> CompiledSql:
         # Force single-row semantics via limit=1 on the plan.
         spec.limit = 1
         ir = build_task_query_plan(spec)
-        sql = build_sql_from_ir(ir)
+        sql = build_sql_from_ir(ir, dialect=dialect_norm)
         params = list(_build_params_from_plan(ir))
         # Clamp limit param to 1 explicitly.
         if params:
@@ -110,7 +120,7 @@ def compile_tasks_sql(spec: TaskQuerySpec) -> CompiledSql:
 
         spec.limit = limit_int
         ir = build_task_query_plan(spec)
-        sql = build_sql_from_ir(ir)
+        sql = build_sql_from_ir(ir, dialect=dialect_norm)
         params = list(_build_params_from_plan(ir))
         # Last param is the LIMIT positional value; ensure it matches the clamped limit.
         if params:
@@ -127,7 +137,7 @@ def compile_tasks_sql(spec: TaskQuerySpec) -> CompiledSql:
             raise TaskSqlCompileError("invalid limit in TaskQuerySpec") from exc
         spec.limit = limit_int
         ir = build_task_query_plan(spec)
-        sql = build_sql_from_ir(ir)
+        sql = build_sql_from_ir(ir, dialect=dialect_norm)
         params = list(_build_params_from_plan(ir))
         if params:
             params[-1] = limit_int
@@ -137,7 +147,7 @@ def compile_tasks_sql(spec: TaskQuerySpec) -> CompiledSql:
     raise TaskSqlCompileError(f"unsupported intent for tasks SQL compile: {intent}")
 
 
-def compile_tasks_sql_v2(spec: TaskQuerySpec) -> CompiledSql:
+def compile_tasks_sql_v2(spec: TaskQuerySpec, *, dialect: Optional[str] = None) -> CompiledSql:
     """
     Multi-table-ready compiler entry point.
 
@@ -156,4 +166,4 @@ def compile_tasks_sql_v2(spec: TaskQuerySpec) -> CompiledSql:
     """
     # For now, delegate to the v1 single-table implementation to avoid any
     # behavioral changes.
-    return compile_tasks_sql(spec)
+    return compile_tasks_sql(spec, dialect=dialect)

@@ -6,6 +6,7 @@ from datetime import datetime, timezone, timedelta
 from enum import Enum
 import json
 import logging
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -110,10 +111,21 @@ table {history_relation} (
 
 TEXT2SQL_SCHEMA = _build_text2sql_schema(_TASKS_SCHEMA.latest_relation, _TASKS_SCHEMA.history_relation)
 
-TEXT2SQL_SYSTEM_PROMPT = (
+TEXT2SQL_SYSTEM_PROMPT_SQLITE = (
     "You are a precise Text-to-SQL assistant for a SQLite database that tracks task status updates. "
     "You must only emit read-only SELECT statements that reference the task_latest or tasks tables described in the schema. "
     "Never produce DML/DDL (INSERT/UPDATE/DELETE/ALTER/etc.), and always include a LIMIT of at most 100 rows. "
+    "When the question explicitly says \"executor\"/\"执行\"/\"执行人\", filter by the `person` column. "
+    "When it says \"owner\"/\"发起人\"/\"负责人\" (or similar), filter by the `owner` column. "
+    "Return only JSON with the structure {\"queries\":[{\"sql\":\"...\",\"description\":\"...\"}]}. "
+    "If the request needs multiple SQL statements, include up to two queries in the JSON array."
+)
+
+TEXT2SQL_SYSTEM_PROMPT_MSSQL = (
+    "You are a precise Text-to-SQL assistant for a SQL Server (T-SQL) database that tracks task status updates. "
+    "You must only emit read-only SELECT statements that reference the task_latest or tasks tables described in the schema. "
+    "Never produce DML/DDL (INSERT/UPDATE/DELETE/ALTER/etc.), and always include TOP (N) with N <= 100. "
+    "Do not use LIMIT; SQL Server requires TOP. "
     "When the question explicitly says \"executor\"/\"执行\"/\"执行人\", filter by the `person` column. "
     "When it says \"owner\"/\"发起人\"/\"负责人\" (or similar), filter by the `owner` column. "
     "Return only JSON with the structure {\"queries\":[{\"sql\":\"...\",\"description\":\"...\"}]}. "
@@ -163,6 +175,26 @@ TEXT2SQL_ANSWER_SYSTEM_PROMPT = (
 )
 
 
+def _resolve_text2sql_dialect() -> str:
+    raw = os.getenv("TASKS_TEXT2SQL_DIALECT") or os.getenv("TASKS_DIALECT")
+    if raw:
+        value = raw.strip().lower()
+        if value:
+            return value
+    backend = os.getenv("TASKS_BACKEND", "sqlite").strip().lower()
+    return "mssql" if backend == "mssql" else "sqlite"
+
+
+def _sqlglot_dialect(dialect: str) -> str:
+    return "tsql" if (dialect or "").strip().lower() == "mssql" else "sqlite"
+
+
+def _text2sql_system_prompt(dialect: str) -> str:
+    if (dialect or "").strip().lower() == "mssql":
+        return TEXT2SQL_SYSTEM_PROMPT_MSSQL
+    return TEXT2SQL_SYSTEM_PROMPT_SQLITE
+
+
 def _resolve_symbolic_time(text: str) -> Optional[int]:
     """Resolve tokens like now-7d, now, start_of_week into epoch millis."""
     t = text.strip().lower()
@@ -189,6 +221,16 @@ def _resolve_symbolic_time(text: str) -> Optional[int]:
             next_month = now.replace(month=now.month + 1, day=1)
         end = next_month - timedelta(seconds=1)
         return int(end.timestamp() * 1000)
+    if t == "next_week":
+        start = now - timedelta(days=now.weekday())
+        next_start = start + timedelta(days=7)
+        return int(next_start.timestamp() * 1000)
+    if t == "next_month":
+        if now.month == 12:
+            next_month = now.replace(year=now.year + 1, month=1, day=1)
+        else:
+            next_month = now.replace(month=now.month + 1, day=1)
+        return int(next_month.timestamp() * 1000)
     m = re.fullmatch(r"now-(\d+)([dwm])", t)
     if m:
         amount = int(m.group(1))
@@ -199,6 +241,17 @@ def _resolve_symbolic_time(text: str) -> Optional[int]:
         elif unit == "m":
             days = amount * 30
         dt = now - timedelta(days=days)
+        return int(dt.timestamp() * 1000)
+    m = re.fullmatch(r"now\+(\d+)([dwm])", t)
+    if m:
+        amount = int(m.group(1))
+        unit = m.group(2)
+        days = amount
+        if unit == "w":
+            days = amount * 7
+        elif unit == "m":
+            days = amount * 30
+        dt = now + timedelta(days=days)
         return int(dt.timestamp() * 1000)
     return None
 
@@ -597,6 +650,16 @@ class TaskQueryEngine:
 
         if mode_raw == "hybrid_llm":
             result = self._answer_via_hybrid_llm(q, topk=topk, thresh=thresh)
+            if nl2sql_attempted and nl2sql_error is not None:
+                result.update(nl2sql_error)
+            return result
+
+        if mode_raw == "text2sql":
+            try:
+                spec = parse_task_query_nl(q)
+            except Exception:
+                spec = None
+            result = self._answer_via_text2sql(q, spec)
             if nl2sql_attempted and nl2sql_error is not None:
                 result.update(nl2sql_error)
             return result
@@ -1381,9 +1444,10 @@ class TaskQueryEngine:
             )
             return base
 
-        prompt = _build_text2sql_prompt(q, spec)
+        dialect = _resolve_text2sql_dialect()
+        prompt = _build_text2sql_prompt(q, spec, dialect=dialect)
         try:
-            llm_result, llm_runtime = _call_text2sql_llm(prompt)
+            llm_result, llm_runtime = _call_text2sql_llm(prompt, dialect=dialect)
         except Text2SQLGenerateError as exc:
             base["error"] = "text2sql_llm_failed"
             base["answer"] = "Failed to generate SQL from the LLM."
@@ -1413,7 +1477,10 @@ class TaskQueryEngine:
         for item in llm_result.queries[:TEXT2SQL_MAX_QUERIES]:
             try:
                 rewritten_sql = _rewrite_text2sql_query(item.sql, hint, question=q)
-                normalized_sql = _normalize_and_validate_text2sql_query(rewritten_sql)
+                normalized_sql = _normalize_and_validate_text2sql_query(
+                    rewritten_sql,
+                    dialect=dialect,
+                )
             except Text2SQLValidationError as exc:
                 base["error"] = "text2sql_invalid_sql"
                 base["answer"] = "Generated SQL failed validation."
@@ -1473,39 +1540,64 @@ class TaskQueryEngine:
         return base
 
 
-def _build_text2sql_prompt(question: str, spec: Optional[TaskQuerySpec]) -> str:
+def _build_text2sql_prompt(
+    question: str, spec: Optional[TaskQuerySpec], *, dialect: str = "sqlite"
+) -> str:
     hint = _make_text2sql_ir_hint(spec)
     hint_json = json.dumps(hint, ensure_ascii=False, indent=2)
-    return (
-        "Generate at most two SQL queries that answer the user's question using the "
-        "SQLite schema below. SQL requirements:\n"
-        "- Only SELECT statements are allowed.\n"
-        "- Target the task_latest or tasks tables (task_latest contains the latest row per person+task).\n"
-        "- Always include an ORDER BY when the user cares about recency.\n"
-        "- ALWAYS include a LIMIT clause (<= 100 rows).\n"
-        "- Do not invent tables or columns.\n"
-        "- Do not use parameters; embed literal values directly in the SQL.\n"
-        "- 当 IR hint 提供了 person/task/project 等字段时，请优先使用 hint 中的值，不要从原始文本中重新猜测人名/项目名。\n"
-        "- If the IR hint lists multiple persons or tasks, use an IN (...) filter instead of re-parsing the question.\n"
-        "- Map IR hint tags to tags LIKE filters; do not treat tag keywords as person/task names.\n"
-        "- Translate time_range/due_range/created_range hints into comparisons on ts/due_ts/created_ts respectively, instead of inventing CURRENT_TIMESTAMP math.\n"
-        "- Do not compare ts with created_ts/due_ts directly; rely on the IR-provided ranges for each column.\n"
-        "- If a time/due/created range hint is missing, either omit that filter or choose an explicit literal (e.g., now-7d); never output placeholders or arbitrary constants.\n"
-        "- Honor hint.limit when present so LIMIT matches the user's request; otherwise keep LIMIT <= 100.\n"
-        "- Do not emit parameter placeholders (?) or MySQL-specific functions such as DATE_SUB/CURDATE; stick to SQLite expressions only.\n"
-        "- Return strictly valid JSON (no comments or explanations outside the JSON block, and ensure all quotes/brackets are balanced).\n"
-        "- If you cannot obtain a literal value for a filter, drop that filter instead of inventing placeholders.\n"
-        "\n"
-        "Return your answer as pure JSON matching this shape (no extra commentary):\n"
-        '{"queries":[{"sql":"SELECT ...","description":"short natural language summary"}]}\n'
-        "\n"
-        "### Database schema\n"
-        f"{TEXT2SQL_SCHEMA.strip()}\n\n"
-        "### Natural language question\n"
-        f"{question}\n\n"
-        "### IR hint (may contain mistakes, but usually helpful)\n"
-        f"{hint_json}\n"
-    )
+    dialect_norm = (dialect or "sqlite").strip().lower()
+    if dialect_norm == "mssql":
+        intro = (
+            "Generate at most two SQL queries that answer the user's question using the "
+            "SQL Server (T-SQL) schema below. SQL requirements:\n"
+        )
+        limit_rule = "- ALWAYS include a TOP (N) clause (N <= 100 rows). Do not use LIMIT.\n"
+        hint_limit_rule = (
+            "- Honor hint.limit when present so TOP matches the user's request; otherwise keep TOP <= 100.\n"
+        )
+        dialect_note = "- Do not use SQLite-only syntax; stick to T-SQL expressions only.\n"
+    else:
+        intro = (
+            "Generate at most two SQL queries that answer the user's question using the "
+            "SQLite schema below. SQL requirements:\n"
+        )
+        limit_rule = "- ALWAYS include a LIMIT clause (<= 100 rows).\n"
+        hint_limit_rule = (
+            "- Honor hint.limit when present so LIMIT matches the user's request; otherwise keep LIMIT <= 100.\n"
+        )
+        dialect_note = "- Do not use non-SQLite syntax; stick to SQLite expressions only.\n"
+
+    parts = [
+        intro,
+        "- Only SELECT statements are allowed.\n",
+        "- Target the task_latest or tasks tables (task_latest contains the latest row per person+task).\n",
+        "- Always include an ORDER BY when the user cares about recency.\n",
+        limit_rule,
+        "- Do not invent tables or columns.\n",
+        "- Do not use parameters; embed literal values directly in the SQL.\n",
+        "- ?IR hint ???person/task/project ?????????? hint ??????????????????/????\n",
+        "- If the IR hint lists multiple persons or tasks, use an IN (...) filter instead of re-parsing the question.\n",
+        "- Map IR hint tags to tags LIKE filters; do not treat tag keywords as person/task names.\n",
+        "- Translate time_range/due_range/created_range hints into comparisons on ts/due_ts/created_ts respectively, instead of inventing CURRENT_TIMESTAMP math.\n",
+        "- Do not compare ts with created_ts/due_ts directly; rely on the IR-provided ranges for each column.\n",
+        "- If a time/due/created range hint is missing, either omit that filter or choose an explicit literal (e.g., now-7d); never output placeholders or arbitrary constants.\n",
+        hint_limit_rule,
+        "- Do not emit parameter placeholders (?) or MySQL-specific functions such as DATE_SUB/CURDATE.\n",
+        dialect_note,
+        "- Return strictly valid JSON (no comments or explanations outside the JSON block, and ensure all quotes/brackets are balanced).\n",
+        "- If you cannot obtain a literal value for a filter, drop that filter instead of inventing placeholders.\n",
+        "\n",
+        "Return your answer as pure JSON matching this shape (no extra commentary):\n",
+        '{"queries":[{"sql":"SELECT ...","description":"short natural language summary"}]}\n',
+        "\n",
+        "### Database schema\n",
+        f"{TEXT2SQL_SCHEMA.strip()}\n\n",
+        "### Natural language question\n",
+        f"{question}\n\n",
+        "### IR hint (may contain mistakes, but usually helpful)\n",
+        f"{hint_json}\n",
+    ]
+    return "".join(parts)
 
 
 def _make_text2sql_ir_hint(spec: Optional[TaskQuerySpec]) -> Dict[str, Any]:
@@ -1538,15 +1630,18 @@ def _make_text2sql_ir_hint(spec: Optional[TaskQuerySpec]) -> Dict[str, Any]:
     return hint
 
 
-def _call_text2sql_llm(prompt: str) -> Tuple[Text2SQLResponseModel, Dict[str, str]]:
+def _call_text2sql_llm(
+    prompt: str, *, dialect: str = "sqlite"
+) -> Tuple[Text2SQLResponseModel, Dict[str, str]]:
     if not llm_settings.enabled or llm_settings.provider == "dummy":
         raise Text2SQLGenerateError("LLM provider is not configured")
 
+    system_prompt = _text2sql_system_prompt(dialect)
     runtime = _resolve_text2sql_settings()
     provider = runtime["provider"]
     if provider == "ollama":
         response = _call_text2sql_via_ollama(
-            prompt, runtime["model"], runtime["base_url"]
+            prompt, runtime["model"], runtime["base_url"], system_prompt
         )
         return response, runtime
     if provider in {"openai", "dashscope"}:
@@ -1555,6 +1650,7 @@ def _call_text2sql_llm(prompt: str) -> Tuple[Text2SQLResponseModel, Dict[str, st
             runtime["model"],
             runtime["base_url"],
             runtime["api_key"],
+            system_prompt,
         )
         return response, runtime
 
@@ -1598,14 +1694,14 @@ def _resolve_text2sql_settings() -> Dict[str, str]:
     }
 
 def _call_text2sql_via_ollama(
-    prompt: str, model: str, base_url: str
+    prompt: str, model: str, base_url: str, system_prompt: str
 ) -> Text2SQLResponseModel:
     """Call Ollama's /api/chat endpoint for Text2SQL."""
 
     payload: Dict[str, Any] = {
         "model": model,
         "messages": [
-            {"role": "system", "content": TEXT2SQL_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ],
         "stream": False,
@@ -1664,7 +1760,7 @@ def _call_text2sql_via_ollama(
 
 
 def _call_text2sql_via_openai(
-    prompt: str, model: str, base_url: str, api_key: str
+    prompt: str, model: str, base_url: str, api_key: str, system_prompt: str
 ) -> Text2SQLResponseModel:
     """Call an OpenAI-compatible chat completion API for Text2SQL."""
 
@@ -1674,7 +1770,7 @@ def _call_text2sql_via_openai(
     payload: Dict[str, Any] = {
         "model": model,
         "messages": [
-            {"role": "system", "content": TEXT2SQL_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.0,
@@ -1901,6 +1997,98 @@ def _format_range_literal(value: Optional[Any]) -> Optional[str]:
         return text
     escaped = text.replace("'", "''")
     return f"'{escaped}'"
+
+
+def _replace_symbolic_time_literals(sql: str) -> str:
+    if not sql:
+        return sql
+
+    def _resolve_literal(token: str) -> Optional[int]:
+        return _resolve_symbolic_time(token)
+
+    quoted_pattern = re.compile(
+        r"\b(ts|created_ts|due_ts)\s*(>=|<=|=)\s*'([^']+)'",
+        re.IGNORECASE,
+    )
+
+    def _quoted_repl(match: re.Match) -> str:
+        column = match.group(1)
+        op = match.group(2)
+        token = match.group(3).strip().lower()
+        resolved = _resolve_literal(token)
+        if resolved is None:
+            return match.group(0)
+        return f"{column} {op} {int(resolved)}"
+
+    sql = quoted_pattern.sub(_quoted_repl, sql)
+
+    bare_pattern = re.compile(
+        r"\b(ts|created_ts|due_ts)\s*(>=|<=|=)\s*(now(?:[+-]\d+[dwm])?|start_of_week|end_of_week|start_of_month|end_of_month|next_week|next_month)\b",
+        re.IGNORECASE,
+    )
+
+    def _bare_repl(match: re.Match) -> str:
+        column = match.group(1)
+        op = match.group(2)
+        token = match.group(3).strip().lower()
+        resolved = _resolve_literal(token)
+        if resolved is None:
+            return match.group(0)
+        return f"{column} {op} {int(resolved)}"
+
+    return bare_pattern.sub(_bare_repl, sql)
+
+
+def _replace_tsql_datetime_math(sql: str) -> str:
+    """Replace common T-SQL datetime expressions with epoch-millis literals."""
+    if not sql:
+        return sql
+    now = datetime.now(timezone.utc)
+    now_ms = int(now.timestamp() * 1000)
+
+    def _days_ms(days: int) -> int:
+        return int((now + timedelta(days=days)).timestamp() * 1000)
+
+    patterns = [
+        (re.compile(r"CAST\(\s*GETUTCDATE\(\)\s*AS\s*BIGINT\s*\)\s*\*\s*1000", re.IGNORECASE), now_ms),
+        (re.compile(r"CAST\(\s*GETDATE\(\)\s*AS\s*BIGINT\s*\)\s*\*\s*1000", re.IGNORECASE), now_ms),
+        (
+            re.compile(
+                r"CAST\(\s*DATEDIFF\(\s*SECOND\s*,\s*CAST\('1970-01-01'\s+AS\s+DATETIME2\)\s*,\s*CAST\(GETUTCDATE\(\)\s+AS\s+DATETIME2\)\s*\)\s*AS\s*BIGINT\s*\)\s*\*\s*1000",
+                re.IGNORECASE,
+            ),
+            now_ms,
+        ),
+        (
+            re.compile(
+                r"CAST\(\s*DATEDIFF\(\s*SECOND\s*,\s*CAST\('1970-01-01'\s+AS\s+DATETIME2\)\s*,\s*CAST\(GETDATE\(\)\s+AS\s+DATETIME2\)\s*\)\s*AS\s*BIGINT\s*\)\s*\*\s*1000",
+                re.IGNORECASE,
+            ),
+            now_ms,
+        ),
+    ]
+
+    def _dateadd_repl(match: re.Match) -> str:
+        days = int(match.group(1))
+        return str(_days_ms(days))
+
+    dateadd_patterns = [
+        re.compile(
+            r"CAST\(\s*DATEADD\(\s*DAY\s*,\s*([+-]?\d+)\s*,\s*GETUTCDATE\(\)\s*\)\s*AS\s*BIGINT\s*\)\s*\*\s*1000",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"CAST\(\s*DATEADD\(\s*DAY\s*,\s*([+-]?\d+)\s*,\s*GETDATE\(\)\s*\)\s*AS\s*BIGINT\s*\)\s*\*\s*1000",
+            re.IGNORECASE,
+        ),
+    ]
+
+    updated = sql
+    for pattern, value in patterns:
+        updated = pattern.sub(str(value), updated)
+    for pattern in dateadd_patterns:
+        updated = pattern.sub(_dateadd_repl, updated)
+    return updated
 
 
 def _build_range_clause(column: str, start_literal: Optional[str], end_literal: Optional[str]) -> str:
@@ -2376,11 +2564,15 @@ def _normalize_and_validate_text2sql_query(sql: str, *, dialect: str = "sqlite")
     if not sql or not sql.strip():
         raise Text2SQLValidationError("SQL query is empty.")
     normalized = sql.strip().rstrip(";").strip()
-    ast = _parse_sql_expression(normalized, dialect=dialect)
+    normalized = _replace_symbolic_time_literals(normalized)
+    normalized = _replace_tsql_datetime_math(normalized)
+    dialect_norm = (dialect or "sqlite").strip().lower()
+    sqlglot_dialect = _sqlglot_dialect(dialect_norm)
+    ast = _parse_sql_expression(normalized, dialect=sqlglot_dialect)
     _validate_allowed_tables(ast)
     target = _validate_select_expression(ast)
     _ensure_limit_ast(target, max_rows=100)
-    normalized = ast.sql(dialect="sqlite")
+    normalized = ast.sql(dialect=sqlglot_dialect)
     lowered = normalized.lower()
     if "?" in normalized:
         raise Text2SQLValidationError("Parameter placeholders are not allowed.")

@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+from app.config_loader import load_app_config
+
+# Load env-file config as early as possible so import-time settings (e.g. app.config.llm_settings)
+# see the intended values.
+load_app_config()
+
 from datetime import datetime, timezone
 import os
 from os import getenv
@@ -64,6 +70,27 @@ tasks_backend = getenv("TASKS_BACKEND", "sqlite").lower()
 TASKS: TasksStore
 if tasks_backend == "sqlite":
     TASKS = SQLiteTasksStore(SQLiteTasksConfig(db_path=getenv("TASKS_DB", "data/tasks.db")))
+elif tasks_backend == "mssql":
+    try:
+        from app.tasks_store.mssql_store import MSSQLTasksStore, MSSQLTasksConfig
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError(
+            "MSSQL backend requested but pyodbc is unavailable. Install pyodbc and the SQL Server ODBC driver."
+        ) from exc
+    TASKS = MSSQLTasksStore(
+        MSSQLTasksConfig(
+            server=getenv("TASKS_MSSQL_SERVER", "127.0.0.1,1433"),
+            database=getenv("TASKS_MSSQL_DATABASE", "fact_tasks"),
+            user=getenv("TASKS_MSSQL_USER", "sa"),
+            password=getenv("TASKS_MSSQL_PASSWORD", ""),
+            driver=getenv("TASKS_MSSQL_DRIVER", "ODBC Driver 18 for SQL Server"),
+            encrypt=(getenv("TASKS_MSSQL_ENCRYPT", "yes").lower() != "no"),
+            trust_server_certificate=(
+                getenv("TASKS_MSSQL_TRUST_CERT", "yes").lower() != "no"
+            ),
+            timeout_sec=float(getenv("TASKS_MSSQL_TIMEOUT_SEC", "5")),
+        )
+    )
 else:
     # Placeholder for future backends (e.g., KG). Keep API stable.
     TASKS = SQLiteTasksStore(SQLiteTasksConfig(db_path=getenv("TASKS_DB", "data/tasks.db")))
