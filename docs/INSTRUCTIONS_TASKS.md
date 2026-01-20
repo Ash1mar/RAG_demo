@@ -1,12 +1,12 @@
-# Task Status Q&A (Step 2) – Design Notes
+# Task Status Q&A (Step 2) - Design Notes
 
-This document explains how the “task status Q&A” subsystem works: the `/tasks/ask` endpoint, the NL→JSON IR (`TaskQuerySpec`), the KG-lite semantic dictionary, the SQL compiler, and the optional Text2SQL branch. Use it together with `docs/START_AND_TEST.md` for end‑to‑end setup instructions.
+This document explains how the "task status Q&A" subsystem works: the `/tasks/ask` endpoint, the NL->JSON IR (`TaskQuerySpec`), the KG-lite semantic dictionary, the SQL compiler, and the optional Text2SQL branch. Use it together with `docs/START_AND_TEST.md` for end-to-end setup instructions.
 
 ---
 
 ## 1. Scope & Endpoints
 
-The subsystem answers questions like “Has Zhang San finished task X?”, “List Zhang San’s TODO tasks this week”, “How many tasks are still not done?”, or “Give me a status summary for Zhang San and Li Si.”
+The subsystem answers questions like "Has Zhang San finished task X?", "List Zhang San's TODO tasks this week", "How many tasks are still not done?", or "Give me a status summary for Zhang San and Li Si."
 
 Endpoints:
 
@@ -15,18 +15,29 @@ Endpoints:
   - Controlled by `RESOLVER` (rules / embeddings / hybrid / hybrid_plus_rules / hybrid_llm / text2sql).
 
 - `GET /db/ask?q=...`
-  - NL→JSON→SQL experiment endpoint over the `tasks`/`task_latest` tables.
+  - NL->JSON->SQL experiment endpoint over the `tasks`/`task_latest` tables.
   - Returns `query`, `ir`, `sql`, `params`, `rows` only (no natural-language answer).
+
+---
+
+## 1.1 Configuration Quick Note
+
+- Optional centralized env file: `config/app.env` (loaded at startup).
+- Override via `APP_CONFIG=path/to/your.env`.
+- Tasks backend/dialect:
+  - `TASKS_BACKEND=sqlite|mssql`
+  - `TASKS_DIALECT=sqlite|mssql` (IR->SQL compiler)
+  - `TASKS_TEXT2SQL_DIALECT=sqlite|mssql` (Text2SQL prompt/validation override)
 
 ---
 
 ## 2. Resolver Modes (`RESOLVER`)
 
 - `rules`: keyword and string matching; baseline for exact names.
-- `embeddings`: embedding-only “Focus Query” resolver (matrix scoring).
+- `embeddings`: embedding-only "Focus Query" resolver (matrix scoring).
 - `hybrid`: embeddings + keyword heuristics for better robustness.
 - `hybrid_plus_rules`: `hybrid` plus additional rule assists for gating.
-- `hybrid_llm`: LLM NL→JSON (`TaskQuerySpec`) + small model candidate alignment + unified SQL compiler.
+- `hybrid_llm`: LLM NL->JSON (`TaskQuerySpec`) + small model candidate alignment + unified SQL compiler.
 - `text2sql`: LLM-generated SQL under AST validation (can also be triggered from `hybrid_llm` when complex analytics are needed).
 
 `RESOLVER` is set via environment variable; change it and restart the API (or call `/tasks/reload`) to switch modes.
@@ -35,7 +46,7 @@ Endpoints:
 
 ## 3. Tasks Table Schema
 
-`data/tasks.db` contains two logical views over the same schema:
+The tasks backend exposes two logical views over the same schema (`tasks` and `task_latest`), regardless of SQLite or SQL Server:
 
 ```sql
 CREATE TABLE tasks (
@@ -43,7 +54,7 @@ CREATE TABLE tasks (
   person      TEXT NOT NULL,
   task        TEXT NOT NULL,
   status      TEXT NOT NULL,        -- DONE / TODO / IN_PROGRESS / BLOCKED
-  ts          INTEGER NOT NULL,     -- epoch millis (“status time”)
+  ts          INTEGER NOT NULL,     -- epoch millis ("status time")
   project     TEXT,
   tags        TEXT,                 -- comma-separated strings
   priority    INTEGER,              -- 1 = highest
@@ -54,14 +65,16 @@ CREATE TABLE tasks (
 );
 ```
 
-- `task_latest`: latest row per `(person, task)` (used for “current status / list” queries).
+- `task_latest`: latest row per `(person, task)` (used for "current status / list" queries).
 - `tasks`: full history (used for `task_history`, summaries, completion times).
 
-The SQL compiler only emits read-only `SELECT` statements referencing these tables and always enforces a `LIMIT`.
+Use compatibility views (`tasks`, `task_latest`) with the same logical columns when switching to SQL Server; set `TASKS_DIALECT=mssql` so the compiler emits T-SQL (`TOP`).
+
+The SQL compiler only emits read-only `SELECT` statements referencing these tables and always enforces a row cap (SQLite uses `LIMIT`, SQL Server uses `TOP`).
 
 ---
 
-## 4. NL→JSON IR: `TaskQuerySpec`
+## 4. NL->JSON IR: `TaskQuerySpec`
 
 Located in `app/services/nl2sql_engine.py`, this Pydantic model captures the semantics of each task query.
 
@@ -72,11 +85,11 @@ Key fields:
 - `answer_mode: TaskAnswerMode`
   - `default`, `completion_time_latest`, `task_count_by_status`, `person_summary_by_project`, `overdue_count_by_person`.
 - Entities: `person`, `task`, `task_keywords`, `project`, `tags`, `priority`.
-- Status list: `status: List[TaskStatus]` (can be empty → “no restriction”).
+- Status list: `status: List[TaskStatus]` (can be empty -> "no restriction").
 - Time windows: `time_range`, `due_range`, `created_range` (`TimeRange` models storing `start`/`end` tokens such as `now-7d`, `start_of_week`, ISO timestamps, etc.).
 - Safety knobs: `order_by`, `limit`, `filters`, `extra` (for heuristics, KG flags, parse details).
 
-### NL→IR flow
+### NL->IR flow
 
 `parse_task_query_nl(q)` proceeds as follows:
 
@@ -92,17 +105,17 @@ Key fields:
 
 ## 5. KG-lite: persons/projects/categories/status/priority dictionary
 
-Rather than scattering alias mappings and category→tag expansions across Python code or prompts, we use a lightweight KG-lite layer.
+Rather than scattering alias mappings and category->tag expansions across Python code or prompts, we use a lightweight KG-lite layer.
 
 - **Location**
   - Code: `app/services/kg_lite.py`
   - Data: `data/kg_data.json`
 
 - **Schema**
-  - `persons`: canonical names + aliases (e.g. `"张工"` / `"老张"` → `"张三"`).
-  - `projects`: canonical project/system names + aliases (e.g. `"芯片平台"` → `"芯片"`).
+  - `persons`: canonical names + aliases (e.g. `"张工"` / `"老张"` -> `"张三"`).
+  - `projects`: canonical project/system names + aliases (e.g. `"芯片平台"` -> `"芯片"`).
   - `categories`: `{name, aliases, tags}` entries (e.g. `"安全专项"` / `"安监专项"` map to `"安监整改"` with tags `["整改","安全整改"]`).
-  - `statuses`: canonical TaskStatus names (`DONE/TODO/IN_PROGRESS/BLOCKED`) and synonyms (“完成/搞定/已完成”等).
+  - `statuses`: canonical TaskStatus names (`DONE/TODO/IN_PROGRESS/BLOCKED`) and synonyms ("完成/搞定/已完成"等).
   - `priorities`: canonical integers (`1/2/3`) plus synonyms (`P1`, `高优`, `最高优先级` 等).
 
 - **Backend abstraction**
@@ -117,14 +130,15 @@ Rather than scattering alias mappings and category→tag expansions across Pytho
     - `get_debug_snapshot()`
 
 - **Integration points**
-  - NL→JSON (`parse_task_query_nl` → `_post_process_intent`):
+  - NL->JSON (`parse_task_query_nl` -> `_post_process_intent`):
     - normalize person/project/tags and record `kg_person_source` / `kg_project_source` / `kg_category_source` when they change;
     - normalize `spec.status` by mapping strings or enums to canonical `TaskStatus` values;
-    - normalize `spec.priority` (e.g. `P1` / “高优” → `1`);
+    - normalize `spec.priority` (e.g. `P1` / "高优" -> `1`);
     - set `spec.extra["kg_enabled"] = True` when any change occurs.
   - Text2SQL:
     - `task_query._make_text2sql_ir_hint(spec)` includes canonical person/project/tags/status/priority in the IR hint used in the prompt;
-    - `_rewrite_text2sql_query(sql, hint)` uses those hints to rewrite SQL literals (`person = '张工'` → `'张三'`, `priority = '高优'` → `1`) and to inject missing `tags LIKE '%整改%'` filters.
+    - `_rewrite_text2sql_query(sql, hint)` uses those hints to rewrite SQL literals (`person = '张工'` -> `'张三'`, `priority = '高优'` -> `1`) and to inject missing `tags LIKE '%整改%'` filters.
+    - Rewrite symbolic time literals (e.g. `now+7d`, `next_week`) and common T-SQL datetime math into epoch-ms constants.
 
 - **Debugging KG-lite**
   - `/tasks/ask` includes `kg_enabled` at the top level when KG-lite intervenes.
@@ -160,7 +174,7 @@ Typical payload includes:
 
 ### `/db/ask`
 
-Always returns a structured snapshot of the NL→IR→SQL pipeline:
+Always returns a structured snapshot of the NL->IR->SQL pipeline:
 
 ```json
 {
@@ -180,12 +194,12 @@ If SQL compilation fails, `/db/ask` returns 4xx with `detail.error` and `detail.
 
 Located in `app/services/task_query.py` (`_answer_via_text2sql`):
 
-1. Build the Text2SQL prompt with schema + IR hint (now including KG-normalized person/project/tags/status/priority).
+1. Build the Text2SQL prompt with schema + IR hint, selecting SQLite or T-SQL rules via `TASKS_TEXT2SQL_DIALECT`/`TASKS_DIALECT`.
 2. Call the configured LLM (e.g. `qwen3-coder:480b-cloud`) to obtain JSON `{ "queries": [{ "sql": "...", "description": "..." }, ...] }`.
 3. For each SQL:
    - `_rewrite_text2sql_query` aligns time windows, tag filters, person/project literals, priority hints, etc.
-   - `_normalize_and_validate_text2sql_query` (sqlglot) enforces read-only `SELECT`, allowed tables (`task_latest`/`tasks`), `LIMIT <= 100`, safe functions, no placeholders.
-   - Execute via `TasksStore.query` (no bind parameters; literals are already baked in).
+   - `_normalize_and_validate_text2sql_query` (sqlglot) enforces read-only `SELECT`, allowed tables (`task_latest`/`tasks`), and a hard row cap (SQLite `LIMIT`, SQL Server `TOP`).
+   - Execute via `TasksStore.query` (SQLite or SQL Server backend).
 4. Optionally call `_generate_text2sql_answer` (LLM summarization) or `_summarize_text2sql_rows` for a lightweight summary.
 5. Report errors (`text2sql_invalid_sql`, `text2sql_db_query_failed`, etc.) with detailed `reason` and raw LLM output when something fails.
 
@@ -204,4 +218,4 @@ Located in `app/services/task_query.py` (`_answer_via_text2sql`):
     2. Review/merge canonical names into `data/kg_data.json` (add aliases/tags manually or via additional tooling).
     3. For query alias gathering, future scripts can analyze query logs to propose new aliases for approval.
 
-Use these tools to keep the NL→IR→SQL pipeline stable as you add more real data and complex queries.
+Use these tools to keep the NL->IR->SQL pipeline stable as you add more real data and complex queries.
