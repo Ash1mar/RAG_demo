@@ -100,7 +100,24 @@ class MSSQLTasksStore(TasksStore):
             latest_relation=latest,
             history_relation=history,
             allowed_relations=allowed_norm,
+            field_map=base.field_map,
         )
+
+    def _col(self, logical: str) -> str:
+        return self._schema.translate_field(logical)
+
+    def _pick_row_key(self, row: Dict[str, Any], logical: str) -> Optional[str]:
+        if logical in row:
+            return logical
+        physical = self._col(logical)
+        if physical in row:
+            return physical
+        key_map = {str(k).lower(): k for k in row.keys()}
+        logical_key = str(logical).lower()
+        if logical_key in key_map:
+            return key_map[logical_key]
+        physical_key = str(physical).lower()
+        return key_map.get(physical_key)
 
     def _latest_table(self) -> str:
         if self._has_table_or_view(self._schema.latest_relation):
@@ -119,21 +136,25 @@ class MSSQLTasksStore(TasksStore):
         return [dict(zip(columns, row)) for row in cur.fetchall()]
 
     def _row_to_dict(self, row: Dict[str, Any]) -> Dict[str, Any]:
-        keys = set(row.keys())
         base: Dict[str, Any] = {}
-        if "id" in keys:
-            base["id"] = int(row["id"]) if row["id"] is not None else None
-        if "person" in keys:
-            base["person"] = row["person"]
-        if "task" in keys:
-            base["task"] = row["task"]
-        if "status" in keys:
-            base["status"] = row["status"]
-        if "ts" in keys:
+        id_key = self._pick_row_key(row, "id")
+        if id_key is not None:
+            base["id"] = int(row[id_key]) if row[id_key] is not None else None
+        person_key = self._pick_row_key(row, "person")
+        if person_key is not None:
+            base["person"] = row[person_key]
+        task_key = self._pick_row_key(row, "task")
+        if task_key is not None:
+            base["task"] = row[task_key]
+        status_key = self._pick_row_key(row, "status")
+        if status_key is not None:
+            base["status"] = row[status_key]
+        ts_key = self._pick_row_key(row, "ts")
+        if ts_key is not None:
             try:
-                base["ts"] = int(row["ts"]) if row["ts"] is not None else None
+                base["ts"] = int(row[ts_key]) if row[ts_key] is not None else None
             except (TypeError, ValueError):
-                base["ts"] = row["ts"]
+                base["ts"] = row[ts_key]
         for field in (
             "project",
             "tags",
@@ -145,8 +166,9 @@ class MSSQLTasksStore(TasksStore):
             "description",
             "person_id",
         ):
-            if field in keys:
-                base[field] = row[field]
+            key = self._pick_row_key(row, field)
+            if key is not None:
+                base[field] = row[key]
         return base
 
     def ready(self) -> bool:
@@ -160,9 +182,13 @@ class MSSQLTasksStore(TasksStore):
 
     def get_latest_status(self, person: str, task: str) -> Optional[Dict[str, Any]]:
         table = self._latest_table()
+        person_col = self._col("person")
+        task_col = self._col("task")
+        ts_col = self._col("ts")
+        id_col = self._col("id")
         sql = (
-            f"SELECT * FROM {table} WHERE person = ? AND task = ? "
-            "ORDER BY ts DESC, id DESC OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY"
+            f"SELECT * FROM {table} WHERE {person_col} = ? AND {task_col} = ? "
+            f"ORDER BY {ts_col} DESC, {id_col} DESC OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY"
         )
         rows = self._exec_select(sql, (person, task))
         if not rows:
@@ -177,17 +203,21 @@ class MSSQLTasksStore(TasksStore):
         limit: int = 10,
     ) -> List[Dict[str, Any]]:
         table = self._latest_table()
+        person_col = self._col("person")
+        task_col = self._col("task")
+        ts_col = self._col("ts")
+        id_col = self._col("id")
         clauses: List[str] = []
         params: List[Any] = []
         if person:
-            clauses.append("person = ?")
+            clauses.append(f"{person_col} = ?")
             params.append(person)
         if task:
-            clauses.append("task = ?")
+            clauses.append(f"{task_col} = ?")
             params.append(task)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         sql = (
-            f"SELECT * FROM {table}{where} ORDER BY ts DESC, id DESC "
+            f"SELECT * FROM {table}{where} ORDER BY {ts_col} DESC, {id_col} DESC "
             "OFFSET 0 ROWS FETCH NEXT ? ROWS ONLY"
         )
         params.append(int(limit))
@@ -196,13 +226,15 @@ class MSSQLTasksStore(TasksStore):
 
     def list_persons(self) -> List[str]:
         table = self._latest_table()
-        rows = self._exec_select(f"SELECT DISTINCT person FROM {table}", ())
-        return [str(r["person"]) for r in rows if r.get("person") is not None]
+        col = self._col("person")
+        rows = self._exec_select(f"SELECT DISTINCT {col} AS person FROM {table}", ())
+        return [str(r.get("person")) for r in rows if r.get("person") is not None]
 
     def list_tasks(self) -> List[str]:
         table = self._latest_table()
-        rows = self._exec_select(f"SELECT DISTINCT task FROM {table}", ())
-        return [str(r["task"]) for r in rows if r.get("task") is not None]
+        col = self._col("task")
+        rows = self._exec_select(f"SELECT DISTINCT {col} AS task FROM {table}", ())
+        return [str(r.get("task")) for r in rows if r.get("task") is not None]
 
     def query(self, sql: str, params: Tuple[Any, ...]) -> List[Dict[str, Any]]:
         s = (sql or "").strip().lower()

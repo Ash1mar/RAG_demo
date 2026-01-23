@@ -21,11 +21,11 @@ from app.services.embeddings import Embedder
 from app.services.hybrid import merge_scores
 from app.services.keyword import KeywordIndex
 from app.vector_store.faiss_store import FaissVectorStore
+from app.app_factory import create_task_query_engine, create_tasks_store
 from app.services.task_query import TaskQueryEngine
 from app.services.nl2sql_engine import parse_task_query_nl, build_task_query_plan
 from app.services.sql_compiler import compile_tasks_sql, TaskSqlCompileError
 from app.tasks_store.base import TasksStore
-from app.tasks_store.sqlite_store import SQLiteTasksStore, SQLiteTasksConfig
 
 
 app = FastAPI(title="Minimal RAG Demo", version="0.1.0")
@@ -66,38 +66,19 @@ else:
 KW_INDEX = KeywordIndex()
 
 # ---- Tasks store (read-only) ----
-tasks_backend = getenv("TASKS_BACKEND", "sqlite").lower()
+tasks_backend: str
+resolver_mode: str
 TASKS: TasksStore
-if tasks_backend == "sqlite":
-    TASKS = SQLiteTasksStore(SQLiteTasksConfig(db_path=getenv("TASKS_DB", "data/tasks.db")))
-elif tasks_backend == "mssql":
-    try:
-        from app.tasks_store.mssql_store import MSSQLTasksStore, MSSQLTasksConfig
-    except Exception as exc:  # pragma: no cover - optional dependency
-        raise RuntimeError(
-            "MSSQL backend requested but pyodbc is unavailable. Install pyodbc and the SQL Server ODBC driver."
-        ) from exc
-    TASKS = MSSQLTasksStore(
-        MSSQLTasksConfig(
-            server=getenv("TASKS_MSSQL_SERVER", "127.0.0.1,1433"),
-            database=getenv("TASKS_MSSQL_DATABASE", "fact_tasks"),
-            user=getenv("TASKS_MSSQL_USER", "sa"),
-            password=getenv("TASKS_MSSQL_PASSWORD", ""),
-            driver=getenv("TASKS_MSSQL_DRIVER", "ODBC Driver 18 for SQL Server"),
-            encrypt=(getenv("TASKS_MSSQL_ENCRYPT", "yes").lower() != "no"),
-            trust_server_certificate=(
-                getenv("TASKS_MSSQL_TRUST_CERT", "yes").lower() != "no"
-            ),
-            timeout_sec=float(getenv("TASKS_MSSQL_TIMEOUT_SEC", "5")),
-        )
-    )
-else:
-    # Placeholder for future backends (e.g., KG). Keep API stable.
-    TASKS = SQLiteTasksStore(SQLiteTasksConfig(db_path=getenv("TASKS_DB", "data/tasks.db")))
+TQ_ENGINE: TaskQueryEngine
 
-# Non-LLM task status query engine
-resolver_mode = getenv("RESOLVER", "hybrid").lower()  # rules | embeddings | hybrid
-TQ_ENGINE = TaskQueryEngine(tasks_store=TASKS, embedder=EMBEDDER, resolver_mode=resolver_mode)
+
+def _init_tasks_runtime() -> None:
+    global tasks_backend, resolver_mode, TASKS, TQ_ENGINE
+    tasks_backend, TASKS = create_tasks_store()
+    resolver_mode, TQ_ENGINE = create_task_query_engine(TASKS, EMBEDDER)
+
+
+_init_tasks_runtime()
 
 
 # ---- Schemas ----
@@ -282,6 +263,7 @@ def db_ask(q: str = Query(..., description="Natural language task query for dire
 @app.post("/tasks/reload")
 def tasks_reload() -> Dict[str, Any]:
     """�ؽ�ʵ����������������ݿ����¼��غ�ѡ��"""
+    _init_tasks_runtime()
     return {"reloaded": True, **TQ_ENGINE.reload()}
 
 

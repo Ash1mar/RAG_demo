@@ -66,7 +66,25 @@ class SQLiteTasksStore(TasksStore):
             latest_relation=latest,
             history_relation=history,
             allowed_relations=allowed_norm,
+            field_map=base.field_map,
         )
+
+    def _col(self, logical: str) -> str:
+        return self._schema.translate_field(logical)
+
+    def _pick_row_key(self, row: sqlite3.Row, logical: str) -> Optional[str]:
+        keys = row.keys()
+        if logical in keys:
+            return logical
+        physical = self._col(logical)
+        if physical in keys:
+            return physical
+        key_map = {str(k).lower(): k for k in keys}
+        logical_key = str(logical).lower()
+        if logical_key in key_map:
+            return key_map[logical_key]
+        physical_key = str(physical).lower()
+        return key_map.get(physical_key)
 
     def _latest_table(self) -> str:
         # Prefer configured latest relation when present; fallback to the legacy names.
@@ -103,9 +121,13 @@ class SQLiteTasksStore(TasksStore):
     def get_latest_status(self, person: str, task: str) -> Optional[Dict[str, Any]]:
         conn = self._connect_ro()
         table = self._latest_table()
+        person_col = self._col("person")
+        task_col = self._col("task")
+        ts_col = self._col("ts")
+        id_col = self._col("id")
         sql = (
-            f"SELECT * FROM {table} WHERE person = ? AND task = ? "
-            "ORDER BY ts DESC, id DESC LIMIT 1"
+            f"SELECT * FROM {table} WHERE {person_col} = ? AND {task_col} = ? "
+            f"ORDER BY {ts_col} DESC, {id_col} DESC LIMIT 1"
         )
         row = conn.execute(sql, (person, task)).fetchone()
         if not row:
@@ -121,16 +143,20 @@ class SQLiteTasksStore(TasksStore):
     ) -> List[Dict[str, Any]]:
         conn = self._connect_ro()
         table = self._latest_table()
+        person_col = self._col("person")
+        task_col = self._col("task")
+        ts_col = self._col("ts")
+        id_col = self._col("id")
         clauses: List[str] = []
         params: List[Any] = []
         if person:
-            clauses.append("person = ?")
+            clauses.append(f"{person_col} = ?")
             params.append(person)
         if task:
-            clauses.append("task = ?")
+            clauses.append(f"{task_col} = ?")
             params.append(task)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-        sql = f"SELECT * FROM {table}{where} ORDER BY ts DESC, id DESC LIMIT ?"
+        sql = f"SELECT * FROM {table}{where} ORDER BY {ts_col} DESC, {id_col} DESC LIMIT ?"
         params.append(int(limit))
         rows = conn.execute(sql, params).fetchall()
         return [self._row_to_dict(r) for r in rows]
@@ -138,13 +164,15 @@ class SQLiteTasksStore(TasksStore):
     def list_persons(self) -> List[str]:
         conn = self._connect_ro()
         table = self._latest_table()
-        rows = conn.execute(f"SELECT DISTINCT person FROM {table}").fetchall()
+        col = self._col("person")
+        rows = conn.execute(f"SELECT DISTINCT {col} FROM {table}").fetchall()
         return [str(r[0]) for r in rows]
 
     def list_tasks(self) -> List[str]:
         conn = self._connect_ro()
         table = self._latest_table()
-        rows = conn.execute(f"SELECT DISTINCT task FROM {table}").fetchall()
+        col = self._col("task")
+        rows = conn.execute(f"SELECT DISTINCT {col} FROM {table}").fetchall()
         return [str(r[0]) for r in rows]
 
     # --- generic read‑only query helper for NL→SQL ---
@@ -169,20 +197,27 @@ class SQLiteTasksStore(TasksStore):
     # --- internal mapping ---
     def _row_to_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
         """Normalize SQLite row to a dict with optional extended fields."""
-        keys = set(row.keys())
         base: Dict[str, Any] = {}
-        base["id"] = int(row["id"]) if "id" in keys and row["id"] is not None else None
-        if "person" in keys:
-            base["person"] = row["person"]
-        if "task" in keys:
-            base["task"] = row["task"]
-        if "status" in keys:
-            base["status"] = row["status"]
-        if "ts" in keys:
+        id_key = self._pick_row_key(row, "id")
+        if id_key is None:
+            base["id"] = None
+        else:
+            base["id"] = int(row[id_key]) if row[id_key] is not None else None
+        person_key = self._pick_row_key(row, "person")
+        if person_key is not None:
+            base["person"] = row[person_key]
+        task_key = self._pick_row_key(row, "task")
+        if task_key is not None:
+            base["task"] = row[task_key]
+        status_key = self._pick_row_key(row, "status")
+        if status_key is not None:
+            base["status"] = row[status_key]
+        ts_key = self._pick_row_key(row, "ts")
+        if ts_key is not None:
             try:
-                base["ts"] = int(row["ts"]) if row["ts"] is not None else None
+                base["ts"] = int(row[ts_key]) if row[ts_key] is not None else None
             except (TypeError, ValueError):
-                base["ts"] = row["ts"]
+                base["ts"] = row[ts_key]
         # optional extended fields (absent in older schemas)
         for field in (
             "project",
@@ -195,6 +230,7 @@ class SQLiteTasksStore(TasksStore):
             "description",
             "person_id",
         ):
-            if field in row.keys():
-                base[field] = row[field]
+            key = self._pick_row_key(row, field)
+            if key is not None:
+                base[field] = row[key]
         return base

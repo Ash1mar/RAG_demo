@@ -40,6 +40,18 @@ class TasksSchemaConfig:
         mapping = self.field_map or {}
         return (mapping.get(name) or name).strip() or name
 
+    def logical_field_for(self, physical: str) -> str:
+        """Translate a physical column name back to its logical field name."""
+        name = (physical or "").strip()
+        if not name:
+            return name
+        mapping = self.field_map or {}
+        norm = _normalize_ident(name)
+        for logical, mapped in mapping.items():
+            if _normalize_ident(mapped) == norm:
+                return logical
+        return name
+
 
 def _parse_csv_list(value: Optional[str]) -> List[str]:
     if not value:
@@ -76,6 +88,16 @@ def _default_field_map() -> Dict[str, str]:
         "is_read": "is_read",
         "is_delegated": "is_delegated",
     }
+
+
+def _normalize_ident(name: Optional[str]) -> str:
+    text = str(name or "").strip()
+    if not text:
+        return ""
+    text = text.strip("[]")
+    if "." in text:
+        text = text.split(".")[-1]
+    return text.strip("[]").lower()
 
 
 def get_tasks_schema_config() -> TasksSchemaConfig:

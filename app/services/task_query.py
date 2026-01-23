@@ -30,8 +30,11 @@ from app.services.nl2sql_engine import (
     too_many_entities,
 )
 from app.services.sql_compiler import TaskSqlCompileError, compile_tasks_sql
+from app.tasks_domain import get_tasks_domain
+from app.tasks_intent import get_intent_handler, intent_label
+from app.tasks_intent.base import AnswerContext
 from app.tasks_store.base import TasksStore
-from app.tasks_schema import get_tasks_schema_config
+from app.tasks_schema import TasksSchemaConfig, get_tasks_schema_config
 
 
 def _norm_text(s: str) -> str:
@@ -57,59 +60,135 @@ INTENT_STATUS_KWS = [
 
 logger = logging.getLogger(__name__)
 
-_TASKS_SCHEMA = get_tasks_schema_config()
+_TEXT2SQL_COLUMN_SPECS: Tuple[Tuple[str, str, Optional[str]], ...] = (
+    ("id", "INTEGER PRIMARY KEY", None),
+    ("person", "TEXT NOT NULL", None),
+    ("owner", "TEXT", None),
+    ("task", "TEXT NOT NULL", None),
+    ("status", "TEXT NOT NULL", "DONE | TODO | IN_PROGRESS | BLOCKED"),
+    ("ts", "INTEGER NOT NULL", "epoch milliseconds"),
+    ("project", "TEXT", None),
+    ("tags", "TEXT", "comma-separated strings"),
+    ("org_name", "TEXT", None),
+    ("division_name", "TEXT", None),
+    ("post_name", "TEXT", None),
+    ("is_read", "INTEGER", "0/1"),
+    ("is_delegated", "INTEGER", "0/1"),
+    ("priority", "INTEGER", "1 = highest priority"),
+    ("due_ts", "INTEGER", None),
+    ("created_ts", "INTEGER", None),
+    ("updated_ts", "INTEGER", None),
+    ("status_note", "TEXT", None),
+    ("description", "TEXT", None),
+)
 
 
-def _build_text2sql_schema(latest_relation: str, history_relation: str) -> str:
-    # Keep the column contract stable; only table/view names change.
+def _normalize_relation_name(name: str) -> str:
+    text = (name or "").strip()
+    if not text:
+        return ""
+    text = text.strip("[]")
+    if "." in text:
+        text = text.split(".")[-1]
+    return text.strip("[]").lower()
+
+
+def _allowed_tables() -> set[str]:
+    schema = get_tasks_schema_config()
+    allowed = {_normalize_relation_name(name) for name in schema.allowed_relations}
+    return {name for name in allowed if name}
+
+
+def _tsql_prefix_unicode_literals(sql: str) -> str:
+    """Ensure Unicode string literals use N'...' in T-SQL.
+
+    SQL Server treats non-N-prefixed string literals as VARCHAR, which can cause
+    comparisons like person = '杨洁' to fail depending on collation/codepage.
+    """
+    if not sql:
+        return sql
+
+    def _needs_prefix(literal: str) -> bool:
+        # Only prefix when literal contains any non-ascii character.
+        return any(ord(ch) > 127 for ch in literal)
+
+    # Match single-quoted literals, respecting escaped quotes ('').
+    pattern = re.compile(r"(?<![Nn])'((?:[^']|'')*)'")
+
+    def _repl(match: re.Match) -> str:
+        inner = match.group(1) or ""
+        if not _needs_prefix(inner):
+            return match.group(0)
+        return "N'" + inner + "'"
+
+    return pattern.sub(_repl, sql)
+
+
+def _text2sql_disallowed_comparisons(schema: TasksSchemaConfig) -> Tuple[str, ...]:
+    ts_col = schema.translate_field("ts")
+    created_col = schema.translate_field("created_ts")
+    due_col = schema.translate_field("due_ts")
+
+    pairs: List[str] = []
+
+    def _emit(left: str, right: str) -> None:
+        if not left or not right:
+            return
+        for op in (">", "<", ">=", "<="):
+            pairs.append(f"{left} {op} {right}".lower())
+
+    _emit(ts_col, created_col)
+    _emit(created_col, ts_col)
+    _emit(ts_col, due_col)
+    _emit(due_col, ts_col)
+    return tuple(sorted(set(pairs)))
+
+
+def _text2sql_literal_columns(schema: TasksSchemaConfig) -> List[str]:
+    cols: List[str] = []
+    for logical in ("ts", "created_ts", "due_ts"):
+        col = schema.translate_field(logical)
+        if col and col not in cols:
+            cols.append(col)
+    return cols
+
+
+def _render_text2sql_columns(schema: TasksSchemaConfig) -> str:
+    rendered: List[Tuple[str, str, str]] = []
+    for logical, col_type, comment in _TEXT2SQL_COLUMN_SPECS:
+        physical = schema.translate_field(logical)
+        if not physical:
+            continue
+        notes: List[str] = []
+        if comment:
+            notes.append(comment)
+        if physical != logical:
+            notes.append(f"logical: {logical}")
+        comment_text = f" -- {', '.join(notes)}" if notes else ""
+        rendered.append((physical, col_type, comment_text))
+
+    lines: List[str] = []
+    for idx, (physical, col_type, comment_text) in enumerate(rendered):
+        comma = "," if idx + 1 < len(rendered) else ""
+        lines.append(f"  {physical} {col_type}{comma}{comment_text}")
+    return "\n".join(lines)
+
+
+def _build_text2sql_schema(schema: TasksSchemaConfig) -> str:
+    columns = _render_text2sql_columns(schema)
     return f"""
-table {latest_relation} (
-  id INTEGER PRIMARY KEY,
-  person TEXT NOT NULL,
-  owner TEXT,
-  task TEXT NOT NULL,
-  status TEXT NOT NULL,        -- DONE | TODO | IN_PROGRESS | BLOCKED
-  ts INTEGER NOT NULL,         -- epoch milliseconds
-  project TEXT,
-  tags TEXT,                   -- comma-separated strings
-  org_name TEXT,
-  division_name TEXT,
-  post_name TEXT,
-  is_read INTEGER,             -- 0/1
-  is_delegated INTEGER,        -- 0/1
-  priority INTEGER,            -- 1 = highest priority
-  due_ts INTEGER,
-  created_ts INTEGER,
-  updated_ts INTEGER,
-  status_note TEXT,
-  description TEXT
+table {schema.latest_relation} (
+{columns}
 );
 
-table {history_relation} (
-  id INTEGER PRIMARY KEY,
-  person TEXT NOT NULL,
-  owner TEXT,
-  task TEXT NOT NULL,
-  status TEXT NOT NULL,
-  ts INTEGER NOT NULL,
-  project TEXT,
-  tags TEXT,
-  org_name TEXT,
-  division_name TEXT,
-  post_name TEXT,
-  is_read INTEGER,
-  is_delegated INTEGER,
-  priority INTEGER,
-  due_ts INTEGER,
-  created_ts INTEGER,
-  updated_ts INTEGER,
-  status_note TEXT,
-  description TEXT
+table {schema.history_relation} (
+{columns}
 );
 """
 
 
-TEXT2SQL_SCHEMA = _build_text2sql_schema(_TASKS_SCHEMA.latest_relation, _TASKS_SCHEMA.history_relation)
+def _text2sql_schema() -> str:
+    return _build_text2sql_schema(get_tasks_schema_config())
 
 TEXT2SQL_SYSTEM_PROMPT_SQLITE = (
     "You are a precise Text-to-SQL assistant for a SQLite database that tracks task status updates. "
@@ -132,6 +211,10 @@ TEXT2SQL_SYSTEM_PROMPT_MSSQL = (
     "If the request needs multiple SQL statements, include up to two queries in the JSON array."
 )
 
+_TEXT2SQL_JSON_SHAPE = (
+    "Return only JSON with the structure {\"queries\":[{\"sql\":\"...\",\"description\":\"...\"}]}. "
+)
+
 TEXT2SQL_MAX_QUERIES = 2
 TEXT2SQL_ROW_PREVIEW = 3
 TEXT2SQL_ANSWER_MAX_ROWS = 5
@@ -147,26 +230,10 @@ TEXT2SQL_FORBIDDEN_KEYWORDS = (
     "detach",
     "pragma",
 )
-TEXT2SQL_ALLOWED_TABLE_SNIPPETS = tuple(f" from {name.lower()}" for name in _TASKS_SCHEMA.allowed_relations)
 TEXT2SQL_DISALLOWED_FUNCTIONS = ('date_sub', 'curdate')
-TEXT2SQL_DISALLOWED_COMPARISONS = (
-    "ts > created_ts",
-    "ts < created_ts",
-    "ts >= created_ts",
-    "ts <= created_ts",
-    "created_ts > ts",
-    "created_ts < ts",
-    "created_ts >= ts",
-    "created_ts <= ts",
-    "ts > due_ts",
-    "ts < due_ts",
-    "due_ts > ts",
-    "due_ts < ts",
-)
 TEXT2SQL_SUSPICIOUS_LITERAL_THRESHOLD = 10_000_000_000
 _MILLIS_PER_SECOND = 1000
 _MILLIS_PER_DAY = 24 * 60 * 60 * _MILLIS_PER_SECOND
-SQL_ALLOWED_TABLES = {name.lower() for name in _TASKS_SCHEMA.allowed_relations}
 TEXT2SQL_ANSWER_SYSTEM_PROMPT = (
     "You are a precise assistant for summarizing SQL query results about task statuses. "
     "Use the provided rows to answer the user's question in Chinese. "
@@ -190,9 +257,34 @@ def _sqlglot_dialect(dialect: str) -> str:
 
 
 def _text2sql_system_prompt(dialect: str) -> str:
+    schema = get_tasks_schema_config()
+    person_col = schema.translate_field("person") or "person"
+    owner_col = schema.translate_field("owner") or "owner"
+    tables = f"{schema.latest_relation} or {schema.history_relation}"
     if (dialect or "").strip().lower() == "mssql":
-        return TEXT2SQL_SYSTEM_PROMPT_MSSQL
-    return TEXT2SQL_SYSTEM_PROMPT_SQLITE
+        return (
+            "You are a precise Text-to-SQL assistant for a SQL Server (T-SQL) database that tracks task status updates. "
+            f"You must only emit read-only SELECT statements that reference the {tables} tables described in the schema. "
+            "Never produce DML/DDL (INSERT/UPDATE/DELETE/ALTER/etc.), and always include TOP (N) with N <= 100. "
+            "Do not use LIMIT; SQL Server requires TOP. "
+            "When the question explicitly says \"executor\"/\"执行\"/\"执行人\", "
+            f"filter by the `{person_col}` column. "
+            "When it says \"owner\"/\"发起人\"/\"负责人\" (or similar), "
+            f"filter by the `{owner_col}` column. "
+            + _TEXT2SQL_JSON_SHAPE
+            + "If the request needs multiple SQL statements, include up to two queries in the JSON array."
+        )
+    return (
+        "You are a precise Text-to-SQL assistant for a SQLite database that tracks task status updates. "
+        f"You must only emit read-only SELECT statements that reference the {tables} tables described in the schema. "
+        "Never produce DML/DDL (INSERT/UPDATE/DELETE/ALTER/etc.), and always include a LIMIT of at most 100 rows. "
+        "When the question explicitly says \"executor\"/\"执行\"/\"执行人\", "
+        f"filter by the `{person_col}` column. "
+        "When it says \"owner\"/\"发起人\"/\"负责人\" (or similar), "
+        f"filter by the `{owner_col}` column. "
+        + _TEXT2SQL_JSON_SHAPE
+        + "If the request needs multiple SQL statements, include up to two queries in the JSON array."
+    )
 
 
 def _resolve_symbolic_time(text: str) -> Optional[int]:
@@ -532,20 +624,34 @@ class TaskQueryEngine:
         }
 
     @staticmethod
-    def _intent_label(intent: Optional[TaskQueryIntent]) -> str:
-        if isinstance(intent, TaskQueryIntent):
-            if intent == TaskQueryIntent.task_list_by_person:
-                return "task_list"
-            if intent == TaskQueryIntent.task_history:
-                return "task_history"
-            if intent in (
-                TaskQueryIntent.task_status_single,
-                TaskQueryIntent.task_status_list,
-            ):
-                return "status_query"
-            if intent == TaskQueryIntent.person_summary:
-                return "person_summary"
-        return "unknown"
+    def _intent_label(spec: Optional[TaskQuerySpec]) -> str:
+        return intent_label(spec)
+
+    @staticmethod
+    def _build_intent_answer(
+        *,
+        spec: TaskQuerySpec,
+        rows: List[Dict[str, Any]],
+        person: Optional[str],
+        task_val: Optional[str],
+        person_filters_active: bool,
+        person_filter_values: List[str],
+        low_conf: bool,
+        answer_mode: TaskAnswerMode,
+    ) -> Dict[str, Any]:
+        handler = get_intent_handler(spec, answer_mode)
+        ctx = AnswerContext(
+            spec=spec,
+            rows=rows,
+            person=person,
+            task=task_val,
+            person_filters_active=person_filters_active,
+            person_filter_values=person_filter_values,
+            low_conf=low_conf,
+            answer_mode=answer_mode,
+            format_ts=ts_to_str,
+        )
+        return handler.build_answer(ctx)
 
     def _compute_routing_debug(self, spec: TaskQuerySpec) -> Tuple[bool, Dict[str, Any]]:
         complex_flag = is_complex_by_text(getattr(spec, "raw_query", ""))
@@ -793,7 +899,7 @@ class TaskQueryEngine:
             return payload
 
         spec_intent = getattr(spec, "intent", None)
-        payload["intent"] = self._intent_label(spec_intent)
+        payload["intent"] = self._intent_label(spec)
 
         raw_answer_mode = getattr(spec, "answer_mode", TaskAnswerMode.default)
         if isinstance(raw_answer_mode, TaskAnswerMode):
@@ -1031,296 +1137,25 @@ class TaskQueryEngine:
 
         answer_mode = answer_mode_hint
         payload["answer_mode"] = answer_mode.value
-
-        if answer_mode == TaskAnswerMode.completion_time_latest:
-            done_row = next(
-                (
-                    rec
-                    for rec in rows
-                    if str(rec.get("status", "")).upper() == TaskStatus.DONE.value
-                ),
-                rows[0],
-            )
-            ts = int(done_row.get("ts", -1))
-            ts_str = ts_to_str(ts) if ts >= 0 else "unknown time"
-            payload.update(
-                {
-                    "answer": f'{person} / "{task_val or spec.task}" was completed at {ts_str}.',
-                    "person": person,
-                    "task": task_val or spec.task,
-                    "status": str(done_row.get("status", "")).upper(),
-                    "ts": ts,
-                }
-            )
-            if low_conf:
-                payload["answer"] = str(payload.get("answer", "")) + " (low confidence)"
-            return payload
-
-        if answer_mode == TaskAnswerMode.task_count_by_status:
-            counts_map: Dict[str, int] = {}
-            for rec in rows:
-                status = str(rec.get("status", "")).upper() or "UNKNOWN"
-                raw_count = rec.get("task_count")
-                try:
-                    cnt = int(raw_count)
-                except (TypeError, ValueError):
-                    cnt = 1
-                if cnt < 0:
-                    cnt = 0
-                counts_map[status] = counts_map.get(status, 0) + cnt
-            counts = [
-                {"status": status, "count": counts_map[status]}
-                for status in sorted(counts_map.keys(), key=lambda s: (-counts_map[s], s))
-            ]
-            total = sum(item["count"] for item in counts)
-            stats_str = ", ".join(f"{item['status']}={item['count']}" for item in counts) or "none"
-            if person_filters_active and person_filter_values:
-                subject_label = ", ".join(person_filter_values)
-            elif person:
-                subject_label = str(person)
-            else:
-                subject_label = "Tasks"
-            scope_bits: List[str] = []
-            time_range = getattr(spec, "time_range", None)
-            if time_range:
-                scope_bits.append(
-                    f"time_range={getattr(time_range, 'start', None) or '*'}~{getattr(time_range, 'end', None) or '*'}"
-                )
-            due_range = getattr(spec, "due_range", None)
-            if due_range:
-                scope_bits.append(
-                    f"due_range={getattr(due_range, 'start', None) or '*'}~{getattr(due_range, 'end', None) or '*'}"
-                )
-            scope_suffix = f" within {', '.join(scope_bits)}" if scope_bits else ""
-            if subject_label == "Tasks":
-                answer_prefix = "Tasks by status"
-            else:
-                answer_prefix = f"{subject_label} tasks by status"
-            payload.update(
-                {
-                    "answer": f"{answer_prefix}{scope_suffix}: {stats_str} (total {total}).",
-                    "person": None if person_filters_active else person,
-                    "persons": person_filter_values if person_filters_active else ([person] if person else []),
-                    "task": None,
-                    "status_counts": counts,
-                    "total_tasks": total,
-                }
-            )
-            if low_conf:
-                payload["answer"] = str(payload.get("answer", "")) + " (low confidence)"
-            return payload
-
-        if answer_mode == TaskAnswerMode.person_summary_by_project:
-            summary: Dict[str, Dict[str, Dict[str, int]]] = {}
-            for rec in rows:
-                project = str(rec.get("project", "") or "Unspecified")
-                person_name = str(rec.get("person", "") or "Unknown")
-                status_val = str(rec.get("status", "") or "UNKNOWN").upper()
-                count_val = rec.get("task_count")
-                try:
-                    cnt = int(count_val)
-                except (TypeError, ValueError):
-                    cnt = 0
-                summary.setdefault(project, {}).setdefault(person_name, {})[status_val] = cnt
-
-            parts: List[str] = []
-            for project, people in summary.items():
-                person_bits: List[str] = []
-                for person_name, status_map in people.items():
-                    status_bits = [f"{status}={count}" for status, count in status_map.items()]
-                    person_bits.append(f"{person_name}({', '.join(status_bits)})")
-                project_summary = "; ".join(person_bits) if person_bits else "no data"
-                parts.append(f"{project}: {project_summary}")
-            answer = " | ".join(parts) if parts else "No summary data."
-            payload.update(
-                {
-                    "answer": f"Project/person status summary: {answer}",
-                    "project_summary": summary,
-                    "person": None,
-                    "persons": [],
-                    "task": None,
-                }
-            )
-            if low_conf:
-                payload["answer"] = str(payload.get("answer", "")) + " (low confidence)"
-            return payload
-
-        if answer_mode == TaskAnswerMode.overdue_count_by_person:
-            rows_summary: List[Dict[str, Any]] = []
-            for rec in rows:
-                person_name = str(rec.get("person", "") or "Unknown")
-                raw_count = rec.get("overdue_count")
-                try:
-                    cnt = int(raw_count)
-                except (TypeError, ValueError):
-                    cnt = 0
-                rows_summary.append({"person": person_name, "count": cnt})
-            rows_summary.sort(key=lambda item: (-item["count"], item["person"]))
-            scope_bits: List[str] = []
-            time_range = getattr(spec, "time_range", None)
-            if time_range:
-                scope_bits.append(
-                    f"time_range={getattr(time_range, 'start', None) or '*'}~{getattr(time_range, 'end', None) or '*'}"
-                )
-            due_range = getattr(spec, "due_range", None)
-            if due_range:
-                scope_bits.append(
-                    f"due_range={getattr(due_range, 'start', None) or '*'}~{getattr(due_range, 'end', None) or '*'}"
-                )
-            scope_suffix = f" within {', '.join(scope_bits)}" if scope_bits else ""
-            summary_str = ", ".join(f"{item['person']}={item['count']}" for item in rows_summary) or "none"
-            payload.update(
-                {
-                    "answer": f"Overdue tasks per person{scope_suffix}: {summary_str}.",
-                    "overdue_counts": rows_summary,
-                    "person": None,
-                    "persons": [item["person"] for item in rows_summary],
-                    "task": None,
-                }
-            )
-            if low_conf:
-                payload["answer"] = str(payload.get("answer", "")) + " (low confidence)"
-            return payload
-
-        spec_intent = getattr(spec, "intent", None)
-
-        if spec_intent == TaskQueryIntent.task_list_by_person:
-            count = len(rows)
-            preview_tasks = []
-            for rec in rows[:5]:
-                t_name = str(rec.get("task", ""))
-                t_status = str(rec.get("status", "")).upper()
-                rec_person = str(rec.get("person", ""))
-                if person_filters_active and rec_person:
-                    preview_tasks.append(f"{rec_person}:{t_name}({t_status})")
-                else:
-                    preview_tasks.append(f"{t_name}({t_status})")
-            preview = ", ".join(preview_tasks) if preview_tasks else "none"
-            if person_filters_active:
-                names = ", ".join(person_filter_values)
-                payload.update(
-                    {
-                        "answer": f"Tasks for {names}: {preview}",
-                        "person": None,
-                        "persons": person_filter_values,
-                        "task": None,
-                    }
-                )
-            else:
-                payload.update(
-                    {
-                        "answer": f"{person} has {count} tasks: {preview}",
-                        "person": person,
-                        "task": None,
-                    }
-                )
-            if low_conf:
-                payload["answer"] = str(payload.get("answer", "")) + " (low confidence)"
-            return payload
-
-        if spec_intent == TaskQueryIntent.task_status_list:
-            count = len(rows)
-            preview = []
-            for rec in rows[:5]:
-                t_name = str(rec.get("task", ""))
-                t_status = str(rec.get("status", "")).upper()
-                rec_person = str(rec.get("person", ""))
-                if person_filters_active and rec_person:
-                    preview.append(f"{rec_person}:{t_name}({t_status})")
-                else:
-                    preview.append(f"{t_name}({t_status})")
-            preview_str = ", ".join(preview) if preview else "none"
-            if person_filters_active:
-                names = ", ".join(person_filter_values)
-                payload.update(
-                    {
-                        "answer": f"{names} have {count} task status records: {preview_str}",
-                        "person": None,
-                        "persons": person_filter_values,
-                        "task": None,
-                    }
-                )
-            else:
-                payload.update(
-                    {
-                        "answer": f"{person} has {count} task status records: {preview_str}",
-                        "person": person,
-                        "task": None,
-                    }
-                )
-            if low_conf:
-                payload["answer"] = str(payload.get("answer", "")) + " (low confidence)"
-            return payload
-
-        if spec_intent == TaskQueryIntent.task_history:
-            count = len(rows)
-            rec = rows[0]
-            status = str(rec.get("status", "")).upper()
-            ts = int(rec.get("ts", -1))
-            ts_str = ts_to_str(ts) if ts >= 0 else "unknown time"
-            payload.update(
-                {
-                    "answer": f'{person} / "{task_val}" has {count} status records; latest is {status} at {ts_str}.',
-                    "person": person,
-                    "task": task_val,
-                    "status": status,
-                    "ts": ts,
-                }
-            )
-            if low_conf:
-                payload["answer"] = str(payload.get("answer", "")) + " (low confidence)"
-            return payload
-
-        if spec_intent == TaskQueryIntent.person_summary:
-            summary: Dict[str, List[str]] = {}
-            for rec in rows:
-                p_name = str(rec.get("person", ""))
-                status = str(rec.get("status", "")).upper()
-                count_val = rec.get("task_count")
-                try:
-                    cnt = int(count_val)
-                except (TypeError, ValueError):
-                    cnt = count_val
-                summary.setdefault(p_name, []).append(f"{status}={cnt}")
-            parts = []
-            for p_name, stats in summary.items():
-                stats_str = ", ".join(stats)
-                parts.append(f"{p_name}: {stats_str}")
-            answer = "; ".join(parts) if parts else "No summary data."
-            payload.update(
-                {
-                    "answer": answer,
-                    "person": None if person_filters_active else person,
-                    "persons": person_filter_values if person_filters_active else ([person] if person else []),
-                    "task": None,
-                }
-            )
-            if low_conf:
-                payload["answer"] = str(payload.get("answer", "")) + " (low confidence)"
-            return payload
-
-        rec = rows[0]
-        status = str(rec.get("status", "")).upper()
-        ts = int(rec.get("ts", -1))
-        ts_str = ts_to_str(ts) if ts >= 0 else "unknown time"
         payload.update(
-            {
-                "answer": f'{person} / "{task_val}" is {"completed" if status == "DONE" else status.lower()} (latest update: {ts_str}).',
-                "person": person,
-                "task": task_val,
-                "status": status,
-                "ts": ts,
-            }
+            self._build_intent_answer(
+                spec=spec,
+                rows=rows,
+                person=person,
+                task_val=task_val,
+                person_filters_active=person_filters_active,
+                person_filter_values=person_filter_values,
+                low_conf=low_conf,
+                answer_mode=answer_mode,
+            )
         )
-        if low_conf:
-            payload["answer"] = str(payload.get("answer", "")) + " (low confidence)"
         return payload
 
     def _resolve_via_ir_fast_path(self, spec: TaskQuerySpec, routing_debug: Dict[str, Any]) -> Dict[str, Any]:
         debug = dict(routing_debug or {})
         debug["routed_via"] = "ir_fast_path"
         payload: Dict[str, Any] = {
-            "intent": self._intent_label(getattr(spec, "intent", None)),
+            "intent": self._intent_label(spec),
             "resolver_mode": "hybrid_llm_ir_fast_path",
             "routing_debug": debug,
         }
@@ -1347,7 +1182,7 @@ class TaskQueryEngine:
             payload["reason"] = str(exc)
             return payload
 
-        payload["intent"] = self._intent_label(getattr(spec, "intent", None))
+        payload["intent"] = self._intent_label(spec)
         return self._execute_ir_plan(
             spec,
             payload,
@@ -1397,19 +1232,20 @@ class TaskQueryEngine:
 
         if rows:
             rec = rows[0]
-            person = rec.get("person")
-            task = rec.get("task")
-            status = str(rec.get("status", "")).upper()
-            ts = int(rec.get("ts", -1))
-            ts_str = ts_to_str(ts) if ts >= 0 else "unknown time"
+            person = rec.get("person") or spec.person
+            task = rec.get("task") or spec.task
+            answer_mode = getattr(spec, "answer_mode", TaskAnswerMode.default)
             payload.update(
-                {
-                    "answer": f'{person} / "{task}" is {"completed" if status == "DONE" else status.lower()} (latest update: {ts_str}).',
-                    "person": person,
-                    "task": task,
-                    "status": status,
-                    "ts": ts,
-                }
+                self._build_intent_answer(
+                    spec=spec,
+                    rows=rows,
+                    person=person,
+                    task_val=task,
+                    person_filters_active=False,
+                    person_filter_values=[],
+                    low_conf=False,
+                    answer_mode=answer_mode,
+                )
             )
         else:
             payload["answer"] = no_rows_message
@@ -1427,7 +1263,7 @@ class TaskQueryEngine:
         base["resolver_mode"] = "text2sql"
 
         if spec is not None:
-            base.setdefault("intent", self._intent_label(getattr(spec, "intent", None)))
+            base.setdefault("intent", self._intent_label(spec))
             base["nl_ir"] = spec.dict()
         else:
             base.setdefault("intent", "unknown")
@@ -1545,6 +1381,9 @@ def _build_text2sql_prompt(
 ) -> str:
     hint = _make_text2sql_ir_hint(spec)
     hint_json = json.dumps(hint, ensure_ascii=False, indent=2)
+    schema = get_tasks_schema_config()
+    latest_relation = schema.latest_relation
+    history_relation = schema.history_relation
     dialect_norm = (dialect or "sqlite").strip().lower()
     if dialect_norm == "mssql":
         intro = (
@@ -1570,7 +1409,7 @@ def _build_text2sql_prompt(
     parts = [
         intro,
         "- Only SELECT statements are allowed.\n",
-        "- Target the task_latest or tasks tables (task_latest contains the latest row per person+task).\n",
+        f"- Target the {latest_relation} or {history_relation} tables ({latest_relation} contains the latest row per person+task).\n",
         "- Always include an ORDER BY when the user cares about recency.\n",
         limit_rule,
         "- Do not invent tables or columns.\n",
@@ -1591,7 +1430,7 @@ def _build_text2sql_prompt(
         '{"queries":[{"sql":"SELECT ...","description":"short natural language summary"}]}\n',
         "\n",
         "### Database schema\n",
-        f"{TEXT2SQL_SCHEMA.strip()}\n\n",
+        f"{_text2sql_schema().strip()}\n\n",
         "### Natural language question\n",
         f"{question}\n\n",
         "### IR hint (may contain mistakes, but usually helpful)\n",
@@ -2161,7 +2000,7 @@ def _apply_range_hint(sql: str, column: str, range_hint: Optional[Dict[str, Any]
     return sql
 
 
-def _ensure_tag_filters(sql: str, tags: Optional[List[str]]) -> str:
+def _ensure_tag_filters(sql: str, tags: Optional[List[str]], *, column: str = "tags") -> str:
     def _clean(tag: str) -> str:
         cleaned = str(tag or "").strip()
         cleaned = cleaned.strip(" ，,;；、")
@@ -2172,7 +2011,11 @@ def _ensure_tag_filters(sql: str, tags: Optional[List[str]]) -> str:
     if not tag_values:
         return sql
     lowered = sql.lower()
-    if re.search(r"\btags\s+(?:like|=|in)\b", lowered):
+    col = (column or "tags").strip()
+    if not col:
+        return sql
+    col_norm = col.lower()
+    if re.search(rf"\b{re.escape(col_norm)}\s+(?:like|=|in)\b", lowered):
         return sql
 
     def _escape(tag: str) -> str:
@@ -2183,7 +2026,7 @@ def _ensure_tag_filters(sql: str, tags: Optional[List[str]]) -> str:
             seen.append(tag)
         if len(seen) >= 2:
             break
-    clause_parts = [f"tags LIKE '%{_escape(tag)}%'" for tag in seen]
+    clause_parts = [f"{col} LIKE '%{_escape(tag)}%'" for tag in seen]
     clause = " AND ".join(clause_parts)
     where_idx = lowered.find(" where ")
     if where_idx != -1:
@@ -2232,80 +2075,6 @@ def _strip_semicolons(sql: str) -> str:
     return sql.replace(";", " ")
 
 
-def _ensure_priority_filter(
-    sql: str, priority: Optional[Any], task_hint: Optional[Any]
-) -> str:
-    def _normalize_priority_literals(text: str) -> Tuple[str, bool]:
-        pattern = re.compile(
-            r"priority\s*(?:in\s*\([^\)]*\)|=\s*'[^']*')", re.IGNORECASE
-        )
-        changed = False
-
-        def _repl(match: re.Match) -> str:
-            nonlocal changed
-            chunk = match.group(0)
-            if re.search(r"p\s*1|高优|高優", chunk, re.IGNORECASE):
-                changed = True
-                return "priority = 1"
-            return chunk
-
-        new_text = pattern.sub(_repl, text)
-        return new_text, changed
-
-    sql, normalized_priority = _normalize_priority_literals(sql)
-    lowered = sql.lower()
-
-    if normalized_priority:
-        return sql
-
-    p_val: Optional[int] = None
-    if priority is not None:
-        try:
-            p_val = int(priority)
-        except (TypeError, ValueError):
-            p_val = None
-    if p_val is None and ("高优" in sql and "p1" in lowered):
-        p_val = 1
-    if p_val is None:
-        return sql
-
-    if re.search(r"\bpriority\b", lowered):
-        return sql
-    clause = f"priority = {p_val}"
-
-    if "高优" in sql and "p1" in lowered:
-        pattern_and = re.compile(
-            r"\s+and\s+task\s*(?:=|like)\s*'%[^']*高优[^']*p1[^']*%?'\s*",
-            re.IGNORECASE,
-        )
-        sql = pattern_and.sub(" ", sql)
-
-    lowered = sql.lower()
-    where_idx = lowered.find(" where ")
-    if where_idx != -1:
-        insert_pos = where_idx + len(" where ")
-        existing = sql[insert_pos:].strip()
-        if existing:
-            sql = f"{sql[:insert_pos]}({clause}) AND ({existing})"
-        else:
-            sql = f"{sql[:insert_pos]}({clause})"
-        return sql
-
-    order_idx = lowered.find(" order by ")
-    limit_idx = lowered.find(" limit ")
-    insert_pos = len(sql)
-    for idx in (order_idx, limit_idx):
-        if idx != -1 and idx < insert_pos:
-            insert_pos = idx
-    suffix = sql[insert_pos:]
-    prefix = sql[:insert_pos]
-    if suffix.strip():
-        sql = f"{prefix} WHERE ({clause}) {suffix.lstrip()}"
-    else:
-        sql = f"{prefix} WHERE ({clause})"
-    return sql
-
-
 def _parse_sql_expression(sql: str, dialect: str = "sqlite") -> exp.Expression:
     try:
         return parse_one(sql, read=dialect)
@@ -2332,11 +2101,13 @@ def _validate_select_expression(expr: exp.Expression) -> exp.Query:
 
 
 def _validate_allowed_tables(expression: exp.Expression) -> None:
+    allowed = _allowed_tables()
     for table in expression.find_all(exp.Table):
         name = table.name
         if not name:
             raise Text2SQLValidationError("Query references an unnamed table.")
-        if name.lower() not in SQL_ALLOWED_TABLES:
+        normalized = _normalize_relation_name(name)
+        if normalized not in allowed:
             raise Text2SQLValidationError(
                 f"Query references table '{name}' which is not allowed."
             )
@@ -2361,171 +2132,6 @@ def _ensure_limit_ast(select_expr: exp.Query, *, max_rows: int = 100) -> None:
         limit.set("expression", capped_literal)
 
 
-def _ensure_priority_filter(sql: str, priority: Optional[Any], task_hint: Optional[Any]) -> str:
-    lowered = sql.lower()
-
-    p_val: Optional[int] = None
-    if priority is not None:
-        try:
-            p_val = int(priority)
-        except (TypeError, ValueError):
-            p_val = None
-    if p_val is None and ("高优" in sql and "p1" in lowered):
-        p_val = 1
-    if p_val is None:
-        return sql
-
-    if re.search(r"\bpriority\b", lowered):
-        return sql
-    clause = f"priority = {p_val}"
-
-    if "高优" in sql and "p1" in lowered:
-        pattern_and = re.compile(
-            r"\s+and\s+task\s*(?:=|like)\s*'%[^']*高优[^']*p1[^']*%?'\s*",
-            re.IGNORECASE,
-        )
-        sql = pattern_and.sub(" ", sql)
-
-    lowered = sql.lower()
-    where_idx = lowered.find(" where ")
-    if where_idx != -1:
-        insert_pos = where_idx + len(" where ")
-        existing = sql[insert_pos:].strip()
-        if existing:
-            sql = f"{sql[:insert_pos]}({clause}) AND ({existing})"
-        else:
-            sql = f"{sql[:insert_pos]}({clause})"
-        return sql
-
-    order_idx = lowered.find(" order by ")
-    limit_idx = lowered.find(" limit ")
-    insert_pos = len(sql)
-    for idx in (order_idx, limit_idx):
-        if idx != -1 and idx < insert_pos:
-            insert_pos = idx
-    suffix = sql[insert_pos:]
-    prefix = sql[:insert_pos]
-    if suffix.strip():
-        sql = f"{prefix} WHERE ({clause}) {suffix.lstrip()}"
-    else:
-        sql = f"{prefix} WHERE ({clause})"
-    return sql
-
-
-def _inject_where_clause(sql: str, clause: str) -> str:
-    if not sql or not clause:
-        return sql
-    lowered = sql.lower()
-    where_idx = lowered.find(" where ")
-    if where_idx != -1:
-        insert_pos = where_idx + len(" where ")
-        end_idx = len(sql)
-        for keyword in (" order by ", " limit "):
-            idx = lowered.find(keyword, insert_pos)
-            if idx != -1 and idx < end_idx:
-                end_idx = idx
-        existing = sql[insert_pos:end_idx].strip()
-        suffix = sql[end_idx:]
-        if existing:
-            return f"{sql[:insert_pos]}({clause}) AND ({existing}){suffix}"
-        return f"{sql[:insert_pos]}({clause}){suffix}"
-
-    order_idx = lowered.find(" order by ")
-    limit_idx = lowered.find(" limit ")
-    insert_pos = len(sql)
-    for idx in (order_idx, limit_idx):
-        if idx != -1 and idx < insert_pos:
-            insert_pos = idx
-    suffix = sql[insert_pos:]
-    prefix = sql[:insert_pos]
-    if suffix.strip():
-        return f"{prefix} WHERE ({clause}) {suffix.lstrip()}"
-    return f"{prefix} WHERE ({clause})"
-
-
-def _rewrite_flow_filter(sql: str, *, question: str, project_hint: Optional[str]) -> str:
-    if not sql:
-        return sql
-    project = (project_hint or "").strip()
-    if not project:
-        return sql
-    if "flow_name" not in (question or "") and "流程" not in (question or ""):
-        return sql
-
-    lowered = sql.lower()
-    if re.search(r"\bproject\s*(=|like|in)\b", lowered):
-        return sql
-
-    escaped_project = project.replace("'", "''")
-    escaped = re.escape(project)
-    tags_like_pat = re.compile(
-        rf"\btags\s+like\s+(['\"])%{escaped}%\1", re.IGNORECASE
-    )
-    if tags_like_pat.search(sql):
-        return tags_like_pat.sub(f"project = '{escaped_project}'", sql)
-
-    return _inject_where_clause(sql, f"project = '{escaped_project}'")
-
-
-def _remove_predicate(sql: str, predicate_pattern: re.Pattern[str]) -> str:
-    if not sql:
-        return sql
-    updated = sql
-
-    # AND <pred>
-    updated = re.sub(
-        rf"\s+AND\s+\(?{predicate_pattern.pattern}\)?",
-        "",
-        updated,
-        flags=re.IGNORECASE,
-    )
-    # <pred> AND
-    updated = re.sub(
-        rf"\(?{predicate_pattern.pattern}\)?\s+AND\s+",
-        "",
-        updated,
-        flags=re.IGNORECASE,
-    )
-    # WHERE <pred> (remove to WHERE 1=1)
-    updated = re.sub(
-        rf"\bWHERE\s+\(?{predicate_pattern.pattern}\)?\s*(?=(ORDER\s+BY|LIMIT|$))",
-        "WHERE 1=1 ",
-        updated,
-        flags=re.IGNORECASE,
-    )
-    return updated
-
-
-_FLOW_VALUE_PATTERN = re.compile(
-    r"(?:流程|flow_name)\s*(?:（[^）]*）)?\s*(?:=|为)\s*([^\s，。,?？]+)",
-    re.IGNORECASE,
-)
-
-
-def _extract_flow_value(question: str) -> Optional[str]:
-    text = (question or "").strip()
-    if not text:
-        return None
-    match = _FLOW_VALUE_PATTERN.search(text)
-    if not match:
-        return None
-    value = (match.group(1) or "").strip()
-    return value or None
-
-
-def _rewrite_status_overconstraint(sql: str, *, question: str, status_hint: Optional[List[str]]) -> str:
-    if not sql:
-        return sql
-    # Drop a spurious "status = 'BLOCKED'" predicate when the user did not ask for it.
-    q = (question or "").lower()
-    if "blocked" in q or "阻塞" in (question or ""):
-        return sql
-    pred = re.compile(r"status\s*=\s*(['\"])BLOCKED\1", re.IGNORECASE)
-    if not pred.search(sql):
-        return sql
-    return _remove_predicate(sql, pred)
-
-
 def _rewrite_text2sql_query(sql: str, hint: Optional[Dict[str, Any]], *, question: str = "") -> str:
     if not sql:
         return sql
@@ -2533,30 +2139,36 @@ def _rewrite_text2sql_query(sql: str, hint: Optional[Dict[str, Any]], *, questio
     hint = hint or {}
 
     # Align time-related literals with IR hint (ts/created_ts/due_ts).
-    updated = _apply_range_hint(updated, "ts", hint.get("time_range"))
-    updated = _apply_range_hint(updated, "created_ts", hint.get("created_range"))
-    updated = _apply_range_hint(updated, "due_ts", hint.get("due_range"))
+    schema = get_tasks_schema_config()
+    ts_col = schema.translate_field("ts") or "ts"
+    created_col = schema.translate_field("created_ts") or "created_ts"
+    due_col = schema.translate_field("due_ts") or "due_ts"
+    tags_col = schema.translate_field("tags") or "tags"
+    person_col = schema.translate_field("person") or "person"
+    project_col = schema.translate_field("project") or "project"
+
+    updated = _apply_range_hint(updated, ts_col, hint.get("time_range"))
+    updated = _apply_range_hint(updated, created_col, hint.get("created_range"))
+    updated = _apply_range_hint(updated, due_col, hint.get("due_range"))
 
     # Ensure tag filters reflect IR/KG tags when LLM forgot to use them.
-    updated = _ensure_tag_filters(updated, hint.get("tags"))
+    updated = _ensure_tag_filters(updated, hint.get("tags"), column=tags_col)
 
     # Normalize person/project literals to canonical values from IR/KG.
-    updated = _apply_scalar_hint(updated, "person", hint.get("person"))
-    updated = _apply_scalar_hint(updated, "project", hint.get("project"))
+    updated = _apply_scalar_hint(updated, person_col, hint.get("person"))
+    updated = _apply_scalar_hint(updated, project_col, hint.get("project"))
 
-    # Domain-specific corrections (lightweight; prefer improving correctness over
-    # relying purely on prompt compliance).
-    flow_value = _extract_flow_value(question or "")
-    project_hint = hint.get("project")
-    if not project_hint and flow_value:
-        project_hint = flow_value
-    updated = _rewrite_flow_filter(updated, question=question or "", project_hint=project_hint)
-    updated = _rewrite_status_overconstraint(updated, question=question or "", status_hint=hint.get("status"))
+    domain = get_tasks_domain()
+    updated = domain.rewrite_text2sql(
+        updated,
+        hint=hint,
+        question=question or "",
+        schema=schema,
+    )
 
     # Cleanup and safety-normalization.
     updated = _cleanup_invalid_order_tokens(updated)
     updated = _strip_semicolons(updated)
-    updated = _ensure_priority_filter(updated, hint.get("priority"), hint.get("task"))
     return updated
 
 
@@ -2573,7 +2185,10 @@ def _normalize_and_validate_text2sql_query(sql: str, *, dialect: str = "sqlite")
     target = _validate_select_expression(ast)
     _ensure_limit_ast(target, max_rows=100)
     normalized = ast.sql(dialect=sqlglot_dialect)
+    if dialect_norm == "mssql":
+        normalized = _tsql_prefix_unicode_literals(normalized)
     lowered = normalized.lower()
+    schema = get_tasks_schema_config()
     if "?" in normalized:
         raise Text2SQLValidationError("Parameter placeholders are not allowed.")
     if re.search(r":(?!/)[A-Za-z_]\w*", normalized):
@@ -2581,19 +2196,25 @@ def _normalize_and_validate_text2sql_query(sql: str, *, dialect: str = "sqlite")
     for func in TEXT2SQL_DISALLOWED_FUNCTIONS:
         if re.search(rf"\b{re.escape(func)}\b", lowered):
             raise Text2SQLValidationError(f"Unsupported SQL function detected: {func}")
-    for comparison in TEXT2SQL_DISALLOWED_COMPARISONS:
+    for comparison in _text2sql_disallowed_comparisons(schema):
         if comparison in lowered:
             raise Text2SQLValidationError(f"Unsupported column comparison detected: {comparison}")
-    literal_pattern = re.compile(r"\b(ts|created_ts|due_ts)\s*(>=|<=|=)\s*(\d+)")
-    for column, _, value in literal_pattern.findall(lowered):
-        try:
-            literal = int(value)
-        except ValueError:
-            continue
-        if literal < TEXT2SQL_SUSPICIOUS_LITERAL_THRESHOLD:
-            raise Text2SQLValidationError(
-                f"Suspicious literal detected for {column}: {value}"
-            )
+    literal_cols = _text2sql_literal_columns(schema)
+    if literal_cols:
+        col_pattern = "|".join(re.escape(col) for col in literal_cols)
+        literal_pattern = re.compile(
+            rf"(?<!\w)({col_pattern})(?!\w)\s*(>=|<=|=)\s*(\d+)",
+            re.IGNORECASE,
+        )
+        for column, _, value in literal_pattern.findall(normalized):
+            try:
+                literal = int(value)
+            except ValueError:
+                continue
+            if literal < TEXT2SQL_SUSPICIOUS_LITERAL_THRESHOLD:
+                raise Text2SQLValidationError(
+                    f"Suspicious literal detected for {column}: {value}"
+                )
     for keyword in TEXT2SQL_FORBIDDEN_KEYWORDS:
         if re.search(rf"\b{re.escape(keyword)}\b", lowered):
             raise Text2SQLValidationError(f"Forbidden keyword detected: {keyword}")
