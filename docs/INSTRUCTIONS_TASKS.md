@@ -28,8 +28,24 @@ Endpoints:
   - `TASKS_BACKEND=sqlite|mssql`
   - `TASKS_DIALECT=sqlite|mssql` (IR->SQL compiler)
   - `TASKS_TEXT2SQL_DIALECT=sqlite|mssql` (Text2SQL prompt/validation override)
+- Tasks schema & portability (decouple knobs):
+  - `TASKS_DOMAIN=tasks|issues|tickets`: domain pack for Text2SQL rewrite rules (default `tasks`)
+  - `TASKS_INTENT_PACK=tasks|<pack>`: load extra intent handlers from `app/tasks_intent/<pack>.py` (default `tasks`)
+  - `TASKS_INTENT_MODULES`: optional extra handler modules (comma-separated import paths)
+  - `TASKS_LATEST_RELATION`, `TASKS_HISTORY_RELATION`: relation/view names (default `task_latest`, `tasks`)
+  - `TASKS_ALLOWED_RELATIONS`: comma-separated allowlist for compiler/Text2SQL validation (default includes latest+history)
+  - `TASKS_COL_*`: logical->physical column mapping when you cannot provide compatibility views
 
 ---
+
+## 1.2 Decoupling & Extension Points
+
+The project is designed so switching databases, switching tables/views, or switching "task domain" requires minimal code changes:
+
+- **Tasks backend (`TasksStore`)**: `app/tasks_store/base.py` with `sqlite`/`mssql` implementations.
+- **Schema contract (`TasksSchemaConfig`)**: `app/tasks_schema.py` controls relation names + column mapping.
+- **Domain pack (`TaskDomain`)**: `app/tasks_domain/` contains domain-specific Text2SQL rewrite logic; switch via `TASKS_DOMAIN`.
+- **Intent handlers**: `app/tasks_intent/` provides a registerable `intent -> label/answer` layer to avoid growing `task_query.py` (load packs via `TASKS_INTENT_PACK`).
 
 ## 2. Resolver Modes (`RESOLVER`)
 
@@ -165,7 +181,7 @@ Typical payload includes:
 
 - `answer`: Chinese response (or Text2SQL summary).
 - `resolver_mode`: `rules` / `embeddings` / `hybrid` / `hybrid_plus_rules` / `hybrid_llm` / `text2sql`.
-- `intent`: string label derived from `TaskQueryIntent`.
+- `intent`: label derived from `TaskQuerySpec` via `app/tasks_intent` handlers (extendable without editing the core engine).
 - `sql`, `params`, `rows`: the SQL query executed (for DB-backed modes).
 - `candidates`: person/task candidate scores (for non-Text2SQL resolvers).
 - `nl_ir`: serialized `TaskQuerySpec`, including `extra.nl2sql_source` and `extra.kg_*` flags.
@@ -198,7 +214,9 @@ Located in `app/services/task_query.py` (`_answer_via_text2sql`):
 2. Call the configured LLM (e.g. `qwen3-coder:480b-cloud`) to obtain JSON `{ "queries": [{ "sql": "...", "description": "..." }, ...] }`.
 3. For each SQL:
    - `_rewrite_text2sql_query` aligns time windows, tag filters, person/project literals, priority hints, etc.
+     - After generic rewrites, `get_tasks_domain().rewrite_text2sql(...)` applies domain-specific adjustments (flow/status/priority rules, etc.).
    - `_normalize_and_validate_text2sql_query` (sqlglot) enforces read-only `SELECT`, allowed tables (`task_latest`/`tasks`), and a hard row cap (SQLite `LIMIT`, SQL Server `TOP`).
+     - SQL Server: Unicode string literals are normalized to `N'...'` to avoid VARCHAR/codepage comparison issues.
    - Execute via `TasksStore.query` (SQLite or SQL Server backend).
 4. Optionally call `_generate_text2sql_answer` (LLM summarization) or `_summarize_text2sql_rows` for a lightweight summary.
 5. Report errors (`text2sql_invalid_sql`, `text2sql_db_query_failed`, etc.) with detailed `reason` and raw LLM output when something fails.

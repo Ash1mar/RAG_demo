@@ -22,6 +22,10 @@ RAG_demo/
     demo_app.py               # FastAPI app (HTTP routes)
     __init__.py
     config_loader.py          # Optional env-file loader (config/app.env)
+    app_factory.py            # Wire dependencies and create the app
+    tasks_schema.py           # Tasks schema contract (relations + column mapping)
+    tasks_domain/             # Domain packs for Text2SQL rewrites (TASKS_DOMAIN)
+    tasks_intent/             # Intent handler registry (intent->label/answer)
     services/
       answer.py               # Simple Chinese answer composer
       chunking.py             # Simple text chunking
@@ -88,6 +92,8 @@ RAG_demo/
       - `rules` / `embeddings` / `hybrid` / `hybrid_plus_rules` (non-LLM baselines);
       - `hybrid_llm`: LLM NL->JSON + small model + FAISS + SQL compiler;
       - `text2sql`: direct LLM-generated SQL (with AST safety checks).
+    - domain pack (`app/tasks_domain/`): move domain-specific rewrites out of the core engine; switch via `TASKS_DOMAIN`.
+    - intent handlers (`app/tasks_intent/`): registerable intent->label/answer builders so new intents can be added with minimal core edits.
   - Backed by `SQLiteTasksStore` or `MSSQLTasksStore`, returning:
     - `answer` (short Chinese answer), `status`, `person`, `task`, `ts`, `id`;
     - `resolver_mode`, `sql`, `params`, `rows` (for debugging);
@@ -113,6 +119,8 @@ RAG_demo/
     - reject dangerous keywords/functions and positional placeholders;
     - normalize time windows, tag filters, and priority filters using the IR hint.
     - rewrite symbolic time literals (e.g. `now+7d`) and common T-SQL datetime math into epoch-ms constants.
+    - apply domain-specific rewrites via `TASKS_DOMAIN` (e.g. flow/status/priority heuristics).
+    - SQL Server: prefix Unicode string literals with `N'...'` to avoid VARCHAR/codepage comparison issues.
 
 - **KG-lite semantic dictionary for tasks**
   - Implemented in `app/services/kg_lite.py` with data in `data/kg_data.json`.
@@ -153,7 +161,13 @@ Common env vars (see also `docs/START_AND_TEST.md` and `.env.example`):
   - `TASKS_BACKEND=sqlite|mssql` (default `sqlite`)
   - `TASKS_DIALECT=sqlite|mssql` (SQL compiler dialect for `/db/ask` and Text2SQL normalization)
   - `TASKS_TEXT2SQL_DIALECT=sqlite|mssql` (optional; overrides `TASKS_DIALECT` for Text2SQL)
+  - `TASKS_DOMAIN=tasks|issues|tickets` (default `tasks`): selects domain pack for Text2SQL rewrite rules
+  - `TASKS_INTENT_PACK=tasks|<pack>` (default `tasks`): load extra intent handlers from `app/tasks_intent/<pack>.py`
+  - `TASKS_INTENT_MODULES`: optional extra handler modules (comma-separated import paths)
   - `TASKS_DB`: SQLite file path (default `data/tasks.db`)
+  - `TASKS_LATEST_RELATION`, `TASKS_HISTORY_RELATION`: relation/view names (default `task_latest`, `tasks`)
+  - `TASKS_ALLOWED_RELATIONS`: comma-separated allowlist for SQL compiler/Text2SQL validator (default includes latest+history)
+  - `TASKS_COL_*`: logical->physical column mapping when you cannot provide compatibility views (see `docs/START_AND_TEST.md`)
   - SQL Server connection (when `TASKS_BACKEND=mssql`):
     - `TASKS_MSSQL_SERVER`, `TASKS_MSSQL_DATABASE`, `TASKS_MSSQL_USER`, `TASKS_MSSQL_PASSWORD`
     - `TASKS_MSSQL_DRIVER`, `TASKS_MSSQL_ENCRYPT`, `TASKS_MSSQL_TRUST_CERT`, `TASKS_MSSQL_TIMEOUT_SEC`

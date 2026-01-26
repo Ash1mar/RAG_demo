@@ -125,11 +125,28 @@ If your dataset uses different column names and you prefer not to create views, 
 
 This is intended to reduce future migrations to "new DB + a few env vars" instead of code changes.
 
+You can also remap which relations/views are used by the tasks subsystem:
+
+- `TASKS_LATEST_RELATION`: latest-status relation (default `task_latest`)
+- `TASKS_HISTORY_RELATION`: history/event relation (default `tasks`)
+- `TASKS_ALLOWED_RELATIONS`: comma-separated allowlist for SQL compiler/Text2SQL validator (default includes latest+history)
+
 ---
 
 ### 3.4) (Optional) Use SQL Server Tasks DB
 
 If you have initialized SQL Server (see `docs/VM_SQLServer_Docker_Setup.md`), set the following in `config/app.env`:
+
+If SQL Server is running inside a VM and you want to connect from your host machine, create a local port-forward first (keep this terminal open):
+
+```bash
+ssh -L 1433:127.0.0.1:1433 <vm_user>@<vm_ip>
+```
+
+Notes:
+
+- This demo expects SQL Server on `127.0.0.1,1433` from the host (after port-forward).
+- Ensure an ODBC driver is installed locally (default: `ODBC Driver 18 for SQL Server`).
 
 ```env
 TASKS_BACKEND=mssql
@@ -284,6 +301,7 @@ $env:LLM_PROVIDER = 'ollama'
 $env:LLM_MODEL = 'qwen2.5-coder:7b'             # for general NL→IR (if used)
 $env:LLM_TEXT2SQL_MODEL = 'qwen3-coder:480b-cloud' # for Text2SQL
 $env:RESOLVER = 'text2sql'
+$env:TASKS_DOMAIN = 'tasks'                      # optional: domain pack for Text2SQL rewrites
 
 uvicorn app.demo_app:app --host 0.0.0.0 --port 8000 --reload
 ```
@@ -299,6 +317,7 @@ You should see:
 - `resolver_mode: "text2sql"`
 - A `text2sql` array with at least one `{sql, description, rows}` entry.
 - `answer` summarizing the latest status from the returned rows (or a “no rows” message).
+  - SQL Server note: if manual queries like `person = '杨洁'` return 0 but `person = N'杨洁'` returns 1, it is a Unicode literal/codepage issue; prefer NVARCHAR columns and use `N'...'` in T-SQL.
 
 For stricter NL→JSON + Text2SQL combination, use:
 
@@ -413,7 +432,73 @@ This keeps the KG-lite layer data-driven and ready for eventual migration to a g
 
 ---
 
-## 12) Troubleshooting
+## 12) Extending (Domain Packs & Intent Handlers)
+
+The project supports "add files + change config" extensions for two common evolution paths:
+
+- Switching "task domain" (e.g., tasks → issues/tickets) without touching the core Text2SQL engine.
+- Adding new intents/answer behaviors without growing `app/services/task_query.py`.
+
+### 12.1 Add a domain pack (Text2SQL rewrite rules)
+
+1. Add a new module under `app/tasks_domain/`, for example `app/tasks_domain/issues.py`.
+2. Define a `TaskDomain` subclass and implement `rewrite_text2sql(...)`.
+3. Set `TASKS_DOMAIN=issues` and restart the API.
+
+Minimal template:
+
+```python
+from app.tasks_domain.base import TaskDomain
+
+
+class IssuesDomain(TaskDomain):
+    name = "issues"
+
+    def rewrite_text2sql(self, sql: str, *, hint, question: str, schema) -> str:
+        return sql
+```
+
+Loader rules:
+
+- If `TASKS_DOMAIN=issues`, the system tries to import `app.tasks_domain.issues`.
+- It accepts either `DOMAIN = <TaskDomain instance>`, a `get_domain()` function, or any `TaskDomain` subclass defined in that module.
+
+### 12.2 Add an intent handler pack (intent → label/answer)
+
+1. Add a new module under `app/tasks_intent/`, for example `app/tasks_intent/issues.py`.
+2. Export a `HANDLERS` list (your handlers run before the built-ins).
+3. Set `TASKS_INTENT_PACK=issues` and restart the API.
+
+Minimal template:
+
+```python
+from app.services.nl2sql_engine import TaskAnswerMode, TaskQuerySpec
+from app.tasks_intent.base import TaskIntentHandler, AnswerContext
+
+
+class MyCustomHandler:
+    name = "my_custom_handler"
+
+    def matches(self, spec: TaskQuerySpec, answer_mode: TaskAnswerMode) -> bool:
+        return False
+
+    def label(self, spec: TaskQuerySpec):
+        return None
+
+    def build_answer(self, ctx: AnswerContext):
+        return {}
+
+
+HANDLERS = [MyCustomHandler()]
+```
+
+Optional: load multiple extra modules via:
+
+- `TASKS_INTENT_MODULES=app.tasks_intent.issues_extra,app.tasks_intent.more_handlers`
+
+---
+
+## 13) Troubleshooting
 
 - **No results from `/search` or `/search_hybrid`**
   - Ingest some docs via `/ingest` first.
