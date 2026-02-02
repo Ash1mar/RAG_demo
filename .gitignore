@@ -36,3 +36,7 @@ Thumbs.db
 data/
 !data/.gitkeep
 volumes/
+
+# Offline wheels / local env config (do not commit)
+wheelhouse/
+# config/app.env
