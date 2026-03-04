@@ -1273,10 +1273,12 @@ class TaskQueryEngine:
             base["error"] = "text2sql_llm_disabled"
             base["answer"] = "Text2SQL pipeline requires a configured LLM provider."
             return base
-        if llm_settings.provider != "ollama":
+        runtime = _resolve_text2sql_settings()
+        runtime_provider = runtime.get("provider", llm_settings.provider)
+        if runtime_provider not in {"ollama", "openai", "dashscope"}:
             base["error"] = "text2sql_llm_provider_unsupported"
             base["answer"] = (
-                f"Text2SQL is not yet supported for provider {llm_settings.provider}."
+                f"Text2SQL is not yet supported for provider {runtime_provider}."
             )
             return base
 
