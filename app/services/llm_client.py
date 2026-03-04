@@ -1,7 +1,8 @@
 ﻿from __future__ import annotations
 
+import json
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Protocol
+from typing import Any, Dict, List, Optional, Protocol
 
 import httpx
 from pydantic import ValidationError
@@ -103,11 +104,8 @@ class OllamaLLMClient:
             raise LLMParseError("Ollama response missing expected message.content") from exc
 
         try:
-            if isinstance(content, str):
-                spec = TaskQuerySpec.parse_raw(content)
-            else:
-                # Be tolerant if Ollama already returns structured JSON
-                spec = TaskQuerySpec.parse_obj(content)
+            normalized = _normalize_task_query_spec_payload(content, raw_query=q)
+            spec = TaskQuerySpec.parse_obj(normalized)
         except (ValueError, TypeError, ValidationError) as exc:
             raise LLMParseError(f"Failed to parse TaskQuerySpec from LLM output: {exc}") from exc
 
@@ -163,14 +161,127 @@ class OpenAICompatibleLLMClient:
             raise LLMParseError("OpenAI-compatible response missing choices[0].message.content") from exc
 
         try:
-            if isinstance(content, str):
-                spec = TaskQuerySpec.parse_raw(content)
-            else:
-                spec = TaskQuerySpec.parse_obj(content)
+            normalized = _normalize_task_query_spec_payload(content, raw_query=q)
+            spec = TaskQuerySpec.parse_obj(normalized)
         except (ValueError, TypeError, ValidationError) as exc:
             raise LLMParseError(f"Failed to parse TaskQuerySpec from OpenAI-compatible output: {exc}") from exc
 
         return spec.dict()
+
+
+def _normalize_task_query_spec_payload(content: Any, *, raw_query: str) -> Dict[str, Any]:
+    payload = _to_json_object(content)
+    normalized: Dict[str, Any] = dict(payload)
+
+    normalized["raw_query"] = _normalize_string_value(normalized.get("raw_query")) or raw_query
+    for key in ("person", "task", "project", "raw_intent_nl"):
+        normalized[key] = _normalize_string_value(normalized.get(key))
+
+    for key in ("task_keywords", "tags", "status", "filters"):
+        normalized[key] = _ensure_list_value(normalized.get(key), key=key)
+
+    normalized["order_by"] = _normalize_order_by_value(normalized.get("order_by"))
+
+    for key in ("time_range", "due_range", "created_range"):
+        normalized[key] = _normalize_time_range_value(normalized.get(key))
+
+    extra = normalized.get("extra")
+    if not isinstance(extra, dict):
+        normalized["extra"] = {}
+
+    return normalized
+
+
+def _to_json_object(content: Any) -> Dict[str, Any]:
+    if isinstance(content, dict):
+        return content
+    if isinstance(content, str):
+        text = _strip_markdown_json_fence(content.strip())
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    raise ValueError("LLM content is not a JSON object")
+
+
+def _strip_markdown_json_fence(text: str) -> str:
+    if not text.startswith("```"):
+        return text
+    end = text.find("```", 3)
+    if end == -1:
+        return text
+    inner = text[3:end].lstrip()
+    if inner.lower().startswith("json"):
+        inner = inner[4:].lstrip()
+    return inner.strip()
+
+
+def _ensure_list_value(value: Any, *, key: str) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, dict) and key == "filters":
+        return [value]
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        if key in {"task_keywords", "tags", "status", "filters"}:
+            return [text]
+    return []
+
+
+def _normalize_string_value(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    if isinstance(value, list):
+        for item in value:
+            text = _normalize_string_value(item)
+            if text:
+                return text
+        return None
+    return None
+
+
+def _normalize_order_by_value(value: Any) -> List[Dict[str, str]]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        return [value]
+    if not isinstance(value, str):
+        return []
+
+    text = value.strip()
+    if not text:
+        return []
+    parts = text.split()
+    field = parts[0].strip().lower()
+    if not field:
+        return []
+    direction = "desc"
+    if len(parts) >= 2 and parts[1].strip().lower() in {"asc", "desc"}:
+        direction = parts[1].strip().lower()
+    return [{"field": field, "direction": direction}]
+
+
+def _normalize_time_range_value(value: Any) -> Optional[Dict[str, Optional[str]]]:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        return {"start": text, "end": None}
+    return None
 
 
 def build_task_query_user_prompt(q: str) -> str:
