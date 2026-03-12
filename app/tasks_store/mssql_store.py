@@ -136,7 +136,7 @@ class MSSQLTasksStore(TasksStore):
         return [dict(zip(columns, row)) for row in cur.fetchall()]
 
     def _row_to_dict(self, row: Dict[str, Any]) -> Dict[str, Any]:
-        base: Dict[str, Any] = {}
+        base: Dict[str, Any] = dict(row)
         id_key = self._pick_row_key(row, "id")
         if id_key is not None:
             base["id"] = int(row[id_key]) if row[id_key] is not None else None
@@ -165,6 +165,12 @@ class MSSQLTasksStore(TasksStore):
             "status_note",
             "description",
             "person_id",
+            "owner",
+            "org_name",
+            "division_name",
+            "post_name",
+            "is_read",
+            "is_delegated",
         ):
             key = self._pick_row_key(row, field)
             if key is not None:

@@ -177,7 +177,12 @@ def task_status(person: str, task: str) -> Dict[str, Any]:
 
 
 @app.get("/tasks/ask")
-def tasks_ask(q: str, topk: int = 3, thresh: Optional[float] = None) -> Dict[str, Any]:
+def tasks_ask(
+    q: str,
+    topk: int = 3,
+    thresh: Optional[float] = None,
+    debug: bool = Query(False, description="Include step-by-step debug trace in the response"),
+) -> Dict[str, Any]:
     """
 
  
@@ -185,7 +190,7 @@ def tasks_ask(q: str, topk: int = 3, thresh: Optional[float] = None) -> Dict[str
     if not q.strip():
         raise HTTPException(400, "empty query")
 
-    payload = TQ_ENGINE.answer(q, topk=topk, thresh=thresh)
+    payload = TQ_ENGINE.answer(q, topk=topk, thresh=thresh, debug=debug)
     try:
         # For engines that do not populate IR fields themselves, backfill from a fresh parse.
         if "nl_ir" not in payload or "ir" not in payload:

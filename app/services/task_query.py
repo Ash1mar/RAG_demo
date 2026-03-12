@@ -217,7 +217,6 @@ _TEXT2SQL_JSON_SHAPE = (
 
 TEXT2SQL_MAX_QUERIES = 2
 TEXT2SQL_ROW_PREVIEW = 3
-TEXT2SQL_ANSWER_MAX_ROWS = 5
 TEXT2SQL_FORBIDDEN_KEYWORDS = (
     "insert",
     "update",
@@ -363,6 +362,44 @@ class Text2SQLGenerateError(Exception):
 
 class Text2SQLValidationError(Exception):
     """Raised when the generated SQL does not pass safety checks."""
+
+
+def _safe_debug_value(value: Any, *, max_items: int = 5) -> Any:
+    if isinstance(value, BaseModel):
+        return value.dict()
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, dict):
+        return {str(k): _safe_debug_value(v, max_items=max_items) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        items = [_safe_debug_value(v, max_items=max_items) for v in value[:max_items]]
+        if len(value) > max_items:
+            items.append(f"... ({len(value) - max_items} more)")
+        return items
+    return value
+
+
+def _append_debug_trace(
+    payload: Dict[str, Any],
+    *,
+    stage: str,
+    function: str,
+    inputs: Optional[Dict[str, Any]] = None,
+    output: Optional[Any] = None,
+    note: Optional[str] = None,
+) -> None:
+    trace = payload.setdefault("debug_trace", [])
+    entry: Dict[str, Any] = {
+        "stage": stage,
+        "function": function,
+    }
+    if inputs is not None:
+        entry["inputs"] = _safe_debug_value(inputs)
+    if output is not None:
+        entry["output"] = _safe_debug_value(output)
+    if note:
+        entry["note"] = note
+    trace.append(entry)
 
 
 @dataclass
@@ -737,16 +774,39 @@ class TaskQueryEngine:
 
         return alignment
 
-    def answer(self, q: str, topk: int = 3, thresh: Optional[float] = None) -> Dict[str, Any]:
+    def answer(
+        self,
+        q: str,
+        topk: int = 3,
+        thresh: Optional[float] = None,
+        *,
+        debug: bool = False,
+    ) -> Dict[str, Any]:
         """Main entry for non-LLM task status queries."""
         mode_raw = (self.resolver_mode or "hybrid").lower()
         nl2sql_attempted = False
         nl2sql_error: Optional[Dict[str, Any]] = None
+        debug_payload: Dict[str, Any] = {}
+        if debug:
+            _append_debug_trace(
+                debug_payload,
+                stage="request_received",
+                function="TaskQueryEngine.answer",
+                inputs={
+                    "question": q,
+                    "topk": topk,
+                    "thresh": thresh,
+                    "resolver_mode": mode_raw,
+                },
+            )
 
         if mode_raw == "nl2sql":
             nl2sql_attempted = True
             try:
-                return self._answer_via_nl2sql(q)
+                result = self._answer_via_nl2sql(q)
+                if debug:
+                    result.setdefault("debug_trace", []).extend(debug_payload.get("debug_trace", []))
+                return result
             except Exception as exc:  # defensive: fall back to legacy flow
                 nl2sql_error = {
                     "resolver_mode": "nl2sql_failed_fallback_legacy",
@@ -758,14 +818,32 @@ class TaskQueryEngine:
             result = self._answer_via_hybrid_llm(q, topk=topk, thresh=thresh)
             if nl2sql_attempted and nl2sql_error is not None:
                 result.update(nl2sql_error)
+            if debug:
+                result.setdefault("debug_trace", []).extend(debug_payload.get("debug_trace", []))
             return result
 
         if mode_raw == "text2sql":
             try:
                 spec = parse_task_query_nl(q)
+                if debug:
+                    _append_debug_trace(
+                        debug_payload,
+                        stage="nl_to_ir",
+                        function="parse_task_query_nl",
+                        inputs={"question": q},
+                        output=spec.dict(),
+                    )
             except Exception:
                 spec = None
-            result = self._answer_via_text2sql(q, spec)
+                if debug:
+                    _append_debug_trace(
+                        debug_payload,
+                        stage="nl_to_ir",
+                        function="parse_task_query_nl",
+                        inputs={"question": q},
+                        output={"error": "parse_failed"},
+                    )
+            result = self._answer_via_text2sql(q, spec, payload=debug_payload if debug else None)
             if nl2sql_attempted and nl2sql_error is not None:
                 result.update(nl2sql_error)
             return result
@@ -1261,6 +1339,7 @@ class TaskQueryEngine:
 
         base: Dict[str, Any] = dict(payload or {})
         base["resolver_mode"] = "text2sql"
+        debug_enabled = "debug_trace" in base
 
         if spec is not None:
             base.setdefault("intent", self._intent_label(spec))
@@ -1269,9 +1348,25 @@ class TaskQueryEngine:
             base.setdefault("intent", "unknown")
             base["nl_ir"] = {"error": "missing_spec"}
 
+        if debug_enabled:
+            _append_debug_trace(
+                base,
+                stage="resolver_enter",
+                function="TaskQueryEngine._answer_via_text2sql",
+                inputs={"question": q},
+                output={"intent": base.get("intent"), "nl_ir": base.get("nl_ir")},
+            )
+
         if not llm_settings.enabled or llm_settings.provider == "dummy":
             base["error"] = "text2sql_llm_disabled"
             base["answer"] = "Text2SQL pipeline requires a configured LLM provider."
+            if debug_enabled:
+                _append_debug_trace(
+                    base,
+                    stage="resolver_exit",
+                    function="TaskQueryEngine._answer_via_text2sql",
+                    output={"error": base["error"], "answer": base["answer"]},
+                )
             return base
         runtime = _resolve_text2sql_settings()
         runtime_provider = runtime.get("provider", llm_settings.provider)
@@ -1280,30 +1375,91 @@ class TaskQueryEngine:
             base["answer"] = (
                 f"Text2SQL is not yet supported for provider {runtime_provider}."
             )
+            if debug_enabled:
+                _append_debug_trace(
+                    base,
+                    stage="resolver_exit",
+                    function="TaskQueryEngine._answer_via_text2sql",
+                    output={"error": base["error"], "answer": base["answer"]},
+                )
             return base
 
         dialect = _resolve_text2sql_dialect()
         prompt = _build_text2sql_prompt(q, spec, dialect=dialect)
+        if debug_enabled:
+            _append_debug_trace(
+                base,
+                stage="text2sql_prompt_built",
+                function="_build_text2sql_prompt",
+                inputs={
+                    "question": q,
+                    "dialect": dialect,
+                    "runtime": runtime,
+                    "ir_hint": _make_text2sql_ir_hint(spec),
+                },
+                output={
+                    "system_prompt": _text2sql_system_prompt(dialect),
+                    "user_prompt": prompt,
+                },
+            )
         try:
-            llm_result, llm_runtime = _call_text2sql_llm(prompt, dialect=dialect)
+            llm_result, llm_runtime, llm_debug = _call_text2sql_llm(prompt, dialect=dialect)
         except Text2SQLGenerateError as exc:
             base["error"] = "text2sql_llm_failed"
             base["answer"] = "Failed to generate SQL from the LLM."
             base["reason"] = str(exc)
             if getattr(exc, "raw_response", None):
                 base["text2sql_raw_response"] = exc.raw_response
+            if debug_enabled:
+                _append_debug_trace(
+                    base,
+                    stage="text2sql_llm_failed",
+                    function="_call_text2sql_llm",
+                    inputs={"prompt": prompt, "dialect": dialect, "runtime": runtime},
+                    output={
+                        "error": str(exc),
+                        "raw_response": getattr(exc, "raw_response", None),
+                    },
+                )
             logger.warning("Text2SQL LLM failed: %s", exc)
             return base
+
+        if debug_enabled:
+            _append_debug_trace(
+                base,
+                stage="text2sql_llm_response",
+                function="_call_text2sql_llm",
+                inputs={"dialect": dialect},
+                output={
+                    "runtime": llm_runtime,
+                    "queries": [item.dict() for item in llm_result.queries],
+                    "llm_debug": llm_debug,
+                },
+            )
 
         if not llm_result.queries:
             base["error"] = "text2sql_empty_response"
             base["answer"] = "LLM did not return any SQL queries."
+            if debug_enabled:
+                _append_debug_trace(
+                    base,
+                    stage="resolver_exit",
+                    function="TaskQueryEngine._answer_via_text2sql",
+                    output={"error": base["error"], "answer": base["answer"]},
+                )
             return base
 
         query_fn = getattr(self.tasks_store, "query", None)
         if query_fn is None:
             base["error"] = "text2sql_query_not_supported_by_tasks_store"
             base["answer"] = "Current TasksStore cannot execute SQL queries."
+            if debug_enabled:
+                _append_debug_trace(
+                    base,
+                    stage="resolver_exit",
+                    function="TaskQueryEngine._answer_via_text2sql",
+                    output={"error": base["error"], "answer": base["answer"]},
+                )
             return base
 
         executed: List[Dict[str, Any]] = []
@@ -1324,7 +1480,31 @@ class TaskQueryEngine:
                 base["answer"] = "Generated SQL failed validation."
                 base["reason"] = str(exc)
                 base["invalid_sql"] = item.sql
+                if debug_enabled:
+                    _append_debug_trace(
+                        base,
+                        stage="text2sql_validation_failed",
+                        function="_normalize_and_validate_text2sql_query",
+                        inputs={
+                            "original_sql": item.sql,
+                            "rewritten_sql": rewritten_sql if "rewritten_sql" in locals() else None,
+                            "dialect": dialect,
+                        },
+                        output={"error": str(exc)},
+                    )
                 return base
+
+            if debug_enabled:
+                _append_debug_trace(
+                    base,
+                    stage="text2sql_sql_prepared",
+                    function="_normalize_and_validate_text2sql_query",
+                    inputs={"original_sql": item.sql, "description": item.description},
+                    output={
+                        "rewritten_sql": rewritten_sql,
+                        "normalized_sql": normalized_sql,
+                    },
+                )
 
             try:
                 rows = query_fn(normalized_sql, tuple())
@@ -1334,11 +1514,33 @@ class TaskQueryEngine:
                 base["reason"] = str(exc)
                 base["sql"] = normalized_sql
                 base["params"] = []
+                if debug_enabled:
+                    _append_debug_trace(
+                        base,
+                        stage="text2sql_db_query_failed",
+                        function="TasksStore.query",
+                        inputs={"sql": normalized_sql, "params": []},
+                        output={"error": str(exc)},
+                    )
                 logger.warning("Text2SQL query failed: %s", exc)
                 return base
 
+            if debug_enabled:
+                _append_debug_trace(
+                    base,
+                    stage="text2sql_db_query_executed",
+                    function="TasksStore.query",
+                    inputs={"sql": normalized_sql, "params": []},
+                    output={
+                        "row_count": len(rows),
+                        "rows_preview": rows[:TEXT2SQL_ROW_PREVIEW],
+                    },
+                )
+
             executed.append(
                 {
+                    "generated_sql": item.sql,
+                    "rewritten_sql": rewritten_sql,
                     "sql": normalized_sql,
                     "description": item.description,
                     "rows": rows,
@@ -1362,11 +1564,48 @@ class TaskQueryEngine:
             base["text2sql_provider"] = llm_runtime.get("provider")
 
         natural_answer: Optional[str] = None
+        answer_debug: Dict[str, Any] = {}
         if primary_rows:
             try:
-                natural_answer = _generate_text2sql_answer(q, primary_rows, llm_runtime)
+                natural_answer, answer_debug = _generate_text2sql_answer(q, primary_rows, llm_runtime)
             except Text2SQLGenerateError as exc:
                 base["text2sql_answer_error"] = str(exc)
+                if debug_enabled:
+                    _append_debug_trace(
+                        base,
+                        stage="answer_llm_failed",
+                        function="_generate_text2sql_answer",
+                        inputs={
+                            "question": q,
+                            "rows_for_prompt": primary_rows,
+                            "runtime": llm_runtime,
+                        },
+                        output={"error": str(exc)},
+                    )
+        elif debug_enabled:
+            _append_debug_trace(
+                base,
+                stage="answer_llm_skipped",
+                function="_generate_text2sql_answer",
+                inputs={"question": q},
+                output={"reason": "primary_rows_empty"},
+            )
+
+        if debug_enabled and answer_debug:
+            _append_debug_trace(
+                base,
+                stage="answer_llm_prompt",
+                function="_generate_text2sql_answer",
+                inputs={
+                    "question": q,
+                    "runtime": answer_debug.get("runtime"),
+                },
+                output={
+                    "rows_for_prompt": answer_debug.get("rows_for_prompt"),
+                    "prompt": answer_debug.get("prompt"),
+                    "response": answer_debug.get("response"),
+                },
+            )
 
         if natural_answer:
             base["answer"] = natural_answer
@@ -1374,6 +1613,18 @@ class TaskQueryEngine:
             base["answer"] = _summarize_text2sql_rows(primary_rows)
         else:
             base["answer"] = "Text2SQL query returned no rows."
+
+        if debug_enabled:
+            _append_debug_trace(
+                base,
+                stage="resolver_exit",
+                function="TaskQueryEngine._answer_via_text2sql",
+                output={
+                    "answer": base.get("answer"),
+                    "sql": base.get("sql"),
+                    "row_count": len(base.get("rows") or []),
+                },
+            )
 
         return base
 
@@ -1473,7 +1724,7 @@ def _make_text2sql_ir_hint(spec: Optional[TaskQuerySpec]) -> Dict[str, Any]:
 
 def _call_text2sql_llm(
     prompt: str, *, dialect: str = "sqlite"
-) -> Tuple[Text2SQLResponseModel, Dict[str, str]]:
+) -> Tuple[Text2SQLResponseModel, Dict[str, str], Dict[str, Any]]:
     if not llm_settings.enabled or llm_settings.provider == "dummy":
         raise Text2SQLGenerateError("LLM provider is not configured")
 
@@ -1481,19 +1732,19 @@ def _call_text2sql_llm(
     runtime = _resolve_text2sql_settings()
     provider = runtime["provider"]
     if provider == "ollama":
-        response = _call_text2sql_via_ollama(
+        response, debug_meta = _call_text2sql_via_ollama(
             prompt, runtime["model"], runtime["base_url"], system_prompt
         )
-        return response, runtime
+        return response, runtime, debug_meta
     if provider in {"openai", "dashscope"}:
-        response = _call_text2sql_via_openai(
+        response, debug_meta = _call_text2sql_via_openai(
             prompt,
             runtime["model"],
             runtime["base_url"],
             runtime["api_key"],
             system_prompt,
         )
-        return response, runtime
+        return response, runtime, debug_meta
 
     raise Text2SQLGenerateError(f"Provider {provider} is not supported for Text2SQL")
 
@@ -1536,7 +1787,7 @@ def _resolve_text2sql_settings() -> Dict[str, str]:
 
 def _call_text2sql_via_ollama(
     prompt: str, model: str, base_url: str, system_prompt: str
-) -> Text2SQLResponseModel:
+) -> Tuple[Text2SQLResponseModel, Dict[str, Any]]:
     """Call Ollama's /api/chat endpoint for Text2SQL."""
 
     payload: Dict[str, Any] = {
@@ -1593,7 +1844,13 @@ def _call_text2sql_via_ollama(
             ) from exc
 
     try:
-        return Text2SQLResponseModel.parse_obj(parsed)
+        model_payload = Text2SQLResponseModel.parse_obj(parsed)
+        return model_payload, {
+            "request": payload,
+            "response_text": response_text,
+            "parsed_content": content,
+            "parsed_json": parsed,
+        }
     except ValidationError as exc:
         raise Text2SQLGenerateError(
             f"LLM JSON does not match expected schema: {exc}", raw_response=content
@@ -1602,7 +1859,7 @@ def _call_text2sql_via_ollama(
 
 def _call_text2sql_via_openai(
     prompt: str, model: str, base_url: str, api_key: str, system_prompt: str
-) -> Text2SQLResponseModel:
+) -> Tuple[Text2SQLResponseModel, Dict[str, Any]]:
     """Call an OpenAI-compatible chat completion API for Text2SQL."""
 
     if not api_key:
@@ -1650,7 +1907,13 @@ def _call_text2sql_via_openai(
         )
 
     try:
-        return Text2SQLResponseModel.parse_obj(parsed)
+        model_payload = Text2SQLResponseModel.parse_obj(parsed)
+        return model_payload, {
+            "request": payload,
+            "response_text": response_text,
+            "parsed_content": content,
+            "parsed_json": parsed,
+        }
     except ValidationError as exc:
         raise Text2SQLGenerateError(
             f"LLM JSON does not match expected schema: {exc}", raw_response=response_text
@@ -1661,13 +1924,19 @@ def _generate_text2sql_answer(
     question: str,
     rows: List[Dict[str, Any]],
     runtime: Optional[Dict[str, str]],
-) -> Optional[str]:
+) -> Tuple[Optional[str], Dict[str, Any]]:
     if not rows or not runtime:
-        return None
-    preview = rows[:TEXT2SQL_ANSWER_MAX_ROWS]
-    prompt = _build_text2sql_answer_prompt(question, preview)
+        return None, {"skipped": True, "reason": "missing_rows_or_runtime"}
+    prompt_rows = list(rows)
+    prompt = _build_text2sql_answer_prompt(question, prompt_rows)
     content = _call_text2sql_answer_llm(prompt, runtime)
-    return content.strip() if content else None
+    answer = content.strip() if content else None
+    return answer, {
+        "runtime": runtime,
+        "rows_for_prompt": prompt_rows,
+        "prompt": prompt,
+        "response": content,
+    }
 
 
 def _build_text2sql_answer_prompt(

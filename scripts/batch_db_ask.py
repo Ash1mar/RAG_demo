@@ -15,9 +15,10 @@ Batch helper to sequentially query /tasks/ask.
   python scripts/batch_db_ask.py --endpoint http://localhost:8000/tasks/ask --file questions.txt
 """
 import argparse
+import json
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
-from typing import Iterable, List
+from typing import Any, Dict, Iterable, List
 
 import requests
 
@@ -43,10 +44,39 @@ def iter_questions(args: argparse.Namespace) -> Iterable[str]:
     return questions
 
 
-def ask(endpoint: str, question: str, timeout: int) -> dict:
-    resp = requests.get(endpoint, params={"q": question}, timeout=timeout)
+def ask(endpoint: str, question: str, timeout: int, debug_trace: bool = False) -> dict:
+    params = {"q": question}
+    if debug_trace:
+        params["debug"] = "true"
+    resp = requests.get(endpoint, params=params, timeout=timeout)
     resp.raise_for_status()
     return resp.json()
+
+
+def _print_json_block(title: str, value: Any) -> None:
+    print(title)
+    print(json.dumps(value, ensure_ascii=False, indent=2))
+
+
+def print_debug_trace(payload: Dict[str, Any]) -> None:
+    trace = payload.get("debug_trace") or []
+    if not trace:
+        print("--- Debug trace: <empty>")
+        return
+
+    print("\n--- Debug trace start ---")
+    for idx, step in enumerate(trace, start=1):
+        stage = step.get("stage") or f"step_{idx}"
+        function = step.get("function") or "unknown"
+        print(f"[{idx}] {stage} :: {function}")
+        if "note" in step:
+            print("  note:")
+            print(f"    {step.get('note')}")
+        if "inputs" in step:
+            _print_json_block("  inputs:", step.get("inputs"))
+        if "output" in step:
+            _print_json_block("  output:", step.get("output"))
+    print("--- Debug trace end ---")
 
 def fetch_health(endpoint: str, timeout: int) -> dict:
     parsed = urlparse(endpoint)
@@ -88,6 +118,11 @@ def main() -> None:
         default=300,
         help="HTTP 超时时间（秒），默认 300",
     )
+    parser.add_argument(
+        "--debug-trace",
+        action="store_true",
+        help="请求服务端返回 step-by-step 调试信息，并在每个问题最后打印完整链路",
+    )
     args = parser.parse_args()
 
     try:
@@ -107,7 +142,7 @@ def main() -> None:
     for idx, question in enumerate(questions, start=1):
         print(f"\n=== Q{idx}: {question}")
         try:
-            payload = ask(args.endpoint, question, args.timeout)
+            payload = ask(args.endpoint, question, args.timeout, debug_trace=args.debug_trace)
         except Exception as exc:
             print(f"Request failed: {exc}")
             continue
@@ -162,6 +197,13 @@ def main() -> None:
                 print("    SQL:", item.get("sql"))
                 if item.get("description"):
                     print("    Description:", item.get("description"))
+                if item.get("generated_sql"):
+                    print("    Generated SQL:", item.get("generated_sql"))
+                if item.get("rewritten_sql"):
+                    print("    Rewritten SQL:", item.get("rewritten_sql"))
+
+        if args.debug_trace:
+            print_debug_trace(payload)
 
 
 if __name__ == "__main__":

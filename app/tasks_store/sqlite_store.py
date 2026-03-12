@@ -196,8 +196,13 @@ class SQLiteTasksStore(TasksStore):
 
     # --- internal mapping ---
     def _row_to_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
-        """Normalize SQLite row to a dict with optional extended fields."""
-        base: Dict[str, Any] = {}
+        """Normalize SQLite row to a dict while preserving selected columns.
+
+        Text2SQL may project enterprise fields such as division_name/org_name/post_name
+        or ad-hoc aliases. Keep the raw selected columns first, then overlay the
+        stable logical keys used elsewhere in the app.
+        """
+        base: Dict[str, Any] = {str(key): row[key] for key in row.keys()}
         id_key = self._pick_row_key(row, "id")
         if id_key is None:
             base["id"] = None
@@ -229,6 +234,12 @@ class SQLiteTasksStore(TasksStore):
             "status_note",
             "description",
             "person_id",
+            "owner",
+            "org_name",
+            "division_name",
+            "post_name",
+            "is_read",
+            "is_delegated",
         ):
             key = self._pick_row_key(row, field)
             if key is not None:
