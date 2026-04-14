@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pyodbc
+from sqlglot import exp, parse_one
 
 from app.tasks_store.base import TasksStore
 from app.tasks_schema import TasksSchemaConfig, get_tasks_schema_config
@@ -246,8 +247,19 @@ class MSSQLTasksStore(TasksStore):
         s = (sql or "").strip().lower()
         if not s.startswith("select"):
             raise ValueError("only SELECT statements are allowed in MSSQLTasksStore.query")
-        allowed_targets = tuple(f" from {name.lower()}" for name in self._schema.allowed_relations)
-        if not any(t in s for t in allowed_targets):
+        allowed_targets = {str(name).strip().lower() for name in self._schema.allowed_relations}
+        try:
+            expr = parse_one(sql, read="tsql")
+        except Exception as exc:
+            raise ValueError(f"failed to parse SQL for validation: {exc}") from exc
+        referenced = {
+            str(table.name).strip().lower()
+            for table in expr.find_all(exp.Table)
+            if getattr(table, "name", None)
+        }
+        if not referenced:
+            raise ValueError("query must reference at least one allowed relation")
+        if not referenced.issubset(allowed_targets):
             raise ValueError(f"query must target one of: {', '.join(self._schema.allowed_relations)}")
         rows = self._exec_select(sql, params)
         return [self._row_to_dict(r) for r in rows]

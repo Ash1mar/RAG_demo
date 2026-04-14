@@ -13,6 +13,7 @@ import sys
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from app.services.answer import build_answer
@@ -26,6 +27,7 @@ from app.services.task_query import TaskQueryEngine
 from app.services.nl2sql_engine import parse_task_query_nl, build_task_query_plan
 from app.services.sql_compiler import compile_tasks_sql, TaskSqlCompileError
 from app.tasks_store.base import TasksStore
+from app.ui_page import UI_HTML
 
 
 app = FastAPI(title="Minimal RAG Demo", version="0.1.0")
@@ -263,6 +265,12 @@ def db_ask(q: str = Query(..., description="Natural language task query for dire
         "rows": rows,
         "kg_enabled": bool((spec.extra or {}).get("kg_enabled")),
     }
+
+
+@app.get("/", response_class=HTMLResponse)
+@app.get("/ui", response_class=HTMLResponse)
+def ui_page() -> HTMLResponse:
+    return HTMLResponse(UI_HTML)
 
 
 @app.post("/tasks/reload")

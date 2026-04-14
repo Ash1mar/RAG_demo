@@ -364,14 +364,20 @@ class Text2SQLValidationError(Exception):
     """Raised when the generated SQL does not pass safety checks."""
 
 
-def _safe_debug_value(value: Any, *, max_items: int = 5) -> Any:
+def _safe_debug_value(value: Any, *, max_items: Optional[int] = 5) -> Any:
     if isinstance(value, BaseModel):
         return value.dict()
     if isinstance(value, Enum):
         return value.value
     if isinstance(value, dict):
-        return {str(k): _safe_debug_value(v, max_items=max_items) for k, v in value.items()}
+        out: Dict[str, Any] = {}
+        for k, v in value.items():
+            child_max_items = None if str(k) == "rows_for_prompt" else max_items
+            out[str(k)] = _safe_debug_value(v, max_items=child_max_items)
+        return out
     if isinstance(value, (list, tuple)):
+        if max_items is None:
+            return [_safe_debug_value(v, max_items=None) for v in value]
         items = [_safe_debug_value(v, max_items=max_items) for v in value[:max_items]]
         if len(value) > max_items:
             items.append(f"... ({len(value) - max_items} more)")
@@ -2499,16 +2505,27 @@ def _summarize_text2sql_rows(rows: List[Dict[str, Any]]) -> str:
     parts: List[str] = []
     preview = rows[:TEXT2SQL_ROW_PREVIEW]
     for row in preview:
-        person = row.get("person") or "unknown person"
-        task = row.get("task") or "unknown task"
-        status = str(row.get("status", "") or "").upper() or "UNKNOWN"
-        ts_val = row.get("ts")
-        try:
-            ts_int = int(ts_val)
-        except (TypeError, ValueError):
-            ts_int = None
-        ts_str = ts_to_str(ts_int) if ts_int is not None else str(ts_val)
-        parts.append(f'{person} / "{task}" -> {status} (ts={ts_str})')
+        if any(key in row for key in ("person", "task", "status", "ts")):
+            person = row.get("person") or "unknown person"
+            task = row.get("task") or "unknown task"
+            status = str(row.get("status", "") or "").upper() or "UNKNOWN"
+            ts_val = row.get("ts")
+            try:
+                ts_int = int(ts_val)
+            except (TypeError, ValueError):
+                ts_int = None
+            ts_str = ts_to_str(ts_int) if ts_int is not None else str(ts_val)
+            parts.append(f'{person} / "{task}" -> {status} (ts={ts_str})')
+            continue
+
+        if not row:
+            parts.append("<empty row>")
+            continue
+
+        generic_bits: List[str] = []
+        for key, value in row.items():
+            generic_bits.append(f"{key}={value}")
+        parts.append(", ".join(generic_bits))
 
     remainder = len(rows) - len(preview)
     summary = "; ".join(parts)
