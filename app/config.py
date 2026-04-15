@@ -14,6 +14,10 @@ class LLMSettings(BaseModel):
     model: str = Field("qwen2.5-coder:7b", alias="LLM_MODEL")
     text2sql_provider: Optional[str] = Field(None, alias="LLM_TEXT2SQL_PROVIDER")
     text2sql_model: str = Field("qwen3-coder:480b-cloud", alias="LLM_TEXT2SQL_MODEL")
+    text2sql_timeout: float = Field(180.0, alias="LLM_TEXT2SQL_TIMEOUT")
+    text2sql_answer_timeout: Optional[float] = Field(
+        None, alias="LLM_TEXT2SQL_ANSWER_TIMEOUT"
+    )
     ollama_base_url: str = Field("http://localhost:11434", alias="LLM_OLLAMA_BASE_URL")
     text2sql_ollama_base_url: Optional[str] = Field(
         None, alias="LLM_TEXT2SQL_OLLAMA_BASE_URL"
@@ -51,6 +55,14 @@ def _load_llm_settings() -> LLMSettings:
     v = getenv("LLM_TEXT2SQL_MODEL")
     if v is not None:
         raw["LLM_TEXT2SQL_MODEL"] = v
+
+    v = getenv("LLM_TEXT2SQL_TIMEOUT")
+    if v is not None:
+        raw["LLM_TEXT2SQL_TIMEOUT"] = v
+
+    v = getenv("LLM_TEXT2SQL_ANSWER_TIMEOUT")
+    if v is not None:
+        raw["LLM_TEXT2SQL_ANSWER_TIMEOUT"] = v
 
     v = getenv("LLM_OLLAMA_BASE_URL")
     if v is not None:

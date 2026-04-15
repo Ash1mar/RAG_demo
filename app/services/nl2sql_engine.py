@@ -430,6 +430,11 @@ def is_simple_intent(spec: Optional[TaskQuerySpec]) -> bool:
 
 
 _USE_LLM_FOR_NL2SQL = getenv("TASKS_NL2SQL_LLM", "0") == "1"
+_TASK_STATUS_VALUES = {
+    item.strip().upper()
+    for item in getenv("TASKS_STATUS_VALUES", "DONE,TODO").split(",")
+    if item.strip()
+}
 
 _PERSON_SEPARATOR_CHARS = "、，,/和及与"
 _MULTI_ENTITY_SPLIT_RE = re.compile(f"[{_PERSON_SEPARATOR_CHARS}\+\s]+")
@@ -512,6 +517,65 @@ _PRIORITY_HINTS = [
 
 _ORDER_ASC_HINTS = ("最早", "时间升序", "按创建顺序")
 _ORDER_DESC_HINTS = ("最新", "最近", "按更新时间", "按优先级")
+_DUE_TIME_HINTS = ("截止", "到期", "ddl", "DDL", "计划完成", "期限")
+_STATUS_TIME_HINTS = (
+    "更新时间",
+    "更新于",
+    "最近更新",
+    "状态时间",
+    "完成时间",
+    "什么时候完成",
+    "何时完成",
+)
+_TASK_QUESTION_FRAGMENTS = (
+    "任务有哪些",
+    "有哪些任务",
+    "哪些任务",
+    "任务列表",
+    "任务清单",
+    "所有任务",
+    "全部任务",
+    "多少任务",
+    "几个任务",
+    "什么任务",
+)
+_PERSON_CLAUSE_MARKERS = (
+    "还剩多少",
+    "剩余多少",
+    "剩下多少",
+    "还有多少",
+    "还剩",
+    "剩余",
+    "剩下",
+    "都完成了哪些",
+    "完成了哪些",
+    "都有哪些",
+    "有哪些",
+    "哪些",
+    "最近",
+    "本周",
+    "本月",
+    "截止",
+    "到期",
+    "高优",
+    "P1",
+    "P2",
+    "P3",
+    "都完成了",
+    "完成了",
+    "都负责",
+    "负责",
+    "参与",
+)
+_PERSON_PREFIXES = ("列出", "查看", "查询", "给我看", "看一下", "统计")
+_REMAINING_COUNT_HINTS = (
+    "还剩多少任务",
+    "剩余多少任务",
+    "剩下多少任务",
+    "还有多少任务",
+    "多少任务未完成",
+    "未完成多少任务",
+)
 
 _COMPLEX_KEYWORDS = [
     "\u7edf\u8ba1",
@@ -579,8 +643,22 @@ def _person_has_stopword(token: str) -> bool:
     return any(stop in token for stop in _PERSON_STOPWORDS)
 
 
+def _trim_person_clause(token: str) -> str:
+    candidate = (token or "").strip()
+    if not candidate:
+        return ""
+    for prefix in _PERSON_PREFIXES:
+        if candidate.startswith(prefix) and len(candidate) > len(prefix):
+            candidate = candidate[len(prefix) :].strip()
+            break
+    for marker in _PERSON_CLAUSE_MARKERS:
+        if marker in candidate:
+            candidate = candidate.split(marker, 1)[0].strip()
+    return candidate
+
+
 def _sanitize_person_value(value: Optional[str]) -> Optional[str]:
-    token = _normalize_person_candidate(value)
+    token = _normalize_person_candidate(_trim_person_clause(value or ""))
     if not token:
         return None
     if _person_has_stopword(token):
@@ -646,6 +724,192 @@ def _detect_due_range(text: str) -> Optional[TimeRange]:
             start = f"now-{amount * 30}d"
         return TimeRange(start=start, end="now")
     return None
+
+
+def _mentions_due_time(text: str) -> bool:
+    return any(kw in (text or "") for kw in _DUE_TIME_HINTS)
+
+
+def _mentions_status_time(text: str) -> bool:
+    return any(kw in (text or "") for kw in _STATUS_TIME_HINTS)
+
+
+def _mentions_created_time(text: str) -> bool:
+    lower = (text or "").lower()
+    return any(kw in (text or "") for kw in ("创建", "新建")) or "create" in lower or "created" in lower
+
+
+def _is_remaining_count_question(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    return any(hint in t for hint in _REMAINING_COUNT_HINTS) or (
+        "多少" in t and "任务" in t and any(kw in t for kw in ("还剩", "剩余", "剩下", "未完成"))
+    )
+
+
+def _looks_like_task_question_fragment(value: Optional[str], raw_query: str = "") -> bool:
+    token = (value or "").strip()
+    if not token:
+        return False
+    raw = (raw_query or "").strip()
+    if raw and token == raw and _is_list_style_question(raw):
+        return True
+    if any(fragment in token for fragment in _TASK_QUESTION_FRAGMENTS):
+        return True
+    if "?" in token or "？" in token:
+        return True
+    if len(token) > 30 and any(kw in token for kw in ("哪些", "什么", "多少")):
+        return True
+    return False
+
+
+def _clean_spurious_task_entities(spec: TaskQuerySpec, text: str) -> None:
+    list_style = _is_list_style_question(text)
+    cleanups: List[str] = []
+
+    task_value = (getattr(spec, "task", None) or "").strip()
+    if task_value and (list_style or _looks_like_task_question_fragment(task_value, text)):
+        spec.task = None
+        cleanups.append("cleared_task_question_fragment")
+
+    filters = list(getattr(spec, "filters", []) or [])
+    if filters:
+        kept: List[QueryFilter] = []
+        removed_task_filter = False
+        for flt in filters:
+            field = str(getattr(flt, "field", "") or "").lower()
+            if field != "task":
+                kept.append(flt)
+                continue
+            op = str(getattr(flt, "op", "") or "eq").lower()
+            if list_style:
+                removed_task_filter = True
+                continue
+            if op == "in":
+                values = [
+                    val
+                    for val in (getattr(flt, "values", None) or [])
+                    if not _looks_like_task_question_fragment(str(val), text)
+                    and not _looks_like_person(str(val))
+                ]
+                if values:
+                    flt.values = values
+                    kept.append(flt)
+                else:
+                    removed_task_filter = True
+                continue
+            value = getattr(flt, "value", None)
+            if _looks_like_task_question_fragment(str(value or ""), text) or _looks_like_person(
+                str(value or "")
+            ):
+                removed_task_filter = True
+                continue
+            kept.append(flt)
+        if removed_task_filter:
+            cleanups.append("removed_spurious_task_filter")
+        spec.filters = kept
+
+    if list_style and getattr(spec, "task_keywords", None):
+        keywords = [
+            kw
+            for kw in (getattr(spec, "task_keywords", None) or [])
+            if not _looks_like_task_question_fragment(str(kw), text)
+            and str(kw).strip() not in {"任务", "有哪些", "哪些"}
+        ]
+        if len(keywords) != len(getattr(spec, "task_keywords", None) or []):
+            cleanups.append("trimmed_task_keywords")
+        spec.task_keywords = keywords
+
+    if cleanups:
+        extra = getattr(spec, "extra", None) or {}
+        current = list(extra.get("ir_cleanups") or [])
+        for item in cleanups:
+            if item not in current:
+                current.append(item)
+        extra["ir_cleanups"] = current
+        spec.extra = extra
+
+
+def _clear_due_polluted_time_range(spec: TaskQuerySpec, text: str) -> None:
+    if not getattr(spec, "due_range", None):
+        return
+    if not getattr(spec, "time_range", None):
+        return
+    if not _mentions_due_time(text) or _mentions_status_time(text):
+        return
+    spec.time_range = None
+    extra = getattr(spec, "extra", None) or {}
+    current = list(extra.get("ir_cleanups") or [])
+    if "cleared_time_range_for_due_query" not in current:
+        current.append("cleared_time_range_for_due_query")
+    extra["ir_cleanups"] = current
+    spec.extra = extra
+
+
+def _normalize_due_range_from_text(spec: TaskQuerySpec, text: str) -> None:
+    if not _mentions_due_time(text):
+        return
+    detected = _detect_due_range(text)
+    if not detected:
+        return
+    current = getattr(spec, "due_range", None)
+    if current and current.start == detected.start and current.end == detected.end:
+        return
+    spec.due_range = detected
+    extra = getattr(spec, "extra", None) or {}
+    current_cleanups = list(extra.get("ir_cleanups") or [])
+    if "normalized_due_range_from_text" not in current_cleanups:
+        current_cleanups.append("normalized_due_range_from_text")
+    extra["ir_cleanups"] = current_cleanups
+    spec.extra = extra
+
+
+def _clear_unmentioned_created_range(spec: TaskQuerySpec, text: str) -> None:
+    if not getattr(spec, "created_range", None):
+        return
+    if _mentions_created_time(text):
+        return
+    spec.created_range = None
+    extra = getattr(spec, "extra", None) or {}
+    current = list(extra.get("ir_cleanups") or [])
+    if "cleared_unmentioned_created_range" not in current:
+        current.append("cleared_unmentioned_created_range")
+    extra["ir_cleanups"] = current
+    spec.extra = extra
+
+
+def _normalize_statuses_against_config(spec: TaskQuerySpec) -> None:
+    if not _TASK_STATUS_VALUES or {"DONE", "TODO"} - _TASK_STATUS_VALUES:
+        return
+    normalized: List[TaskStatus] = []
+    mapped: List[str] = []
+    seen: Set[TaskStatus] = set()
+    for status in getattr(spec, "status", None) or []:
+        current = status if isinstance(status, TaskStatus) else None
+        if current is None:
+            try:
+                current = TaskStatus(str(status))
+            except ValueError:
+                continue
+        if current in (TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED):
+            mapped.append(f"{current.value}->TODO")
+            current = TaskStatus.TODO
+        if current != TaskStatus.ANY and current.value not in _TASK_STATUS_VALUES:
+            continue
+        if current not in seen:
+            seen.add(current)
+            normalized.append(current)
+    if normalized != list(getattr(spec, "status", None) or []):
+        spec.status = normalized
+    if mapped:
+        extra = getattr(spec, "extra", None) or {}
+        current = list(extra.get("status_value_mappings") or [])
+        for item in mapped:
+            if item not in current:
+                current.append(item)
+        extra["status_value_mappings"] = current
+        spec.extra = extra
 
 def _looks_like_person(token: str) -> bool:
     candidate = _normalize_person_candidate(token)
@@ -745,6 +1009,49 @@ def _build_multi_filter(field: str, values: List[str]) -> Optional[QueryFilter]:
     return QueryFilter(field=field, op="in", values=values)
 
 
+def _filter_value_text(value: Any) -> Optional[str]:
+    coerced = _coerce_sql_param_scalar(value)
+    if coerced in (None, ""):
+        return None
+    return str(coerced).strip() or None
+
+
+def _normalize_filter_payloads(spec: TaskQuerySpec) -> None:
+    normalized_filters: List[QueryFilter] = []
+    for flt in list(getattr(spec, "filters", None) or []):
+        field = str(getattr(flt, "field", "") or "").lower()
+        op = str(getattr(flt, "op", "") or "eq").lower()
+        values = list(getattr(flt, "values", None) or [])
+        if values:
+            scalar_values: List[Any] = []
+            for item in values:
+                if field == "priority":
+                    priority_value = _coerce_priority_value(item)
+                    if priority_value is not None:
+                        scalar_values.append(priority_value)
+                        continue
+                text_value = _filter_value_text(item)
+                if text_value is not None:
+                    scalar_values.append(text_value)
+            if op == "in":
+                flt.values = scalar_values
+            elif len(scalar_values) == 1 and getattr(flt, "value", None) in (None, ""):
+                flt.value = scalar_values[0]
+                flt.values = None
+            elif len(scalar_values) > 1 and field in {"person", "task", "status", "project", "owner"}:
+                flt.op = "in"
+                flt.value = None
+                flt.values = scalar_values
+            elif scalar_values:
+                flt.values = scalar_values
+        if field == "priority" and getattr(flt, "value", None) not in (None, ""):
+            priority_value = _coerce_priority_value(getattr(flt, "value", None))
+            if priority_value is not None:
+                flt.value = priority_value
+        normalized_filters.append(flt)
+    spec.filters = normalized_filters
+
+
 def _extract_person_task(text: str) -> Dict[str, Optional[str]]:
     """Return parsed person/task strings from a natural language question."""
     match = _PERSON_TASK_STATUS_RE.search(text)
@@ -823,13 +1130,32 @@ def _ensure_person_filter_from_text(spec: TaskQuerySpec, text: str) -> None:
     if len(persons) < 2:
         return
     filters = list(getattr(spec, "filters", []) or [])
+    for flt in filters:
+        if (
+            str(getattr(flt, "field", "")).lower() == "person"
+            and str(getattr(flt, "op", "")).lower() == "in"
+        ):
+            normalized = [
+                text_value
+                for item in (getattr(flt, "values", None) or [])
+                for text_value in [_filter_value_text(item)]
+                if text_value
+            ]
+            if not set(persons).issubset(set(normalized)):
+                normalized = persons
+            flt.values = normalized
+            spec.filters = filters
+            if not (getattr(spec, "person", None) or "").strip():
+                spec.person = persons[0]
+            return
     has_person_filter = any(
         str(getattr(f, "field", "")).lower() == "person"
-        and str(getattr(f, "op", "")).lower() == "in"
         and getattr(f, "values", None)
         for f in filters
     )
     if has_person_filter:
+        if not (getattr(spec, "person", None) or "").strip():
+            spec.person = persons[0]
         return
     filters.append(QueryFilter(field="person", op="in", values=persons))
     spec.filters = filters
@@ -1025,6 +1351,13 @@ def _post_process_intent(spec: TaskQuerySpec, text: str) -> None:
     status_kws = ("已完成", "未完成", "done", "todo", "搞定", "结束")
     status_kws_lower = tuple(kw.lower() for kw in status_kws)
 
+    if _is_remaining_count_question(t):
+        spec.intent = TaskQueryIntent.task_status_list
+        spec.answer_mode = TaskAnswerMode.task_count_by_status
+        spec.status = [TaskStatus.TODO]
+        spec.task = None
+        _prune_filters_by_field(spec, "task")
+
     # 如果 LLM/规则没有给出任何 status，就根据文本自动推断一遍
     if not getattr(spec, "status", None):
         status_hints: list[TaskStatus] = []
@@ -1201,11 +1534,6 @@ def _post_process_intent(spec: TaskQuerySpec, text: str) -> None:
         not getattr(spec, "person", None)
         and len(person_tokens_hint) == 1
         and not has_person_scope_filter
-        and not (
-            list_style
-            and getattr(spec, "intent", None)
-            in (TaskQueryIntent.task_status_list, TaskQueryIntent.task_list_by_person)
-        )
     ):
         spec.person = person_tokens_hint[0]
     if not getattr(spec, "task", None) and spec.intent in (
@@ -1226,6 +1554,9 @@ def _post_process_intent(spec: TaskQuerySpec, text: str) -> None:
     if getattr(spec, "task", None):
         spec.task = str(spec.task).strip()
 
+    _normalize_filter_payloads(spec)
+    _clean_spurious_task_entities(spec, t)
+
     if spec.intent == TaskQueryIntent.task_list_by_person and not spec.person:
         spec.is_supported = False
         spec.extra.setdefault("unsupported_reason", "list_by_person_missing_person")
@@ -1245,6 +1576,11 @@ def _post_process_intent(spec: TaskQuerySpec, text: str) -> None:
         cr = _detect_created_range(t)
         if cr:
             spec.created_range = cr
+
+    _normalize_due_range_from_text(spec, t)
+    _clear_due_polluted_time_range(spec, t)
+    _clear_unmentioned_created_range(spec, t)
+    _normalize_statuses_against_config(spec)
 
     if spec.priority is None:
         pr = _detect_priority(t)
@@ -1298,6 +1634,20 @@ def parse_task_query_nl(q: str) -> TaskQuerySpec:
     if llm_error is not None:
         spec.extra.setdefault("nl2sql_llm_error", str(llm_error))
     return spec
+
+
+def sanitize_task_query_spec_for_downstream(spec: TaskQuerySpec) -> TaskQuerySpec:
+    """Return a cleaned copy of TaskQuerySpec for prompts or fallback SQL."""
+
+    cleaned = spec.copy(deep=True)
+    text = (getattr(cleaned, "raw_query", "") or "").strip()
+    _normalize_filter_payloads(cleaned)
+    _clean_spurious_task_entities(cleaned, text)
+    _normalize_due_range_from_text(cleaned, text)
+    _clear_due_polluted_time_range(cleaned, text)
+    _clear_unmentioned_created_range(cleaned, text)
+    _normalize_statuses_against_config(cleaned)
+    return cleaned
 
 
 def _rule_based_parse_task_query_nl(q: str) -> TaskQuerySpec:
@@ -1360,14 +1710,19 @@ def _rule_based_parse_task_query_nl_v2(q: str) -> TaskQuerySpec:
     text = (q or "").strip()
 
     text_lower = text.lower()
+    list_style = _is_list_style_question(text)
 
     # 1) coarse intent guess
     intent = TaskQueryIntent.task_status_single
     answer_mode = TaskAnswerMode.default
+    remaining_count = _is_remaining_count_question(text)
     if any(kw in text for kw in ("列表", "有哪些", "所有", "全部", "清单")):
         intent = TaskQueryIntent.task_status_list
     if "任务列表" in text or "有哪些" in text:
         intent = TaskQueryIntent.task_list_by_person
+    if remaining_count:
+        intent = TaskQueryIntent.task_status_list
+        answer_mode = TaskAnswerMode.task_count_by_status
 
     completion_mode = any(kw in text for kw in _COMPLETION_TIME_HINTS)
     if completion_mode:
@@ -1377,17 +1732,26 @@ def _rule_based_parse_task_query_nl_v2(q: str) -> TaskQuerySpec:
     entities = _extract_person_task(text)
     raw_person = entities.get("person")
     person = _sanitize_person_value(raw_person)
-    task = entities.get("task") or text or None
+    task = entities.get("task")
+    if list_style and task and _looks_like_task_question_fragment(task, text):
+        task = None
+    if remaining_count:
+        task = None
+    if not task and not list_style and not remaining_count:
+        task = text or None
 
     person_tokens_raw = _split_multi_values(raw_person)
-    if not person_tokens_raw and person:
+    text_person_tokens = _extract_person_tokens_from_text(text)
+    if text_person_tokens:
+        person_tokens_raw = text_person_tokens
+    elif not person_tokens_raw and person:
         person_tokens_raw = [person]
     person_tokens: List[str] = []
     for token in person_tokens_raw:
         normalized = _sanitize_person_value(token)
         if normalized and _looks_like_person(normalized) and normalized not in person_tokens:
             person_tokens.append(normalized)
-    task_tokens = _split_multi_values(task)
+    task_tokens = [] if (list_style or remaining_count) else _split_multi_values(task)
     filters: List[QueryFilter] = []
     person_filter = _build_multi_filter("person", person_tokens)
     if person_filter:
@@ -1411,7 +1775,9 @@ def _rule_based_parse_task_query_nl_v2(q: str) -> TaskQuerySpec:
     for kws, st in status_map:
         if any(kw.lower() in text_lower for kw in kws):
             status.append(st)
-    if completion_mode:
+    if remaining_count:
+        status = [TaskStatus.TODO]
+    elif completion_mode:
         answer_mode = TaskAnswerMode.completion_time_latest
         status = [TaskStatus.DONE]
     elif not status and "状态" in text and intent == TaskQueryIntent.task_status_single:
@@ -1427,7 +1793,8 @@ def _rule_based_parse_task_query_nl_v2(q: str) -> TaskQuerySpec:
     tags = _extract_tags(text)
     priority = _detect_priority(text)
     detected_limit = _detect_limit(text)
-    time_range = _detect_time_range(text)
+    due_range = _detect_due_range(text)
+    time_range = None if due_range and not _mentions_status_time(text) else _detect_time_range(text)
     created_range = _detect_created_range(text)
 
     order_by = [
@@ -1464,6 +1831,7 @@ def _rule_based_parse_task_query_nl_v2(q: str) -> TaskQuerySpec:
         priority=priority,
         status=status,
         time_range=time_range,
+        due_range=due_range,
         created_range=created_range,
         order_by=order_by,
         limit=limit,

@@ -64,13 +64,22 @@ class TaskCountByStatusHandler:
             for status in sorted(counts_map.keys(), key=lambda s: (-counts_map[s], s))
         ]
         total = sum(item["count"] for item in counts)
-        stats_str = ", ".join(f"{item['status']}={item['count']}" for item in counts) or "none"
+        status_labels = {
+            "TODO": "未完成",
+            "DONE": "已完成",
+            "IN_PROGRESS": "处理中",
+            "BLOCKED": "卡点",
+        }
+        stats_str = "、".join(
+            f"{status_labels.get(item['status'], item['status'])}={item['count']}"
+            for item in counts
+        ) or "无"
         if ctx.person_filters_active and ctx.person_filter_values:
             subject_label = ", ".join(ctx.person_filter_values)
         elif ctx.person:
             subject_label = str(ctx.person)
         else:
-            subject_label = "Tasks"
+            subject_label = "任务"
         scope_bits: List[str] = []
         time_range = getattr(ctx.spec, "time_range", None)
         if time_range:
@@ -82,13 +91,13 @@ class TaskCountByStatusHandler:
             scope_bits.append(
                 f"due_range={getattr(due_range, 'start', None) or '*'}~{getattr(due_range, 'end', None) or '*'}"
             )
-        scope_suffix = f" within {', '.join(scope_bits)}" if scope_bits else ""
-        if subject_label == "Tasks":
-            answer_prefix = "Tasks by status"
+        scope_suffix = f"（范围：{', '.join(scope_bits)}）" if scope_bits else ""
+        if subject_label == "任务":
+            answer_prefix = "任务按状态统计"
         else:
-            answer_prefix = f"{subject_label} tasks by status"
+            answer_prefix = f"{subject_label}的任务按状态统计"
         payload = {
-            "answer": f"{answer_prefix}{scope_suffix}: {stats_str} (total {total}).",
+            "answer": f"{answer_prefix}{scope_suffix}：{stats_str}（总计 {total}）。",
             "person": None if ctx.person_filters_active else ctx.person,
             "persons": ctx.person_filter_values if ctx.person_filters_active else ([ctx.person] if ctx.person else []),
             "task": None,

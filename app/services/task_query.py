@@ -27,6 +27,7 @@ from app.services.nl2sql_engine import (
     is_complex_by_text,
     is_simple_intent,
     parse_task_query_nl,
+    sanitize_task_query_spec_for_downstream,
     too_many_entities,
 )
 from app.services.sql_compiler import TaskSqlCompileError, compile_tasks_sql
@@ -65,7 +66,7 @@ _TEXT2SQL_COLUMN_SPECS: Tuple[Tuple[str, str, Optional[str]], ...] = (
     ("person", "TEXT NOT NULL", None),
     ("owner", "TEXT", None),
     ("task", "TEXT NOT NULL", None),
-    ("status", "TEXT NOT NULL", "DONE | TODO | IN_PROGRESS | BLOCKED"),
+    ("status", "TEXT NOT NULL", "observed values in task_latest.csv: DONE | TODO"),
     ("ts", "INTEGER NOT NULL", "epoch milliseconds"),
     ("project", "TEXT", None),
     ("tags", "TEXT", "comma-separated strings"),
@@ -233,6 +234,7 @@ TEXT2SQL_DISALLOWED_FUNCTIONS = ('date_sub', 'curdate')
 TEXT2SQL_SUSPICIOUS_LITERAL_THRESHOLD = 10_000_000_000
 _MILLIS_PER_SECOND = 1000
 _MILLIS_PER_DAY = 24 * 60 * 60 * _MILLIS_PER_SECOND
+TEXT2SQL_DEFAULT_TIMEOUT_SEC = 180.0
 TEXT2SQL_ANSWER_SYSTEM_PROMPT = (
     "You are a precise assistant for summarizing SQL query results about task statuses. "
     "Use the provided rows to answer the user's question in Chinese. "
@@ -1335,6 +1337,97 @@ class TaskQueryEngine:
             payload["answer"] = no_rows_message
         return payload
 
+    def _try_text2sql_ir_fallback(
+        self,
+        spec: Optional[TaskQuerySpec],
+        base: Dict[str, Any],
+        *,
+        debug_enabled: bool,
+    ) -> Optional[Dict[str, Any]]:
+        if spec is None:
+            return None
+        query_fn = getattr(self.tasks_store, "query", None)
+        if query_fn is None:
+            return None
+        cleaned = sanitize_task_query_spec_for_downstream(spec)
+        try:
+            compiled = compile_tasks_sql(cleaned)
+            rows = query_fn(compiled.sql, compiled.params)
+        except Exception as exc:
+            if debug_enabled:
+                _append_debug_trace(
+                    base,
+                    stage="text2sql_ir_fallback_failed",
+                    function="TaskQueryEngine._try_text2sql_ir_fallback",
+                    inputs={"nl_ir": cleaned.dict()},
+                    output={"error": str(exc)},
+                )
+            return None
+
+        fallback = dict(base)
+        fallback["resolver_mode"] = "text2sql_ir_fallback"
+        fallback["nl_ir"] = cleaned.dict()
+        fallback["text2sql_fallback"] = "cleaned_ir"
+        fallback["sql"] = compiled.sql
+        fallback["params"] = list(compiled.params)
+        fallback["rows"] = rows
+        fallback.pop("error", None)
+        fallback.pop("reason", None)
+        raw_answer_mode = getattr(cleaned, "answer_mode", TaskAnswerMode.default)
+        if isinstance(raw_answer_mode, TaskAnswerMode):
+            answer_mode = raw_answer_mode
+        else:
+            try:
+                answer_mode = TaskAnswerMode(str(raw_answer_mode))
+            except ValueError:
+                answer_mode = TaskAnswerMode.default
+
+        person_filter_values: List[str] = []
+        for flt in getattr(cleaned, "filters", None) or []:
+            if not isinstance(flt, QueryFilter):
+                continue
+            if str(getattr(flt, "field", "") or "").lower() != "person":
+                continue
+            op = str(getattr(flt, "op", "eq") or "eq").lower()
+            if op == "in":
+                person_filter_values.extend([str(v) for v in (getattr(flt, "values", None) or []) if v])
+            elif getattr(flt, "value", None):
+                person_filter_values.append(str(flt.value))
+        person_filters_active = len(person_filter_values) > 1
+
+        if rows:
+            try:
+                fallback.update(
+                    self._build_intent_answer(
+                        spec=cleaned,
+                        rows=rows,
+                        person=None if person_filters_active else cleaned.person,
+                        task_val=cleaned.task,
+                        person_filters_active=person_filters_active,
+                        person_filter_values=person_filter_values,
+                        low_conf=False,
+                        answer_mode=answer_mode,
+                    )
+                )
+            except Exception as exc:
+                fallback["answer"] = _summarize_text2sql_rows(rows)
+                fallback["text2sql_fallback_answer_error"] = str(exc)
+        else:
+            fallback["answer"] = "Text2SQL LLM failed; cleaned IR fallback returned no rows."
+        if debug_enabled:
+            _append_debug_trace(
+                fallback,
+                stage="text2sql_ir_fallback_succeeded",
+                function="TaskQueryEngine._try_text2sql_ir_fallback",
+                inputs={"nl_ir": cleaned.dict()},
+                output={
+                    "sql": compiled.sql,
+                    "params": list(compiled.params),
+                    "row_count": len(rows),
+                },
+            )
+        return fallback
+
     def _answer_via_text2sql(
         self,
         q: str,
@@ -1428,9 +1521,20 @@ class TaskQueryEngine:
                     },
                 )
             logger.warning("Text2SQL LLM failed: %s", exc)
+            fallback = self._try_text2sql_ir_fallback(
+                spec,
+                base,
+                debug_enabled=debug_enabled,
+            )
+            if fallback is not None:
+                fallback["text2sql_llm_error"] = str(exc)
+                return fallback
             return base
 
         if debug_enabled:
+            thinking = llm_debug.get("thinking") if isinstance(llm_debug, dict) else None
+            if thinking:
+                base["debug_thinking"] = thinking
             _append_debug_trace(
                 base,
                 stage="text2sql_llm_response",
@@ -1440,6 +1544,7 @@ class TaskQueryEngine:
                     "runtime": llm_runtime,
                     "queries": [item.dict() for item in llm_result.queries],
                     "llm_debug": llm_debug,
+                    "thinking": thinking,
                 },
             )
 
@@ -1529,6 +1634,15 @@ class TaskQueryEngine:
                         output={"error": str(exc)},
                     )
                 logger.warning("Text2SQL query failed: %s", exc)
+                fallback = self._try_text2sql_ir_fallback(
+                    spec,
+                    base,
+                    debug_enabled=debug_enabled,
+                )
+                if fallback is not None:
+                    fallback["text2sql_db_error"] = str(exc)
+                    fallback["text2sql_failed_sql"] = normalized_sql
+                    return fallback
                 return base
 
             if debug_enabled:
@@ -1598,6 +1712,9 @@ class TaskQueryEngine:
             )
 
         if debug_enabled and answer_debug:
+            thinking = answer_debug.get("thinking")
+            if thinking:
+                base["debug_thinking"] = thinking
             _append_debug_trace(
                 base,
                 stage="answer_llm_prompt",
@@ -1610,6 +1727,7 @@ class TaskQueryEngine:
                     "rows_for_prompt": answer_debug.get("rows_for_prompt"),
                     "prompt": answer_debug.get("prompt"),
                     "response": answer_debug.get("response"),
+                    "thinking": thinking,
                 },
             )
 
@@ -1673,7 +1791,7 @@ def _build_text2sql_prompt(
         limit_rule,
         "- Do not invent tables or columns.\n",
         "- Do not use parameters; embed literal values directly in the SQL.\n",
-        "- ?IR hint ???person/task/project ?????????? hint ??????????????????/????\n",
+        "- Treat the IR hint as advisory. If hint_quality.trusted=false, only use stable range/status/limit hints and re-derive entities from the question.\n",
         "- If the IR hint lists multiple persons or tasks, use an IN (...) filter instead of re-parsing the question.\n",
         "- Map IR hint tags to tags LIKE filters; do not treat tag keywords as person/task names.\n",
         "- Translate time_range/due_range/created_range hints into comparisons on ts/due_ts/created_ts respectively, instead of inventing CURRENT_TIMESTAMP math.\n",
@@ -1698,9 +1816,23 @@ def _build_text2sql_prompt(
     return "".join(parts)
 
 
+def _is_low_trust_ir_for_text2sql(spec: TaskQuerySpec) -> bool:
+    extra = getattr(spec, "extra", None) or {}
+    source = str(extra.get("nl2sql_source") or "").lower()
+    if getattr(spec, "is_supported", None) is False:
+        return True
+    confidence = getattr(spec, "intent_confidence", None)
+    if confidence is not None and confidence < 0.6:
+        return True
+    if source == "rules" and extra.get("nl2sql_llm_error"):
+        return True
+    return False
+
+
 def _make_text2sql_ir_hint(spec: Optional[TaskQuerySpec]) -> Dict[str, Any]:
     if spec is None:
         return {}
+    spec = sanitize_task_query_spec_for_downstream(spec)
 
     def _enum_to_str(value: Any) -> Any:
         if isinstance(value, Enum):
@@ -1725,6 +1857,24 @@ def _make_text2sql_ir_hint(spec: Optional[TaskQuerySpec]) -> Dict[str, Any]:
         "order_by": [ob.dict() for ob in (spec.order_by or [])],
         "filters": [flt.dict() for flt in (spec.filters or [])],
     }
+    if _is_low_trust_ir_for_text2sql(spec):
+        hint["hint_quality"] = {
+            "trusted": False,
+            "reason": "low_confidence_or_rules_fallback",
+        }
+        keep_keys = {
+            "intent",
+            "raw_query",
+            "status",
+            "time_range",
+            "due_range",
+            "created_range",
+            "limit",
+            "order_by",
+            "hint_quality",
+        }
+        return {key: value for key, value in hint.items() if key in keep_keys and value not in (None, [], "")}
+    hint["hint_quality"] = {"trusted": True}
     return hint
 
 
@@ -1739,7 +1889,11 @@ def _call_text2sql_llm(
     provider = runtime["provider"]
     if provider == "ollama":
         response, debug_meta = _call_text2sql_via_ollama(
-            prompt, runtime["model"], runtime["base_url"], system_prompt
+            prompt,
+            runtime["model"],
+            runtime["base_url"],
+            system_prompt,
+            timeout=_runtime_timeout(runtime),
         )
         return response, runtime, debug_meta
     if provider in {"openai", "dashscope"}:
@@ -1749,6 +1903,7 @@ def _call_text2sql_llm(
             runtime["base_url"],
             runtime["api_key"],
             system_prompt,
+            timeout=_runtime_timeout(runtime),
         )
         return response, runtime, debug_meta
 
@@ -1761,6 +1916,15 @@ def _resolve_text2sql_settings() -> Dict[str, str]:
 
     model = llm_settings.text2sql_model or llm_settings.model
 
+    try:
+        timeout = float(llm_settings.text2sql_timeout or TEXT2SQL_DEFAULT_TIMEOUT_SEC)
+    except (TypeError, ValueError):
+        timeout = TEXT2SQL_DEFAULT_TIMEOUT_SEC
+    try:
+        answer_timeout = float(llm_settings.text2sql_answer_timeout or timeout)
+    except (TypeError, ValueError):
+        answer_timeout = timeout
+
     if provider == "ollama":
         base_url = (
             llm_settings.text2sql_ollama_base_url or llm_settings.ollama_base_url
@@ -1770,6 +1934,8 @@ def _resolve_text2sql_settings() -> Dict[str, str]:
             "model": model,
             "base_url": base_url,
             "api_key": "",
+            "timeout": str(timeout),
+            "answer_timeout": str(answer_timeout),
         }
 
     if provider in {"openai", "dashscope"}:
@@ -1782,6 +1948,8 @@ def _resolve_text2sql_settings() -> Dict[str, str]:
             "model": model,
             "base_url": base_url,
             "api_key": api_key,
+            "timeout": str(timeout),
+            "answer_timeout": str(answer_timeout),
         }
 
     return {
@@ -1789,10 +1957,25 @@ def _resolve_text2sql_settings() -> Dict[str, str]:
         "model": model,
         "base_url": llm_settings.ollama_base_url,
         "api_key": llm_settings.api_key,
+        "timeout": str(timeout),
+        "answer_timeout": str(answer_timeout),
     }
 
+
+def _runtime_timeout(runtime: Dict[str, str], key: str = "timeout") -> float:
+    try:
+        value = float(runtime.get(key) or TEXT2SQL_DEFAULT_TIMEOUT_SEC)
+    except (TypeError, ValueError):
+        value = TEXT2SQL_DEFAULT_TIMEOUT_SEC
+    return max(1.0, value)
+
 def _call_text2sql_via_ollama(
-    prompt: str, model: str, base_url: str, system_prompt: str
+    prompt: str,
+    model: str,
+    base_url: str,
+    system_prompt: str,
+    *,
+    timeout: float,
 ) -> Tuple[Text2SQLResponseModel, Dict[str, Any]]:
     """Call Ollama's /api/chat endpoint for Text2SQL."""
 
@@ -1810,7 +1993,7 @@ def _call_text2sql_via_ollama(
 
     url = f"{base_url.rstrip('/')}/api/chat"
     try:
-        resp = httpx.post(url, json=payload, timeout=60.0)
+        resp = httpx.post(url, json=payload, timeout=timeout)
         resp.raise_for_status()
     except httpx.HTTPError as exc:
         raise Text2SQLGenerateError(f"Ollama request failed: {exc}") from exc
@@ -1818,11 +2001,13 @@ def _call_text2sql_via_ollama(
     response_text = resp.text
     try:
         data = resp.json()
-        content = data["message"]["content"]
+        message = data["message"]
+        content = message["content"]
     except (ValueError, KeyError, TypeError) as exc:
         raise Text2SQLGenerateError(
             "Invalid response format from Ollama", raw_response=response_text
         ) from exc
+    thinking = _extract_llm_message_thinking(message, content)
 
     def _try_parse_raw_json(text: str) -> Optional[Dict[str, Any]]:
         candidate = (text or "").strip()
@@ -1856,6 +2041,7 @@ def _call_text2sql_via_ollama(
             "response_text": response_text,
             "parsed_content": content,
             "parsed_json": parsed,
+            "thinking": thinking,
         }
     except ValidationError as exc:
         raise Text2SQLGenerateError(
@@ -1864,7 +2050,13 @@ def _call_text2sql_via_ollama(
 
 
 def _call_text2sql_via_openai(
-    prompt: str, model: str, base_url: str, api_key: str, system_prompt: str
+    prompt: str,
+    model: str,
+    base_url: str,
+    api_key: str,
+    system_prompt: str,
+    *,
+    timeout: float,
 ) -> Tuple[Text2SQLResponseModel, Dict[str, Any]]:
     """Call an OpenAI-compatible chat completion API for Text2SQL."""
 
@@ -1887,7 +2079,7 @@ def _call_text2sql_via_openai(
 
     url = f"{base_url.rstrip('/')}/chat/completions"
     try:
-        resp = httpx.post(url, headers=headers, json=payload, timeout=60.0)
+        resp = httpx.post(url, headers=headers, json=payload, timeout=timeout)
         resp.raise_for_status()
     except httpx.HTTPError as exc:
         raise Text2SQLGenerateError(f"OpenAI-compatible request failed: {exc}") from exc
@@ -1895,11 +2087,13 @@ def _call_text2sql_via_openai(
     response_text = resp.text
     try:
         data = resp.json()
-        content = data["choices"][0]["message"]["content"]
+        message = data["choices"][0]["message"]
+        content = message["content"]
     except (ValueError, KeyError, TypeError, IndexError) as exc:
         raise Text2SQLGenerateError(
             "Invalid response format from OpenAI-compatible API", raw_response=response_text
         ) from exc
+    thinking = _extract_llm_message_thinking(message, content)
 
     parsed: Optional[Dict[str, Any]] = None
     if isinstance(content, dict):
@@ -1919,6 +2113,7 @@ def _call_text2sql_via_openai(
             "response_text": response_text,
             "parsed_content": content,
             "parsed_json": parsed,
+            "thinking": thinking,
         }
     except ValidationError as exc:
         raise Text2SQLGenerateError(
@@ -1936,13 +2131,58 @@ def _generate_text2sql_answer(
     prompt_rows = list(rows)
     prompt = _build_text2sql_answer_prompt(question, prompt_rows)
     content = _call_text2sql_answer_llm(prompt, runtime)
-    answer = content.strip() if content else None
+    thinking = _extract_model_thinking(content)
+    answer = _strip_model_thinking(content).strip() if content else None
     return answer, {
         "runtime": runtime,
         "rows_for_prompt": prompt_rows,
         "prompt": prompt,
         "response": content,
+        "thinking": thinking,
     }
+
+
+def _extract_model_thinking(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return None
+    raw = str(text)
+    full_match = re.search(r"(?is)<think\b[^>]*>(.*?)</think\s*>", raw)
+    if full_match:
+        thinking = full_match.group(1).strip()
+        return thinking or None
+    end_tag = re.search(r"(?is)</think\s*>", raw)
+    if end_tag:
+        thinking = raw[: end_tag.start()].strip()
+        return thinking or None
+    return None
+
+
+def _strip_model_thinking(text: Optional[str]) -> str:
+    if not text:
+        return ""
+    cleaned = str(text)
+    cleaned = re.sub(r"(?is)<think\b[^>]*>.*?</think>", "", cleaned)
+    end_tag = re.search(r"(?is)</think\s*>", cleaned)
+    if end_tag:
+        cleaned = cleaned[end_tag.end() :]
+    start_tag = re.search(r"(?is)<think\b[^>]*>", cleaned)
+    if start_tag:
+        cleaned = cleaned[: start_tag.start()]
+    return cleaned.strip()
+
+
+def _extract_llm_message_thinking(
+    message: Optional[Dict[str, Any]],
+    content: Optional[Any],
+) -> Optional[str]:
+    if isinstance(message, dict):
+        for key in ("reasoning", "reasoning_content", "thinking", "thoughts"):
+            value = message.get(key)
+            if isinstance(value, str) and value.strip():
+                return _strip_model_thinking(value) or value.strip()
+    if isinstance(content, str):
+        return _extract_model_thinking(content)
+    return None
 
 
 def _build_text2sql_answer_prompt(
@@ -1985,7 +2225,7 @@ def _call_text2sql_answer_via_ollama(
     }
     url = f"{base_url.rstrip('/')}/api/chat"
     try:
-        resp = httpx.post(url, json=payload, timeout=60.0)
+        resp = httpx.post(url, json=payload, timeout=_runtime_timeout(runtime, "answer_timeout"))
         resp.raise_for_status()
     except httpx.HTTPError as exc:
         raise Text2SQLGenerateError(f"Ollama answer request failed: {exc}") from exc
@@ -2017,7 +2257,12 @@ def _call_text2sql_answer_via_openai(
     }
     url = f"{base_url.rstrip('/')}/chat/completions"
     try:
-        resp = httpx.post(url, headers=headers, json=payload, timeout=60.0)
+        resp = httpx.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=_runtime_timeout(runtime, "answer_timeout"),
+        )
         resp.raise_for_status()
     except httpx.HTTPError as exc:
         raise Text2SQLGenerateError(f"OpenAI-compatible answer request failed: {exc}") from exc

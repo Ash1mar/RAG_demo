@@ -174,6 +174,7 @@ def _normalize_task_query_spec_payload(content: Any, *, raw_query: str) -> Dict[
     normalized: Dict[str, Any] = dict(payload)
 
     normalized["raw_query"] = _normalize_string_value(normalized.get("raw_query")) or raw_query
+    _normalize_misplaced_answer_mode(normalized)
     for key in ("person", "task", "project", "raw_intent_nl"):
         normalized[key] = _normalize_string_value(normalized.get(key))
 
@@ -190,6 +191,26 @@ def _normalize_task_query_spec_payload(content: Any, *, raw_query: str) -> Dict[
         normalized["extra"] = {}
 
     return normalized
+
+
+def _normalize_misplaced_answer_mode(normalized: Dict[str, Any]) -> None:
+    answer_modes = {
+        "completion_time_latest",
+        "task_count_by_status",
+        "person_summary_by_project",
+        "overdue_count_by_person",
+    }
+    intent = _normalize_string_value(normalized.get("intent"))
+    if intent not in answer_modes:
+        return
+    if not _normalize_string_value(normalized.get("answer_mode")):
+        normalized["answer_mode"] = intent
+    if intent == "completion_time_latest":
+        normalized["intent"] = "task_history"
+    elif intent == "person_summary_by_project":
+        normalized["intent"] = "person_summary"
+    else:
+        normalized["intent"] = "task_status_list"
 
 
 def _to_json_object(content: Any) -> Dict[str, Any]:
@@ -308,13 +329,13 @@ def build_task_query_user_prompt(q: str) -> str:
         "-> task_count_by_status (supply status/time_range/due_range); project/person summaries "
         "-> person_summary_by_project; overdue stats -> overdue_count_by_person (provide "
         "due_range/time_range and non-DONE status).\n"
-        "8) Whenever the question explicitly mentions status keywords (e.g., TODO/未完成/待办, IN_PROGRESS/进行中, DONE/完成, BLOCKED/阻塞/卡住/卡点, 逾期/overdue), you MUST map them to the `status` array exactly as requested and do not add extra statuses.\n"
+        "8) The current production status domain is DONE and TODO. Map 完成/已完成/done to DONE, and 未完成/待办/未读待办/逾期/overdue/进行中/卡点/阻塞 to TODO unless a future schema explicitly exposes richer statuses. Do not emit IN_PROGRESS or BLOCKED for the current dataset.\n"
         "9) LIMIT defaults to 10 (task_list_by_person can use 50) unless the question demands "
         "otherwise; order_by defaults to ts desc then priority asc.\n"
         "10) filters should express remaining constraints with eq/in/like/gte/lte "
         "(project, tags, status, priority, etc.).\n"
         "11) When the query uses phrases such as “哪些/有哪些/全部/所有/列出/任务列表/给我看看” without asking about a single concrete task, treat it as a list intent (task_status_list or task_list_by_person if a person is specified) and keep `task` null, filling filters/time_range/tags as needed.\n"
-        "12) When the query describes time windows like “最近N天/最近一周/本周/上周/本月/本周截止/本周内/截止日期/DDL/创建于…”, populate the appropriate `time_range` or `created_range` (prefer `created_range` when the wording talks about task creation) instead of leaving them empty.\n"
+        "12) When the query describes time windows like “最近N天/最近一周/本周/上周/本月/本周内/创建于…”, populate `time_range` or `created_range` as appropriate. For deadline wording such as “本周截止/截止日期/到期/DDL/计划完成”, populate `due_range` and do not also populate `time_range` unless the question separately asks about update/status time.\n"
         "11) Provide is_supported=true only when the query clearly maps to an existing simple intent; otherwise set is_supported=false and prefer intent=\"unknown\".\n"
         "12) intent_confidence must be a float between 0 and 1 (e.g. 0.9 for strong matches); raw_intent_nl should briefly summarize the user intent in natural language.\n"
         "13) When the user names a specific task (no plural/list wording), prefer task_status_single/task_history intents and set `task` accordingly; do NOT set list intents for single-task questions.\n\n"
@@ -333,7 +354,7 @@ TASK_QUERY_SYSTEM_PROMPT = (
     "- raw_query must be the original user query.\n"
     "- intent must be one of task_status_single | task_status_list | task_list_by_person | task_history | person_summary | unknown.\n"
     "- answer_mode must be one of default | completion_time_latest | task_count_by_status | person_summary_by_project | overdue_count_by_person.\n"
-    "- status values must use the enum strings (DONE, TODO, IN_PROGRESS, BLOCKED, ANY); when the user mentions status keywords (TODO/未完成/待办, IN_PROGRESS/进行中, DONE/已完成, BLOCKED/阻塞/卡点, 逾期/overdue, etc.), include exactly those in the `status` array and do not add extra statuses.\n"
+    "- The current production status domain is DONE and TODO. Map 完成/已完成/done to DONE, and 未完成/待办/未读待办/逾期/overdue/进行中/卡点/阻塞 to TODO unless a future schema explicitly exposes richer statuses. Do not emit IN_PROGRESS or BLOCKED for the current dataset.\n"
     "- When the query asks \"when was it finished\" (phrases meaning finished/done/completed), set answer_mode=completion_time_latest, status=[\"DONE\"], limit=1, order_by ts desc.\n"
     "- When the query asks \"how many tasks remain\" or requests counts per status, set answer_mode=task_count_by_status and include the relevant status/time_range/due_range filters.\n"
     "- When the query asks for project/person summaries, set answer_mode=person_summary_by_project and provide the necessary project/person filters.\n"
@@ -341,7 +362,7 @@ TASK_QUERY_SYSTEM_PROMPT = (
     "- When multiple people appear, use {\"field\":\"person\",\"op\":\"in\",\"values\":[...]} and clear the top-level person field.\n"
     "- Populate project/tags/priority/time_range/due_range whenever the query mentions them (P0/P1, this week/month, deadline/due, etc.).\n"
     "- When the question contains phrases such as “哪些/有哪些/全部/所有/列出/任务列表/给我看看” and does not focus on a single concrete task, treat it as a list intent (task_status_list or task_list_by_person if a person is mentioned) and leave `task` null while using filters/time_range/tags to express the constraints.\n"
-    "- When the question contains time expressions like “最近N天/最近一周/本周/上周/本月/本周截止/截止日期/ddl/创建于…”, populate `time_range` or `created_range` appropriately (prefer `created_range` for creation-related wording) and avoid leaving them empty.\n"
+    "- When the question contains time expressions like “最近N天/最近一周/本周/上周/本月/创建于…”, populate `time_range` or `created_range` appropriately (prefer `created_range` for creation-related wording). For deadline wording such as “本周截止/截止日期/到期/ddl/计划完成”, populate `due_range` and avoid also populating `time_range` unless update/status time is separately requested.\n"
     "- Keep LIMIT reasonable (default 10; list-by-person up to 50) unless the user explicitly asks otherwise.\n"
     "- Use filters with eq/in/like/gte/lte for additional constraints.\n"
     "- Provide is_supported=true only when the question clearly belongs to the supported simple intents; otherwise set is_supported=false and prefer intent=\"unknown\".\n"

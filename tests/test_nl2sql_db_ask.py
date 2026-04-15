@@ -18,8 +18,18 @@ from app.services.nl2sql_engine import (
     parse_task_query_nl,
     _post_process_intent,
 )
+from app.services.llm_client import _normalize_task_query_spec_payload
 from app.services.sql_compiler import compile_tasks_sql, TaskSqlCompileError, CompiledSql
-from app.services.task_query import _rewrite_text2sql_query
+from app.services.task_query import (
+    TaskQueryEngine,
+    Text2SQLQueryModel,
+    Text2SQLResponseModel,
+    _extract_model_thinking,
+    _make_text2sql_ir_hint,
+    _rewrite_text2sql_query,
+    _strip_model_thinking,
+)
+from app.services import task_query as task_query_module
 
 STATUS_QUERY = "\u5f20\u4e09\u7684E3D\u63a5\u53e3\u8054\u8c03\u73b0\u5728\u4ec0\u4e48\u72b6\u6001\uff1f"
 MULTI_PERSON_QUERY = "\u5f20\u4e09\u548c\u674e\u56db\u6700\u8fd1\u4e00\u5468\u7684\u4efb\u52a1\u5217\u8868\u8fd8\u6709\u54ea\u4e9b\uff1f"
@@ -130,7 +140,112 @@ def test_parse_completion_time_question_sets_answer_mode() -> None:
 
 def test_parse_task_count_question_defaults_without_llm() -> None:
     spec = parse_task_query_nl(COUNT_QUERY)
-    assert spec.answer_mode == TaskAnswerMode.default
+    assert spec.answer_mode == TaskAnswerMode.task_count_by_status
+    assert spec.status == [TaskStatus.TODO]
+
+
+def test_remaining_count_question_sets_person_todo_count_mode() -> None:
+    q = "\u5f20\u624b\u7434\u8fd8\u5269\u591a\u5c11\u4efb\u52a1"
+    spec = parse_task_query_nl(q)
+    assert spec.intent == TaskQueryIntent.task_status_list
+    assert spec.answer_mode == TaskAnswerMode.task_count_by_status
+    assert spec.person == "\u5f20\u624b\u7434"
+    assert spec.task is None
+    assert spec.status == [TaskStatus.TODO]
+
+
+def test_llm_payload_moves_answer_mode_out_of_intent() -> None:
+    payload = _normalize_task_query_spec_payload(
+        {
+            "intent": "task_count_by_status",
+            "raw_query": "\u5f20\u624b\u7434\u8fd8\u5269\u591a\u5c11\u4efb\u52a1",
+            "person": "\u5f20\u624b\u7434",
+            "status": ["TODO"],
+        },
+        raw_query="\u5f20\u624b\u7434\u8fd8\u5269\u591a\u5c11\u4efb\u52a1",
+    )
+    assert payload["intent"] == "task_status_list"
+    assert payload["answer_mode"] == "task_count_by_status"
+
+
+def test_text2sql_ir_fallback_uses_count_answer_handler() -> None:
+    class FakeStore:
+        def query(self, sql, params):
+            return [{"status": "TODO", "task_count": 9}]
+
+    engine = TaskQueryEngine(tasks_store=FakeStore(), embedder=None, resolver_mode="text2sql")
+    spec = TaskQuerySpec(
+        intent=TaskQueryIntent.task_status_list,
+        raw_query="\u5f20\u624b\u7434\u8fd8\u5269\u591a\u5c11\u4efb\u52a1",
+        person="\u5f20\u624b\u7434",
+        status=[TaskStatus.TODO],
+        answer_mode=TaskAnswerMode.task_count_by_status,
+        filters=[QueryFilter(field="person", op="eq", value="\u5f20\u624b\u7434")],
+    )
+    payload = engine._try_text2sql_ir_fallback(spec, {"debug_trace": []}, debug_enabled=True)
+    assert payload is not None
+    assert payload["answer"] == "\u5f20\u624b\u7434\u7684\u4efb\u52a1\u6309\u72b6\u6001\u7edf\u8ba1\uff1a\u672a\u5b8c\u6210=9\uff08\u603b\u8ba1 9\uff09\u3002"
+    assert payload["status_counts"] == [{"status": "TODO", "count": 9}]
+    assert payload["total_tasks"] == 9
+
+
+def test_text2sql_db_failure_falls_back_to_clean_ir_count(monkeypatch) -> None:
+    class FlakyStore:
+        def __init__(self):
+            self.calls = 0
+
+        def query(self, sql, params):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("ORDER BY invalid for aggregate query")
+            return [{"status": "TODO", "task_count": 9}]
+
+    def fake_text2sql_llm(prompt, *, dialect="sqlite"):
+        return (
+            Text2SQLResponseModel(
+                queries=[
+                    Text2SQLQueryModel(
+                        sql=(
+                            "SELECT COUNT(*) AS unfinished_task_count "
+                            "FROM task_latest WHERE person = '张手琴' "
+                            "AND status = 'TODO' ORDER BY ts DESC"
+                        ),
+                        description="bad aggregate SQL",
+                    )
+                ]
+            ),
+            {"provider": "openai", "model": "fake"},
+            {"thinking": "draft sql"},
+        )
+
+    monkeypatch.setattr(task_query_module.llm_settings, "enabled", True)
+    monkeypatch.setattr(task_query_module.llm_settings, "provider", "openai")
+    monkeypatch.setattr(task_query_module, "_call_text2sql_llm", fake_text2sql_llm)
+
+    store = FlakyStore()
+    engine = TaskQueryEngine(tasks_store=store, embedder=None, resolver_mode="text2sql")
+    spec = TaskQuerySpec(
+        intent=TaskQueryIntent.task_status_list,
+        raw_query="张手琴还有多少未完成的任务？",
+        person="张手琴",
+        status=[TaskStatus.TODO],
+        answer_mode=TaskAnswerMode.task_count_by_status,
+        filters=[QueryFilter(field="person", op="eq", value="张手琴")],
+    )
+
+    payload = engine._answer_via_text2sql(
+        "张手琴还有多少未完成的任务？",
+        spec,
+        {"debug_trace": []},
+    )
+
+    assert store.calls == 2
+    assert payload["resolver_mode"] == "text2sql_ir_fallback"
+    assert payload["answer"] == "\u5f20\u624b\u7434\u7684\u4efb\u52a1\u6309\u72b6\u6001\u7edf\u8ba1\uff1a\u672a\u5b8c\u6210=9\uff08\u603b\u8ba1 9\uff09\u3002"
+    assert payload["text2sql_fallback"] == "cleaned_ir"
+    assert payload["debug_thinking"] == "draft sql"
+    assert "text2sql_db_error" in payload
+    assert "ORDER BY ts DESC" in payload["text2sql_failed_sql"]
 
 
 def test_post_process_adds_multi_person_filters() -> None:
@@ -159,7 +274,71 @@ def test_post_process_detects_due_range_and_priority_keywords() -> None:
     _post_process_intent(spec, DUE_PRIORITY_QUERY)
     assert spec.due_range is not None
     assert spec.due_range.start == "start_of_week"
+    assert spec.time_range is None
     assert spec.priority == 1
+
+
+def test_list_query_clears_question_fragment_task() -> None:
+    q = "\u5f20\u624b\u7434\u7684\u4efb\u52a1\u6709\u54ea\u4e9b"
+    spec = parse_task_query_nl(q)
+    assert spec.person == "\u5f20\u624b\u7434"
+    assert spec.task is None
+    assert not any(getattr(f, "field", "") == "task" for f in spec.filters)
+
+
+def test_multi_person_list_query_uses_person_filter_not_task_filter() -> None:
+    q = "\u5f20\u624b\u7434\u548c\u5218\u536b\u6c11\u90fd\u5b8c\u6210\u4e86\u54ea\u4e9b\u4efb\u52a1"
+    spec = parse_task_query_nl(q)
+    assert spec.task is None
+    assert any(
+        getattr(f, "field", "") == "person"
+        and getattr(f, "op", "").lower() == "in"
+        and getattr(f, "values", None) == ["\u5f20\u624b\u7434", "\u5218\u536b\u6c11"]
+        for f in spec.filters
+    )
+    assert not any(getattr(f, "field", "") == "task" for f in spec.filters)
+
+
+def test_low_trust_rules_ir_hint_drops_entity_fields() -> None:
+    q = "\u5f20\u624b\u7434\u548c\u5218\u536b\u6c11\u90fd\u5b8c\u6210\u4e86\u54ea\u4e9b\u4efb\u52a1"
+    spec = TaskQuerySpec(
+        intent=TaskQueryIntent.task_status_list,
+        raw_query=q,
+        task=q,
+        filters=[QueryFilter(field="task", op="in", values=["\u5f20\u624b\u7434", "\u5218\u536b\u6c11\u90fd\u5b8c\u6210\u4e86\u54ea\u4e9b\u4efb\u52a1"])],
+        extra={"nl2sql_source": "rules", "nl2sql_llm_error": "timeout"},
+    )
+    hint = _make_text2sql_ir_hint(spec)
+    assert hint["hint_quality"]["trusted"] is False
+    assert "task" not in hint
+    assert "filters" not in hint
+
+
+def test_post_process_normalizes_single_value_filter_payload() -> None:
+    q = "\u5217\u51fa\u5f20\u624b\u7434\u672c\u5468\u622a\u6b62\u7684\u4efb\u52a1"
+    spec = TaskQuerySpec(
+        intent=TaskQueryIntent.task_list_by_person,
+        raw_query=q,
+        filters=[QueryFilter(field="person", op="eq", values=[{"name": "\u5f20\u624b\u7434"}])],
+    )
+    _post_process_intent(spec, q)
+    plan = build_task_query_plan(spec)
+    assert any(
+        f["field"] == "person" and f["op"] == "eq" and f["value"] == "\u5f20\u624b\u7434"
+        for f in plan["filters"]
+    )
+    assert not any(f["field"] == "person" and f.get("value") is None for f in plan["filters"])
+
+
+def test_strip_model_thinking_removes_reasoning_prefix() -> None:
+    assert _strip_model_thinking("<think>draft</think>\u7b54\u6848") == "\u7b54\u6848"
+    assert _strip_model_thinking("draft</think>\u7b54\u6848") == "\u7b54\u6848"
+
+
+def test_extract_model_thinking_for_debug() -> None:
+    assert _extract_model_thinking("<think>draft</think>\u7b54\u6848") == "draft"
+    assert _extract_model_thinking("draft</think>\u7b54\u6848") == "draft"
+    assert _extract_model_thinking("\u7b54\u6848") is None
 
 
 def test_post_process_list_style_query_does_not_force_single_task() -> None:
