@@ -175,7 +175,26 @@ def _normalize_task_query_spec_payload(content: Any, *, raw_query: str) -> Dict[
 
     normalized["raw_query"] = _normalize_string_value(normalized.get("raw_query")) or raw_query
     _normalize_misplaced_answer_mode(normalized)
-    for key in ("person", "task", "project", "raw_intent_nl"):
+    for key in (
+        "person",
+        "task",
+        "project",
+        "owner",
+        "owner_code",
+        "owner_name",
+        "created_by",
+        "created_by_name",
+        "created_by_org_code",
+        "org_name",
+        "division_name",
+        "division_code",
+        "post_name",
+        "post_code",
+        "task_id",
+        "status_note",
+        "description",
+        "raw_intent_nl",
+    ):
         normalized[key] = _normalize_string_value(normalized.get(key))
 
     for key in ("task_keywords", "tags", "status", "filters"):
@@ -313,8 +332,10 @@ def build_task_query_user_prompt(q: str) -> str:
         "Convert it into a JSON object that satisfies the TaskQuerySpec JSON schema.\n\n"
         "Requirements:\n"
         "1) Output only JSON (no explanations).\n"
-        "2) Field names must come from the schema: intent, raw_query, is_supported, intent_confidence, raw_intent_nl, person, task, "
-        "task_keywords, project, tags, status, time_range, due_range, created_range, "
+        "2) Field names must come from the schema: intent, raw_query, is_supported, intent_confidence, raw_intent_nl, id, person, task, "
+        "task_keywords, project, owner, owner_code, owner_name, created_by, created_by_name, created_by_org_code, "
+        "org_name, division_name, division_code, post_name, post_code, task_id, is_read, is_delegated, "
+        "ts, due_ts, created_ts, updated_ts, status_note, description, tags, status, time_range, due_range, created_range, "
         "order_by, limit, answer_mode, filters, extra.\n"
         "3) raw_query must contain the original user query verbatim.\n"
         "4) Do not invent people/tasks/projects; leave fields null/empty when unspecified.\n"
@@ -332,8 +353,14 @@ def build_task_query_user_prompt(q: str) -> str:
         "8) The current production status domain is DONE and TODO. Map 完成/已完成/done to DONE, and 未完成/待办/未读待办/逾期/overdue/进行中/卡点/阻塞 to TODO unless a future schema explicitly exposes richer statuses. Do not emit IN_PROGRESS or BLOCKED for the current dataset.\n"
         "9) LIMIT defaults to 10 (task_list_by_person can use 50) unless the question demands "
         "otherwise; order_by defaults to ts desc then priority asc.\n"
-        "10) filters should express remaining constraints with eq/in/like/gte/lte "
-        "(project, tags, status, priority, etc.).\n"
+        "10) Prefer top-level fields for exact single-value constraints when a matching column exists; use filters for multi-value/range/like constraints. "
+        "filters should express remaining constraints with eq/in/like/gte/lte "
+        "(project, tags, status, priority, org_name, division_name, post_name, owner_name, created_by_name, etc.).\n"
+        "10a) Classify extracted entity fragments against the actual task columns. "
+        "Use project only for project/system/product names. Organization names belong in filters: "
+        "company/unit/institute -> org_name, department/section/team names ending with Chinese suffixes such as "
+        "\u79d1/\u90e8/\u5904/\u5ba4/\u4e2d\u5fc3 -> division_name, and role/post names -> post_name. "
+        "For example, \u7814\u53d1\u5e94\u7528\u79d1 should populate division_name=\"\u7814\u53d1\u5e94\u7528\u79d1\", not project.\n"
         "11) When the query uses phrases such as “哪些/有哪些/全部/所有/列出/任务列表/给我看看” without asking about a single concrete task, treat it as a list intent (task_status_list or task_list_by_person if a person is specified) and keep `task` null, filling filters/time_range/tags as needed.\n"
         "12) When the query describes time windows like “最近N天/最近一周/本周/上周/本月/本周内/创建于…”, populate `time_range` or `created_range` as appropriate. For deadline wording such as “本周截止/截止日期/到期/DDL/计划完成”, populate `due_range` and do not also populate `time_range` unless the question separately asks about update/status time.\n"
         "11) Provide is_supported=true only when the query clearly maps to an existing simple intent; otherwise set is_supported=false and prefer intent=\"unknown\".\n"
@@ -346,7 +373,7 @@ def build_task_query_user_prompt(q: str) -> str:
 
 TASK_QUERY_SYSTEM_PROMPT = (
     "You are a strict JSON schema parser for task-status queries.\n"
-    "Convert each Chinese task question into a JSON object that matches the TaskQuerySpec schema (intent, raw_query, is_supported, intent_confidence, raw_intent_nl, person, task, task_keywords, project, tags, status, time_range, due_range, created_range, order_by, limit, answer_mode, filters, extra).\n\n"
+    "Convert each Chinese task question into a JSON object that matches the TaskQuerySpec schema (intent, raw_query, is_supported, intent_confidence, raw_intent_nl, id, person, task, task_keywords, project, owner, owner_code, owner_name, created_by, created_by_name, created_by_org_code, org_name, division_name, division_code, post_name, post_code, task_id, is_read, is_delegated, ts, due_ts, created_ts, updated_ts, status_note, description, tags, status, time_range, due_range, created_range, order_by, limit, answer_mode, filters, extra).\n\n"
     "Requirements:\n"
     "- Output ONLY a JSON object, no extra text.\n"
     "- Field names must exactly match the schema (case-sensitive).\n"
@@ -361,6 +388,8 @@ TASK_QUERY_SYSTEM_PROMPT = (
     "- When the query asks for overdue counts per person, set answer_mode=overdue_count_by_person and provide due_range/time_range plus non-DONE status buckets.\n"
     "- When multiple people appear, use {\"field\":\"person\",\"op\":\"in\",\"values\":[...]} and clear the top-level person field.\n"
     "- Populate project/tags/priority/time_range/due_range whenever the query mentions them (P0/P1, this week/month, deadline/due, etc.).\n"
+    "- Prefer top-level fields for exact single-value constraints when a matching column exists; use filters for multi-value/range/like constraints.\n"
+    "- Classify extracted entity fragments against the actual task columns. Use project only for project/system/product names. Organization names should use top-level fields: company/unit/institute -> org_name, department/section/team names ending with Chinese suffixes such as \u79d1/\u90e8/\u5904/\u5ba4/\u4e2d\u5fc3 -> division_name, and role/post names -> post_name. Example: \u7814\u53d1\u5e94\u7528\u79d1 should populate division_name=\"\u7814\u53d1\u5e94\u7528\u79d1\", not project.\n"
     "- When the question contains phrases such as “哪些/有哪些/全部/所有/列出/任务列表/给我看看” and does not focus on a single concrete task, treat it as a list intent (task_status_list or task_list_by_person if a person is mentioned) and leave `task` null while using filters/time_range/tags to express the constraints.\n"
     "- When the question contains time expressions like “最近N天/最近一周/本周/上周/本月/创建于…”, populate `time_range` or `created_range` appropriately (prefer `created_range` for creation-related wording). For deadline wording such as “本周截止/截止日期/到期/ddl/计划完成”, populate `due_range` and avoid also populating `time_range` unless update/status time is separately requested.\n"
     "- Keep LIMIT reasonable (default 10; list-by-person up to 50) unless the user explicitly asks otherwise.\n"

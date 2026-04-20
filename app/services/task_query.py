@@ -65,14 +65,22 @@ _TEXT2SQL_COLUMN_SPECS: Tuple[Tuple[str, str, Optional[str]], ...] = (
     ("id", "INTEGER PRIMARY KEY", None),
     ("person", "TEXT NOT NULL", None),
     ("owner", "TEXT", None),
+    ("owner_code", "TEXT", None),
+    ("owner_name", "TEXT", None),
+    ("created_by", "TEXT", None),
+    ("created_by_name", "TEXT", None),
+    ("created_by_org_code", "TEXT", None),
     ("task", "TEXT NOT NULL", None),
+    ("task_id", "TEXT", None),
     ("status", "TEXT NOT NULL", "observed values in task_latest.csv: DONE | TODO"),
     ("ts", "INTEGER NOT NULL", "epoch milliseconds"),
     ("project", "TEXT", None),
     ("tags", "TEXT", "comma-separated strings"),
     ("org_name", "TEXT", None),
     ("division_name", "TEXT", None),
+    ("division_code", "TEXT", None),
     ("post_name", "TEXT", None),
+    ("post_code", "TEXT", None),
     ("is_read", "INTEGER", "0/1"),
     ("is_delegated", "INTEGER", "0/1"),
     ("priority", "INTEGER", "1 = highest priority"),
@@ -235,6 +243,8 @@ TEXT2SQL_SUSPICIOUS_LITERAL_THRESHOLD = 10_000_000_000
 _MILLIS_PER_SECOND = 1000
 _MILLIS_PER_DAY = 24 * 60 * 60 * _MILLIS_PER_SECOND
 TEXT2SQL_DEFAULT_TIMEOUT_SEC = 180.0
+TEXT2SQL_REWRITE_MODE_ENV = "TASKS_TEXT2SQL_REWRITE_MODE"
+DIRECT_IR_LLM_GATE_ENV = "TASKS_DIRECT_IR_LLM_GATE"
 TEXT2SQL_ANSWER_SYSTEM_PROMPT = (
     "You are a precise assistant for summarizing SQL query results about task statuses. "
     "Use the provided rows to answer the user's question in Chinese. "
@@ -354,6 +364,12 @@ class Text2SQLQueryModel(BaseModel):
 
 class Text2SQLResponseModel(BaseModel):
     queries: List[Text2SQLQueryModel]
+
+class DirectIRGateDecisionModel(BaseModel):
+    approved: bool
+    reason: str = ""
+    issues: List[str] = []
+    suggested_mode: str = "direct_ir"
 
 class Text2SQLGenerateError(Exception):
     """Raised when the LLM cannot produce a valid Text2SQL payload."""
@@ -833,6 +849,7 @@ class TaskQueryEngine:
         if mode_raw == "text2sql":
             try:
                 spec = parse_task_query_nl(q)
+                spec = sanitize_task_query_spec_for_downstream(spec)
                 if debug:
                     _append_debug_trace(
                         debug_payload,
@@ -851,7 +868,56 @@ class TaskQueryEngine:
                         inputs={"question": q},
                         output={"error": "parse_failed"},
                     )
+            routing = _classify_text2sql_ir_usage(spec)
+            if debug:
+                _append_debug_trace(
+                    debug_payload,
+                    stage="ir_routing_decision",
+                    function="_classify_text2sql_ir_usage",
+                    inputs={"question": q},
+                    output=routing,
+                )
+            if spec is not None and routing.get("mode") == "direct_ir":
+                gate = _evaluate_direct_ir_gate(q, spec, routing)
+                if debug:
+                    _append_debug_trace(
+                        debug_payload,
+                        stage="direct_ir_llm_gate",
+                        function="_evaluate_direct_ir_gate",
+                        inputs={"question": q},
+                        output=gate,
+                    )
+                if gate.get("approved") is False:
+                    if debug:
+                        debug_payload["direct_ir_gate"] = gate
+                    result = self._answer_via_text2sql(q, spec, payload=debug_payload if debug else None)
+                    result["ir_usage"] = "text2sql_after_direct_ir_gate"
+                    result["ir_routing"] = routing
+                    result["direct_ir_gate"] = gate
+                    if nl2sql_attempted and nl2sql_error is not None:
+                        result.update(nl2sql_error)
+                    return result
+                result = self._execute_ir_plan(
+                    spec,
+                    debug_payload if debug else {
+                        "intent": self._intent_label(spec),
+                        "resolver_mode": "text2sql_ir_direct",
+                    },
+                    compile_error_code="text2sql_ir_direct_compile_failed",
+                    query_not_supported_code="text2sql_ir_direct_query_not_supported_by_tasks_store",
+                    query_error_code="text2sql_ir_direct_db_query_failed",
+                    no_rows_message="No matching records found (direct IR).",
+                )
+                result["resolver_mode"] = "text2sql_ir_direct"
+                result["ir_usage"] = "direct_execute"
+                result["ir_routing"] = routing
+                result["direct_ir_gate"] = gate
+                if nl2sql_attempted and nl2sql_error is not None:
+                    result.update(nl2sql_error)
+                return result
             result = self._answer_via_text2sql(q, spec, payload=debug_payload if debug else None)
+            result.setdefault("ir_usage", routing.get("mode", "text2sql_with_hint"))
+            result.setdefault("ir_routing", routing)
             if nl2sql_attempted and nl2sql_error is not None:
                 result.update(nl2sql_error)
             return result
@@ -1318,7 +1384,9 @@ class TaskQueryEngine:
 
         if rows:
             rec = rows[0]
-            person = rec.get("person") or spec.person
+            person_filter_values = _spec_filter_values(spec, "person")
+            person_filters_active = len(person_filter_values) > 1
+            person = None if person_filters_active else (rec.get("person") or spec.person)
             task = rec.get("task") or spec.task
             answer_mode = getattr(spec, "answer_mode", TaskAnswerMode.default)
             payload.update(
@@ -1327,8 +1395,8 @@ class TaskQueryEngine:
                     rows=rows,
                     person=person,
                     task_val=task,
-                    person_filters_active=False,
-                    person_filter_values=[],
+                    person_filters_active=person_filters_active,
+                    person_filter_values=person_filter_values,
                     low_conf=False,
                     answer_mode=answer_mode,
                 )
@@ -1792,6 +1860,7 @@ def _build_text2sql_prompt(
         "- Do not invent tables or columns.\n",
         "- Do not use parameters; embed literal values directly in the SQL.\n",
         "- Treat the IR hint as advisory. If hint_quality.trusted=false, only use stable range/status/limit hints and re-derive entities from the question.\n",
+        "- When the trusted IR hint contains exact top-level field values such as owner_name, created_by_name, org_name, division_name, post_name, task_id, is_read, or is_delegated, translate them into WHERE equality filters on the same columns.\n",
         "- If the IR hint lists multiple persons or tasks, use an IN (...) filter instead of re-parsing the question.\n",
         "- Map IR hint tags to tags LIKE filters; do not treat tag keywords as person/task names.\n",
         "- Translate time_range/due_range/created_range hints into comparisons on ts/due_ts/created_ts respectively, instead of inventing CURRENT_TIMESTAMP math.\n",
@@ -1829,6 +1898,198 @@ def _is_low_trust_ir_for_text2sql(spec: TaskQuerySpec) -> bool:
     return False
 
 
+def _spec_filter_values(spec: TaskQuerySpec, field: str) -> List[str]:
+    values: List[str] = []
+    for flt in getattr(spec, "filters", None) or []:
+        if not isinstance(flt, QueryFilter):
+            continue
+        if str(getattr(flt, "field", "") or "").lower() != field.lower():
+            continue
+        op = str(getattr(flt, "op", "eq") or "eq").lower()
+        if op == "in":
+            values.extend(str(v) for v in (getattr(flt, "values", None) or []) if v not in (None, ""))
+        elif getattr(flt, "value", None) not in (None, ""):
+            values.append(str(flt.value))
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
+
+
+def _classify_text2sql_ir_usage(spec: Optional[TaskQuerySpec]) -> Dict[str, Any]:
+    if spec is None:
+        return {
+            "mode": "text2sql_no_hint",
+            "reason": "missing_ir",
+            "trusted_fields": [],
+            "dropped_fields": ["all"],
+        }
+
+    cleaned = sanitize_task_query_spec_for_downstream(spec)
+    if _is_low_trust_ir_for_text2sql(cleaned):
+        return {
+            "mode": "text2sql_no_hint",
+            "reason": "low_trust_ir",
+            "trusted_fields": ["status", "time_range", "due_range", "created_range", "limit"],
+            "dropped_fields": ["person", "task", "project", "tags", "filters"],
+        }
+
+    raw_answer_mode = getattr(cleaned, "answer_mode", TaskAnswerMode.default)
+    try:
+        answer_mode = raw_answer_mode if isinstance(raw_answer_mode, TaskAnswerMode) else TaskAnswerMode(str(raw_answer_mode))
+    except ValueError:
+        answer_mode = TaskAnswerMode.default
+
+    raw_intent = getattr(cleaned, "intent", TaskQueryIntent.unknown)
+    try:
+        intent = raw_intent if isinstance(raw_intent, TaskQueryIntent) else TaskQueryIntent(str(raw_intent))
+    except ValueError:
+        intent = TaskQueryIntent.unknown
+
+    scope_fields = (
+        "person",
+        "project",
+        "owner",
+        "owner_code",
+        "owner_name",
+        "created_by",
+        "created_by_name",
+        "created_by_org_code",
+        "org_name",
+        "division_name",
+        "division_code",
+        "post_name",
+        "post_code",
+        "task_id",
+        "is_read",
+        "is_delegated",
+    )
+    has_scope = any(
+        bool(_spec_filter_values(cleaned, field) or getattr(cleaned, field, None) not in (None, "", []))
+        for field in scope_fields
+    )
+    has_status_scope = bool(getattr(cleaned, "status", None))
+    if (
+        answer_mode == TaskAnswerMode.task_count_by_status
+        and intent == TaskQueryIntent.task_status_list
+        and has_scope
+        and has_status_scope
+    ):
+        return {
+            "mode": "direct_ir",
+            "reason": "trusted_task_count_by_status",
+            "trusted_fields": ["answer_mode", "scope_fields", "filters", "status", "limit"],
+            "dropped_fields": [],
+        }
+
+    return {
+        "mode": "text2sql_with_hint",
+        "reason": "ir_not_in_direct_whitelist",
+        "trusted_fields": ["status", "person", "project", "organization_fields", "filters", "time_range", "due_range", "created_range", "limit"],
+        "dropped_fields": [],
+    }
+
+
+def _direct_ir_gate_enabled() -> bool:
+    raw = os.getenv(DIRECT_IR_LLM_GATE_ENV, "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _build_direct_ir_gate_prompt(
+    question: str,
+    spec: TaskQuerySpec,
+    routing: Dict[str, Any],
+    plan: Dict[str, Any],
+    compiled: Any,
+) -> str:
+    spec_json = json.dumps(spec.dict(), ensure_ascii=False, default=str, indent=2)
+    plan_json = json.dumps(plan, ensure_ascii=False, default=str, indent=2)
+    routing_json = json.dumps(routing or {}, ensure_ascii=False, default=str, indent=2)
+    params_json = json.dumps(list(getattr(compiled, "params", ()) or ()), ensure_ascii=False, default=str)
+    return (
+        "Judge whether the direct IR SQL can fully and correctly answer the user's question.\n"
+        "Return only JSON with this exact shape:\n"
+        "{\"approved\":true|false,\"reason\":\"short reason\",\"issues\":[\"...\"],\"suggested_mode\":\"direct_ir|text2sql\"}\n\n"
+        "Approve only if the SQL semantics match the natural-language question, including filters, grouping, projections, aggregation, and limits.\n"
+        "Reject if the IR uses unsupported or suspicious filters, compares a column to a placeholder/boolean/string that does not represent a real value, misses a requested grouping dimension, groups by the wrong field, or cannot answer the question without additional Text2SQL reasoning.\n\n"
+        f"Question:\n{question}\n\n"
+        f"Routing decision:\n{routing_json}\n\n"
+        f"TaskQuerySpec IR:\n{spec_json}\n\n"
+        f"Compiled query plan:\n{plan_json}\n\n"
+        f"Compiled SQL:\n{getattr(compiled, 'sql', '')}\n\n"
+        f"SQL params:\n{params_json}\n"
+    )
+
+
+def _evaluate_direct_ir_gate(
+    question: str,
+    spec: TaskQuerySpec,
+    routing: Dict[str, Any],
+) -> Dict[str, Any]:
+    try:
+        plan = build_task_query_plan(spec)
+        compiled = compile_tasks_sql(spec)
+    except Exception as exc:
+        return {
+            "approved": False,
+            "reason": f"direct IR compile failed: {exc}",
+            "issues": ["compile_failed"],
+            "suggested_mode": "text2sql",
+            "gate_source": "compiler",
+        }
+
+    result_base = {
+        "compiled_sql": compiled.sql,
+        "params": list(compiled.params),
+        "plan": plan,
+    }
+    if not llm_settings.enabled or llm_settings.provider == "dummy" or not _direct_ir_gate_enabled():
+        return {
+            **result_base,
+            "approved": True,
+            "reason": "LLM gate disabled or unavailable; direct IR compile succeeded",
+            "issues": [],
+            "suggested_mode": "direct_ir",
+            "gate_source": "skip",
+        }
+
+    try:
+        decision, runtime, debug_meta = _call_direct_ir_gate_llm(
+            _build_direct_ir_gate_prompt(question, spec, routing, plan, compiled)
+        )
+    except Exception as exc:
+        return {
+            **result_base,
+            "approved": False,
+            "reason": f"LLM gate failed: {exc}",
+            "issues": ["gate_call_failed"],
+            "suggested_mode": "text2sql",
+            "gate_source": "llm_error",
+        }
+
+    return {
+        **result_base,
+        "approved": bool(decision.approved),
+        "reason": decision.reason,
+        "issues": list(decision.issues or []),
+        "suggested_mode": decision.suggested_mode or ("direct_ir" if decision.approved else "text2sql"),
+        "gate_source": "llm",
+        "runtime": {
+            "provider": runtime.get("provider"),
+            "model": runtime.get("model"),
+            "base_url": runtime.get("base_url"),
+        },
+        "llm_debug": {
+            "parsed_json": debug_meta.get("parsed_json"),
+            "thinking": debug_meta.get("thinking"),
+        },
+    }
+
+
 def _make_text2sql_ir_hint(spec: Optional[TaskQuerySpec]) -> Dict[str, Any]:
     if spec is None:
         return {}
@@ -1844,9 +2105,30 @@ def _make_text2sql_ir_hint(spec: Optional[TaskQuerySpec]) -> Dict[str, Any]:
         if getattr(spec, "intent", None) is not None
         else None,
         "raw_query": getattr(spec, "raw_query", None),
+        "id": getattr(spec, "id", None),
         "person": spec.person,
         "task": spec.task,
         "project": spec.project,
+        "owner": getattr(spec, "owner", None),
+        "owner_code": getattr(spec, "owner_code", None),
+        "owner_name": getattr(spec, "owner_name", None),
+        "created_by": getattr(spec, "created_by", None),
+        "created_by_name": getattr(spec, "created_by_name", None),
+        "created_by_org_code": getattr(spec, "created_by_org_code", None),
+        "org_name": getattr(spec, "org_name", None),
+        "division_name": getattr(spec, "division_name", None),
+        "division_code": getattr(spec, "division_code", None),
+        "post_name": getattr(spec, "post_name", None),
+        "post_code": getattr(spec, "post_code", None),
+        "task_id": getattr(spec, "task_id", None),
+        "is_read": getattr(spec, "is_read", None),
+        "is_delegated": getattr(spec, "is_delegated", None),
+        "ts": getattr(spec, "ts", None),
+        "due_ts": getattr(spec, "due_ts", None),
+        "created_ts": getattr(spec, "created_ts", None),
+        "updated_ts": getattr(spec, "updated_ts", None),
+        "status_note": getattr(spec, "status_note", None),
+        "description": getattr(spec, "description", None),
         "tags": spec.tags,
         "priority": spec.priority,
         "status": [_enum_to_str(s) for s in (spec.status or [])],
@@ -1908,6 +2190,43 @@ def _call_text2sql_llm(
         return response, runtime, debug_meta
 
     raise Text2SQLGenerateError(f"Provider {provider} is not supported for Text2SQL")
+
+
+def _call_direct_ir_gate_llm(
+    prompt: str,
+) -> Tuple[DirectIRGateDecisionModel, Dict[str, str], Dict[str, Any]]:
+    runtime = _resolve_text2sql_settings()
+    provider = runtime["provider"]
+    system_prompt = (
+        "You are a strict verifier for a task-query direct IR SQL path. "
+        "Decide whether the compiled SQL can answer the natural-language question. "
+        "Return only JSON. Be conservative: reject when grouping, filters, projections, or parameter semantics are suspicious."
+    )
+    if provider == "ollama":
+        parsed, debug_meta = _call_json_gate_via_ollama(
+            prompt,
+            runtime["model"],
+            runtime["base_url"],
+            system_prompt,
+            timeout=_runtime_timeout(runtime),
+        )
+    elif provider in {"openai", "dashscope"}:
+        parsed, debug_meta = _call_json_gate_via_openai(
+            prompt,
+            runtime["model"],
+            runtime["base_url"],
+            runtime["api_key"],
+            system_prompt,
+            timeout=_runtime_timeout(runtime),
+        )
+    else:
+        raise Text2SQLGenerateError(f"Provider {provider} is not supported for direct IR gate")
+
+    try:
+        return DirectIRGateDecisionModel.parse_obj(parsed), runtime, debug_meta
+    except ValidationError as exc:
+        raise Text2SQLGenerateError(f"Direct IR gate JSON does not match expected schema: {exc}") from exc
+
 
 def _resolve_text2sql_settings() -> Dict[str, str]:
     provider = llm_settings.text2sql_provider or llm_settings.provider
@@ -2119,6 +2438,96 @@ def _call_text2sql_via_openai(
         raise Text2SQLGenerateError(
             f"LLM JSON does not match expected schema: {exc}", raw_response=response_text
         ) from exc
+
+
+def _call_json_gate_via_ollama(
+    prompt: str,
+    model: str,
+    base_url: str,
+    system_prompt: str,
+    *,
+    timeout: float,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    payload: Dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ],
+        "stream": False,
+        "options": {"temperature": 0.0},
+    }
+    url = f"{base_url.rstrip('/')}/api/chat"
+    try:
+        resp = httpx.post(url, json=payload, timeout=timeout)
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise Text2SQLGenerateError(f"Ollama direct IR gate request failed: {exc}") from exc
+    response_text = resp.text
+    try:
+        data = resp.json()
+        message = data["message"]
+        content = message["content"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise Text2SQLGenerateError("Invalid response format from Ollama direct IR gate") from exc
+    parsed = _try_parse_json_text(content)
+    if parsed is None:
+        raise Text2SQLGenerateError("Direct IR gate output is not valid JSON", raw_response=response_text)
+    return parsed, {
+        "request": payload,
+        "response_text": response_text,
+        "parsed_content": content,
+        "parsed_json": parsed,
+        "thinking": _extract_llm_message_thinking(message, content),
+    }
+
+
+def _call_json_gate_via_openai(
+    prompt: str,
+    model: str,
+    base_url: str,
+    api_key: str,
+    system_prompt: str,
+    *,
+    timeout: float,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    if not api_key:
+        raise Text2SQLGenerateError("LLM_API_KEY is required for provider 'openai'")
+    payload: Dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.0,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    url = f"{base_url.rstrip('/')}/chat/completions"
+    try:
+        resp = httpx.post(url, headers=headers, json=payload, timeout=timeout)
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise Text2SQLGenerateError(f"OpenAI-compatible direct IR gate request failed: {exc}") from exc
+    response_text = resp.text
+    try:
+        data = resp.json()
+        message = data["choices"][0]["message"]
+        content = message["content"]
+    except (ValueError, KeyError, TypeError, IndexError) as exc:
+        raise Text2SQLGenerateError("Invalid response format from OpenAI-compatible direct IR gate") from exc
+    parsed = content if isinstance(content, dict) else _try_parse_json_text(str(content or ""))
+    if parsed is None:
+        raise Text2SQLGenerateError("Direct IR gate output is not valid JSON", raw_response=response_text)
+    return parsed, {
+        "request": payload,
+        "response_text": response_text,
+        "parsed_content": content,
+        "parsed_json": parsed,
+        "thinking": _extract_llm_message_thinking(message, content),
+    }
 
 
 def _generate_text2sql_answer(
@@ -2659,6 +3068,11 @@ def _rewrite_text2sql_query(sql: str, hint: Optional[Dict[str, Any]], *, questio
         return sql
     updated = sql
     hint = hint or {}
+    mode = (os.getenv(TEXT2SQL_REWRITE_MODE_ENV, "safe") or "safe").strip().lower()
+    if mode in {"0", "off", "none", "disabled"}:
+        return _strip_semicolons(updated)
+    if mode == "safe":
+        return _strip_semicolons(updated)
 
     # Align time-related literals with IR hint (ts/created_ts/due_ts).
     schema = get_tasks_schema_config()
@@ -2676,8 +3090,13 @@ def _rewrite_text2sql_query(sql: str, hint: Optional[Dict[str, Any]], *, questio
     # Ensure tag filters reflect IR/KG tags when LLM forgot to use them.
     updated = _ensure_tag_filters(updated, hint.get("tags"), column=tags_col)
 
-    # Normalize person/project literals to canonical values from IR/KG.
-    updated = _apply_scalar_hint(updated, person_col, hint.get("person"))
+    # Normalize person/project literals to canonical values from IR/KG. Multi-value
+    # filters are more specific than scalar fields like person="张手琴".
+    person_values = _hint_filter_values(hint, person_col)
+    if len(person_values) > 1:
+        updated = _apply_in_hint(updated, person_col, person_values)
+    else:
+        updated = _apply_scalar_hint(updated, person_col, hint.get("person"))
     updated = _apply_scalar_hint(updated, project_col, hint.get("project"))
 
     domain = get_tasks_domain()
@@ -2816,3 +3235,54 @@ def _apply_scalar_hint(sql: str, column: str, value: Optional[Any]) -> str:
         return f"{prefix}'{val_escaped}'{suffix}"
 
     return pattern_in.sub(_repl_in, sql)
+
+
+def _hint_filter_values(hint: Dict[str, Any], column: str) -> List[str]:
+    values: List[str] = []
+    for flt in hint.get("filters") or []:
+        if not isinstance(flt, dict):
+            continue
+        if str(flt.get("field") or "").lower() != column.lower():
+            continue
+        op = str(flt.get("op") or "eq").lower()
+        if op == "in":
+            raw_values = flt.get("values")
+            if raw_values is None:
+                raw_values = flt.get("value")
+            if isinstance(raw_values, list):
+                values.extend(str(v) for v in raw_values if v not in (None, ""))
+            elif raw_values not in (None, ""):
+                values.append(str(raw_values))
+        else:
+            raw_value = flt.get("value")
+            if raw_value not in (None, ""):
+                values.append(str(raw_value))
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
+
+
+def _apply_in_hint(sql: str, column: str, values: List[str]) -> str:
+    if not sql or not values:
+        return sql
+    lowered = sql.lower()
+    if column.lower() not in lowered:
+        return sql
+    escaped = [str(value).replace("'", "''") for value in values]
+    literal_list = ", ".join(f"'{value}'" for value in escaped)
+
+    pattern_in = re.compile(
+        rf"(\b{re.escape(column)}\b\s+in\s*\()([^)]+)(\))", re.IGNORECASE
+    )
+    if pattern_in.search(sql):
+        return pattern_in.sub(rf"\1{literal_list}\3", sql)
+
+    pattern_eq = re.compile(
+        rf"(\b{re.escape(column)}\b\s*=\s*)'[^']*'", re.IGNORECASE
+    )
+    return pattern_eq.sub(f"{column} IN ({literal_list})", sql)

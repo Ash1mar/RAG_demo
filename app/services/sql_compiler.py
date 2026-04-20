@@ -39,6 +39,8 @@ def _build_params_from_plan(ir: Dict[str, Any]) -> Tuple[Any, ...]:
         elif op == "in":
             if isinstance(value, (list, tuple)):
                 params.extend(value)
+        elif op == "exists":
+            continue
         else:
             params.append(value)
 

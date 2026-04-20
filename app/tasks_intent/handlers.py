@@ -48,6 +48,43 @@ class TaskCountByStatusHandler:
         return None
 
     def build_answer(self, ctx: AnswerContext) -> Dict[str, Any]:
+        group_field = str((getattr(ctx.spec, "extra", None) or {}).get("group_by") or "").strip()
+        if group_field and ctx.rows and group_field in ctx.rows[0]:
+            dimension_counts: List[Dict[str, Any]] = []
+            for rec in ctx.rows:
+                raw_name = rec.get(group_field)
+                name = str(raw_name or "\u672a\u6307\u5b9a")
+                raw_count = rec.get("task_count")
+                try:
+                    cnt = int(raw_count)
+                except (TypeError, ValueError):
+                    cnt = 1
+                if cnt < 0:
+                    cnt = 0
+                dimension_counts.append(
+                    {"field": group_field, "value": name, "count": cnt}
+                )
+            total = sum(item["count"] for item in dimension_counts)
+            field_labels = {
+                "division_name": "\u90e8\u95e8",
+                "org_name": "\u7ec4\u7ec7",
+                "post_name": "\u5c97\u4f4d",
+                "project": "\u9879\u76ee",
+                "owner_name": "\u53d1\u8d77\u4eba",
+                "created_by_name": "\u521b\u5efa\u4eba",
+            }
+            label = field_labels.get(group_field, group_field)
+            stats_str = "\uff1b".join(
+                f"{item['value']}={item['count']}" for item in dimension_counts
+            ) or "\u65e0"
+            return {
+                "answer": f"\u5404{label}\u4efb\u52a1\u6570\u91cf\u5206\u522b\u4e3a\uff1a{stats_str}\uff08\u603b\u8ba1 {total}\uff09\u3002",
+                "group_by": group_field,
+                "group_counts": dimension_counts,
+                "total_tasks": total,
+                "task": None,
+            }
+
         counts_map: Dict[str, int] = {}
         for rec in ctx.rows:
             status = str(rec.get("status", "")).upper() or "UNKNOWN"

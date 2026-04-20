@@ -248,6 +248,42 @@ def test_text2sql_db_failure_falls_back_to_clean_ir_count(monkeypatch) -> None:
     assert "ORDER BY ts DESC" in payload["text2sql_failed_sql"]
 
 
+def test_text2sql_mode_routes_trusted_count_to_direct_ir(monkeypatch) -> None:
+    class FakeStore:
+        def query(self, sql, params):
+            return [{"status": "TODO", "task_count": 9}]
+
+    def fail_text2sql_llm(prompt, *, dialect="sqlite"):
+        raise AssertionError("Text2SQL LLM should not be called for direct IR count")
+
+    def approve_direct_gate(prompt):
+        return (
+            task_query_module.DirectIRGateDecisionModel(
+                approved=True,
+                reason="test approval",
+                suggested_mode="direct_ir",
+            ),
+            {"provider": "fake", "model": "fake", "base_url": "fake"},
+            {"parsed_json": {"approved": True}, "thinking": None},
+        )
+
+    monkeypatch.setattr(task_query_module, "_call_text2sql_llm", fail_text2sql_llm)
+    monkeypatch.setattr(task_query_module, "_call_direct_ir_gate_llm", approve_direct_gate)
+
+    engine = TaskQueryEngine(tasks_store=FakeStore(), embedder=None, resolver_mode="text2sql")
+    payload = engine.answer(
+        "\u5f20\u624b\u7434\u548c\u5218\u536b\u6c11\u8fd8\u6709\u591a\u5c11\u672a\u5b8c\u6210\u7684\u4efb\u52a1\uff1f",
+        debug=True,
+    )
+
+    assert payload["resolver_mode"] == "text2sql_ir_direct"
+    assert payload["ir_usage"] == "direct_execute"
+    assert payload["ir_routing"]["mode"] == "direct_ir"
+    assert payload["persons"] == ["\u5f20\u624b\u7434", "\u5218\u536b\u6c11"]
+    assert payload["answer"] == "\u5f20\u624b\u7434, \u5218\u536b\u6c11\u7684\u4efb\u52a1\u6309\u72b6\u6001\u7edf\u8ba1\uff1a\u672a\u5b8c\u6210=9\uff08\u603b\u8ba1 9\uff09\u3002"
+    assert payload["nl_ir"]["person"] is None
+
+
 def test_post_process_adds_multi_person_filters() -> None:
     spec = TaskQuerySpec(
         intent=TaskQueryIntent.task_status_list,
@@ -330,6 +366,190 @@ def test_post_process_normalizes_single_value_filter_payload() -> None:
     assert not any(f["field"] == "person" and f.get("value") is None for f in plan["filters"])
 
 
+def test_post_process_moves_section_project_guess_to_division_filter() -> None:
+    q = "\u7814\u53d1\u5e94\u7528\u79d1\u8fd8\u6709\u591a\u5c11\u672a\u5b8c\u6210\u4efb\u52a1\uff1f"
+    spec = TaskQuerySpec(
+        intent=TaskQueryIntent.task_status_list,
+        raw_query=q,
+        answer_mode=TaskAnswerMode.task_count_by_status,
+        project="\u7814\u53d1\u5e94\u7528\u79d1",
+        status=[TaskStatus.TODO],
+        filters=[
+            QueryFilter(field="project", op="eq", value="\u7814\u53d1\u5e94\u7528\u79d1")
+        ],
+    )
+    _post_process_intent(spec, q)
+    assert spec.project is None
+    assert spec.division_name == "\u7814\u53d1\u5e94\u7528\u79d1"
+    assert not any(getattr(f, "field", "") == "project" for f in spec.filters)
+
+
+def test_top_level_enterprise_fields_are_planned_and_hinted() -> None:
+    spec = TaskQuerySpec(
+        intent=TaskQueryIntent.task_status_list,
+        raw_query="enterprise fields",
+        owner_name="User_14",
+        created_by_name="\u6bdb\u6668",
+        division_name="\u7814\u53d1\u5e94\u7528\u79d1",
+        post_code="Post_1",
+        task_id="TASK_1",
+        is_read=0,
+        is_delegated=1,
+        status=[TaskStatus.TODO],
+    )
+    plan = build_task_query_plan(spec)
+    filter_map = {
+        (f.get("field"), f.get("op")): f.get("value")
+        for f in plan["filters"]
+    }
+    assert filter_map[("owner_name", "eq")] == "User_14"
+    assert filter_map[("created_by_name", "eq")] == "\u6bdb\u6668"
+    assert filter_map[("division_name", "eq")] == "\u7814\u53d1\u5e94\u7528\u79d1"
+    assert filter_map[("post_code", "eq")] == "Post_1"
+    assert filter_map[("task_id", "eq")] == "TASK_1"
+    assert filter_map[("is_read", "eq")] == 0
+    assert filter_map[("is_delegated", "eq")] == 1
+
+    hint = _make_text2sql_ir_hint(spec)
+    assert hint["owner_name"] == "User_14"
+    assert hint["created_by_name"] == "\u6bdb\u6668"
+    assert hint["division_name"] == "\u7814\u53d1\u5e94\u7528\u79d1"
+    assert hint["post_code"] == "Post_1"
+    assert hint["task_id"] == "TASK_1"
+    assert hint["is_read"] == 0
+    assert hint["is_delegated"] == 1
+
+
+def test_group_by_division_count_uses_exists_filter_without_value_param() -> None:
+    spec = TaskQuerySpec(
+        intent=TaskQueryIntent.task_status_list,
+        raw_query="\u5404\u90e8\u95e8\u672a\u5b8c\u6210\u4efb\u52a1\u6570\u91cf\u5206\u522b\u662f\u591a\u5c11\uff1f",
+        answer_mode=TaskAnswerMode.task_count_by_status,
+        status=[TaskStatus.TODO],
+        filters=[QueryFilter(field="division_name", op="exists", value="True")],
+        extra={"group_by": "division_name"},
+        limit=50,
+    )
+    plan = build_task_query_plan(spec)
+    assert plan["projections"] == ["division_name", "COUNT(*) AS task_count"]
+    assert plan["group_by"] == ["division_name"]
+    assert {"field": "division_name", "op": "exists", "value": True} in plan["filters"]
+
+    compiled = compile_tasks_sql(spec, dialect="mssql")
+    assert "division_name IS NOT NULL" in compiled.sql
+    assert "division_name = ?" not in compiled.sql
+    assert "GROUP BY division_name" in compiled.sql
+    assert compiled.params == ("TODO", 50)
+
+
+def test_direct_ir_group_by_division_count_answer(monkeypatch) -> None:
+    class FakeStore:
+        def query(self, sql, params):
+            return [
+                {"division_name": "\u7814\u53d1\u5e94\u7528\u79d1", "task_count": 3},
+                {"division_name": "\u7efc\u5408\u7ba1\u7406\u79d1", "task_count": 1},
+            ]
+
+    def fake_parse(_q):
+        return TaskQuerySpec(
+            intent=TaskQueryIntent.task_status_list,
+            raw_query="\u5404\u90e8\u95e8\u672a\u5b8c\u6210\u4efb\u52a1\u6570\u91cf\u5206\u522b\u662f\u591a\u5c11\uff1f",
+            is_supported=True,
+            intent_confidence=0.9,
+            answer_mode=TaskAnswerMode.task_count_by_status,
+            status=[TaskStatus.TODO],
+            filters=[QueryFilter(field="division_name", op="exists", value="True")],
+            extra={"group_by": "division_name", "nl2sql_source": "llm"},
+            limit=50,
+        )
+
+    def approve_direct_gate(prompt):
+        return (
+            task_query_module.DirectIRGateDecisionModel(
+                approved=True,
+                reason="test approval",
+                suggested_mode="direct_ir",
+            ),
+            {"provider": "fake", "model": "fake", "base_url": "fake"},
+            {"parsed_json": {"approved": True}, "thinking": None},
+        )
+
+    monkeypatch.setattr(task_query_module, "parse_task_query_nl", fake_parse)
+    monkeypatch.setattr(task_query_module, "_call_direct_ir_gate_llm", approve_direct_gate)
+    engine = TaskQueryEngine(tasks_store=FakeStore(), embedder=None, resolver_mode="text2sql")
+    payload = engine.answer("\u5404\u90e8\u95e8\u672a\u5b8c\u6210\u4efb\u52a1\u6570\u91cf\u5206\u522b\u662f\u591a\u5c11\uff1f")
+
+    assert payload["resolver_mode"] == "text2sql_ir_direct"
+    assert payload["group_by"] == "division_name"
+    assert payload["group_counts"] == [
+        {"field": "division_name", "value": "\u7814\u53d1\u5e94\u7528\u79d1", "count": 3},
+        {"field": "division_name", "value": "\u7efc\u5408\u7ba1\u7406\u79d1", "count": 1},
+    ]
+    assert payload["total_tasks"] == 4
+
+
+def test_direct_ir_gate_rejects_and_falls_back_to_text2sql(monkeypatch) -> None:
+    class FakeStore:
+        def query(self, sql, params):
+            return []
+
+    def fake_parse(q):
+        return TaskQuerySpec(
+            intent=TaskQueryIntent.task_status_list,
+            raw_query=q,
+            is_supported=True,
+            intent_confidence=0.95,
+            answer_mode=TaskAnswerMode.task_count_by_status,
+            person="\u5f20\u624b\u7434",
+            status=[TaskStatus.TODO],
+            extra={"nl2sql_source": "llm"},
+        )
+
+    def reject_direct_gate(prompt):
+        return (
+            task_query_module.DirectIRGateDecisionModel(
+                approved=False,
+                reason="compiled SQL does not match requested grouping",
+                issues=["missing_group_by"],
+                suggested_mode="text2sql",
+            ),
+            {"provider": "fake", "model": "fake", "base_url": "fake"},
+            {"parsed_json": {"approved": False}, "thinking": None},
+        )
+
+    def fake_text2sql_llm(prompt, *, dialect="sqlite"):
+        return (
+            Text2SQLResponseModel(
+                queries=[
+                    Text2SQLQueryModel(
+                        sql=(
+                            "SELECT status, COUNT(*) AS task_count FROM task_latest "
+                            "WHERE person = '\u5f20\u624b\u7434' AND status = 'TODO' GROUP BY status"
+                        ),
+                        description="fallback text2sql",
+                    )
+                ]
+            ),
+            {"provider": "fake", "model": "fake", "base_url": "fake"},
+            {"parsed_json": {"queries": []}, "thinking": None},
+        )
+
+    monkeypatch.setattr(task_query_module.llm_settings, "enabled", True)
+    monkeypatch.setattr(task_query_module.llm_settings, "provider", "openai")
+    monkeypatch.setattr(task_query_module, "parse_task_query_nl", fake_parse)
+    monkeypatch.setattr(task_query_module, "_call_direct_ir_gate_llm", reject_direct_gate)
+    monkeypatch.setattr(task_query_module, "_call_text2sql_llm", fake_text2sql_llm)
+
+    engine = TaskQueryEngine(tasks_store=FakeStore(), embedder=None, resolver_mode="text2sql")
+    payload = engine.answer("\u5f20\u624b\u7434\u8fd8\u6709\u591a\u5c11\u672a\u5b8c\u6210\u4efb\u52a1\uff1f", debug=True)
+
+    assert payload["resolver_mode"] == "text2sql"
+    assert payload["ir_usage"] == "text2sql_after_direct_ir_gate"
+    assert payload["direct_ir_gate"]["approved"] is False
+    assert payload["direct_ir_gate"]["suggested_mode"] == "text2sql"
+    assert any(item.get("stage") == "direct_ir_llm_gate" for item in payload["debug_trace"])
+
+
 def test_strip_model_thinking_removes_reasoning_prefix() -> None:
     assert _strip_model_thinking("<think>draft</think>\u7b54\u6848") == "\u7b54\u6848"
     assert _strip_model_thinking("draft</think>\u7b54\u6848") == "\u7b54\u6848"
@@ -401,7 +621,8 @@ def test_compile_sql_sanitizes_structured_filter_values() -> None:
     assert all(not isinstance(p, dict) for p in compiled.params)
 
 
-def test_text2sql_rewrite_flow_uses_project_not_tags() -> None:
+def test_text2sql_rewrite_flow_uses_project_not_tags(monkeypatch) -> None:
+    monkeypatch.setenv("TASKS_TEXT2SQL_REWRITE_MODE", "semantic")
     q = "流程（flow_name）为 部门任务流程 下有哪些任务？"
     sql = "SELECT task, status, ts FROM task_latest WHERE tags LIKE '%部门任务流程%' ORDER BY ts DESC LIMIT 10"
     hint = {"project": "部门任务流程"}
@@ -411,7 +632,8 @@ def test_text2sql_rewrite_flow_uses_project_not_tags() -> None:
     assert "tags like '%部门任务流程%'" not in lowered
 
 
-def test_text2sql_rewrite_flow_can_infer_from_question() -> None:
+def test_text2sql_rewrite_flow_can_infer_from_question(monkeypatch) -> None:
+    monkeypatch.setenv("TASKS_TEXT2SQL_REWRITE_MODE", "semantic")
     q = "流程（flow_name）为 部门任务流程 下有哪些任务？"
     sql = "SELECT task, status, ts FROM task_latest WHERE tags LIKE '%部门任务流程%' ORDER BY ts DESC LIMIT 10"
     rewritten = _rewrite_text2sql_query(sql, {}, question=q)
@@ -420,12 +642,40 @@ def test_text2sql_rewrite_flow_can_infer_from_question() -> None:
     assert "tags like '%部门任务流程%'" not in lowered
 
 
-def test_text2sql_rewrite_drops_spurious_blocked_status() -> None:
+def test_text2sql_rewrite_drops_spurious_blocked_status(monkeypatch) -> None:
+    monkeypatch.setenv("TASKS_TEXT2SQL_REWRITE_MODE", "semantic")
     q = "流程（flow_name）为 部门任务流程 中即将到期的任务有哪些？"
     sql = "SELECT * FROM task_latest WHERE project = '部门任务流程' AND status = 'BLOCKED' AND due_ts < 9999999999999 LIMIT 10"
     hint = {"project": "部门任务流程", "status": []}
     rewritten = _rewrite_text2sql_query(sql, hint, question=q)
     assert "BLOCKED" not in rewritten
+
+
+def test_text2sql_rewrite_defaults_to_safe_mode() -> None:
+    sql = "SELECT task, status FROM task_latest WHERE tags LIKE '%flow%'"
+    hint = {"project": "flow"}
+    rewritten = _rewrite_text2sql_query(sql, hint, question="flow_name=flow")
+    assert rewritten == sql
+
+
+def test_text2sql_rewrite_preserves_multi_person_filter(monkeypatch) -> None:
+    monkeypatch.setenv("TASKS_TEXT2SQL_REWRITE_MODE", "semantic")
+    sql = (
+        "SELECT COUNT(*) AS unfinished_task_count FROM task_latest "
+        "WHERE person IN ('\u5f20\u624b\u7434', '\u5218\u536b\u6c11') AND status = 'TODO'"
+    )
+    hint = {
+        "person": "\u5f20\u624b\u7434",
+        "filters": [
+            {
+                "field": "person",
+                "op": "in",
+                "values": ["\u5f20\u624b\u7434", "\u5218\u536b\u6c11"],
+            }
+        ],
+    }
+    rewritten = _rewrite_text2sql_query(sql, hint, question="")
+    assert "person IN ('\u5f20\u624b\u7434', '\u5218\u536b\u6c11')" in rewritten
 
 
 def test_compile_sql_person_summary_requires_scope() -> None:

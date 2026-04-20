@@ -21,6 +21,8 @@ def _render_filter(field: str, op: str, value: Any) -> str:
     if op == "between":
         # treated as two positional params in the caller
         return f"{field} BETWEEN ? AND ?"
+    if op == "exists":
+        return f"{field} IS NOT NULL AND {field} <> ''"
     if op == "in":
         # value is expected to be an iterable; we only care about length
         if not isinstance(value, (list, tuple)) or not value:

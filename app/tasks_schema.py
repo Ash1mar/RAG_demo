@@ -82,11 +82,19 @@ def _default_field_map() -> Dict[str, str]:
         "description": "description",
         # Enterprise extensions (optional).
         "owner": "owner",
+        "owner_code": "owner_code",
+        "owner_name": "owner_name",
+        "created_by": "created_by",
+        "created_by_name": "created_by_name",
+        "created_by_org_code": "created_by_org_code",
         "org_name": "org_name",
         "division_name": "division_name",
+        "division_code": "division_code",
         "post_name": "post_name",
+        "post_code": "post_code",
         "is_read": "is_read",
         "is_delegated": "is_delegated",
+        "task_id": "task_id",
     }
 
 

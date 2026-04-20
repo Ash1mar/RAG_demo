@@ -84,8 +84,31 @@ class OrderBySpec(BaseModel):
 
 _SQL_PARAM_SCALAR_TYPES = (str, int, float, bytes, bool)
 _SAFE_FIELD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_ALLOWED_FILTER_OPS = {"eq", "in", "like", "gte", "lte", "between"}
+_ALLOWED_FILTER_OPS = {"eq", "in", "like", "gte", "lte", "between", "exists"}
 _PRIORITY_TOKEN_RE = re.compile(r"^P(?P<num>[1-9][0-9]*)$", re.IGNORECASE)
+_TASK_QUERY_SCALAR_FILTER_FIELDS = (
+    "id",
+    "owner",
+    "owner_code",
+    "owner_name",
+    "created_by",
+    "created_by_name",
+    "created_by_org_code",
+    "org_name",
+    "division_name",
+    "division_code",
+    "post_name",
+    "post_code",
+    "task_id",
+    "is_read",
+    "is_delegated",
+    "ts",
+    "due_ts",
+    "created_ts",
+    "updated_ts",
+    "status_note",
+    "description",
+)
 
 
 def _coerce_sql_param_scalar(value: Any) -> Any:
@@ -210,6 +233,10 @@ class QueryFilter(BaseModel):
             payload["value"] = [start, end]
             return payload
 
+        if op == "exists":
+            payload["value"] = True
+            return payload
+
         if field == "priority":
             coerced = _coerce_priority_value(self.value)
         else:
@@ -245,6 +272,9 @@ class TaskQuerySpec(BaseModel):
         TaskAnswerMode.default, description="Optional hint for downstream answer formatter."
     )
 
+    id: Optional[int] = Field(
+        None, description="Internal row id for exact filtering."
+    )
     person: Optional[str] = Field(
         None, description="Person involved in the task, if recognized."
     )
@@ -257,6 +287,66 @@ class TaskQuerySpec(BaseModel):
     )
     project: Optional[str] = Field(
         None, description="Project identifier/name for filtering."
+    )
+    owner: Optional[str] = Field(
+        None, description="Task owner/initiator for filtering."
+    )
+    owner_code: Optional[str] = Field(
+        None, description="Owner/initiator code for filtering."
+    )
+    owner_name: Optional[str] = Field(
+        None, description="Owner/initiator display name for filtering."
+    )
+    created_by: Optional[str] = Field(
+        None, description="Task creator identifier/name for filtering."
+    )
+    created_by_name: Optional[str] = Field(
+        None, description="Task creator display name for filtering."
+    )
+    created_by_org_code: Optional[str] = Field(
+        None, description="Creator organization code for filtering."
+    )
+    org_name: Optional[str] = Field(
+        None, description="Organization/company/unit name for filtering."
+    )
+    division_name: Optional[str] = Field(
+        None, description="Department/division/section name for filtering."
+    )
+    division_code: Optional[str] = Field(
+        None, description="Department/division/section code for filtering."
+    )
+    post_name: Optional[str] = Field(
+        None, description="Post/role name for filtering."
+    )
+    post_code: Optional[str] = Field(
+        None, description="Post/role code for filtering."
+    )
+    task_id: Optional[str] = Field(
+        None, description="Business task identifier for filtering."
+    )
+    is_read: Optional[int] = Field(
+        None, description="Read flag for filtering (0/1)."
+    )
+    is_delegated: Optional[int] = Field(
+        None, description="Delegation flag for filtering (0/1)."
+    )
+    ts: Optional[Any] = Field(
+        None, description="Exact status timestamp filter when explicitly specified."
+    )
+    due_ts: Optional[Any] = Field(
+        None, description="Exact due timestamp filter when explicitly specified."
+    )
+    created_ts: Optional[Any] = Field(
+        None, description="Exact creation timestamp filter when explicitly specified."
+    )
+    updated_ts: Optional[Any] = Field(
+        None, description="Exact update timestamp filter when explicitly specified."
+    )
+    status_note: Optional[str] = Field(
+        None, description="Status note text for exact filtering."
+    )
+    description: Optional[str] = Field(
+        None, description="Task description text for exact filtering."
     )
     tags: List[str] = Field(
         default_factory=list,
@@ -1169,6 +1259,71 @@ def _ensure_person_filter_from_text(spec: TaskQuerySpec, text: str) -> None:
         spec.person = persons[0]
 
 
+_ORG_FIELD_SUFFIXES = {
+    "division_name": (
+        "\u79d1",
+        "\u90e8\u95e8",
+        "\u90e8",
+        "\u5904",
+        "\u5ba4",
+        "\u4e2d\u5fc3",
+    ),
+    "org_name": (
+        "\u516c\u53f8",
+        "\u5355\u4f4d",
+        "\u7814\u7a76\u9662",
+        "\u5206\u516c\u53f8",
+        "\u603b\u90e8",
+    ),
+    "post_name": (
+        "\u5c97",
+        "\u5c97\u4f4d",
+        "\u804c\u4f4d",
+        "\u89d2\u8272",
+    ),
+}
+
+
+def _infer_org_filter_field(value: Optional[str]) -> Optional[str]:
+    text = (value or "").strip()
+    if not text:
+        return None
+    for field, suffixes in _ORG_FIELD_SUFFIXES.items():
+        if any(text.endswith(suffix) for suffix in suffixes):
+            return field
+    return None
+
+
+def _move_project_org_value_to_filter(spec: TaskQuerySpec) -> None:
+    project_value = (getattr(spec, "project", None) or "").strip()
+    target_field = _infer_org_filter_field(project_value)
+    if not project_value or not target_field:
+        return
+
+    filters = list(getattr(spec, "filters", []) or [])
+    cleaned: List[QueryFilter] = []
+    has_target_filter = False
+    for flt in filters:
+        field = str(getattr(flt, "field", "") or "").lower()
+        op = str(getattr(flt, "op", "eq") or "eq").lower()
+        value = (getattr(flt, "value", None) or "")
+        value_text = str(value).strip()
+        if field == "project" and op == "eq" and value_text == project_value:
+            continue
+        if field == target_field and op == "eq" and value_text == project_value:
+            has_target_filter = True
+        cleaned.append(flt)
+
+    if not (getattr(spec, target_field, None) or ""):
+        setattr(spec, target_field, project_value)
+        has_target_filter = True
+
+    if not has_target_filter:
+        cleaned.append(QueryFilter(field=target_field, op="eq", value=project_value))
+    spec.filters = cleaned
+    spec.project = None
+
+
 def _post_process_intent(spec: TaskQuerySpec, text: str) -> None:
     """Apply lightweight intent heuristics on top of LLM/rule output."""
     t = (text or "").strip()
@@ -1406,9 +1561,8 @@ def _post_process_intent(spec: TaskQuerySpec, text: str) -> None:
         person_value = (getattr(spec, "person", None) or "").strip()
         if person_value and person_value.lower() == enterprise_user.lower():
             _prune_filters_by_field(spec, "person")
-            spec.filters = list(getattr(spec, "filters", []) or []) + [
-                QueryFilter(field="owner", op="eq", value=enterprise_user)
-            ]
+            if not (getattr(spec, "owner_name", None) or "").strip():
+                spec.owner_name = enterprise_user
             spec.person = None
 
     # Enterprise hint: Org_/Division_/Post_ tokens map to organization fields, not project/person.
@@ -1416,43 +1570,33 @@ def _post_process_intent(spec: TaskQuerySpec, text: str) -> None:
         project_value = (getattr(spec, "project", None) or "").strip()
         if project_value and project_value.lower() == enterprise_division.lower():
             spec.project = None
-        spec.filters = list(getattr(spec, "filters", []) or []) + [
-            QueryFilter(field="division_name", op="eq", value=enterprise_division)
-        ]
+        if not (getattr(spec, "division_name", None) or "").strip():
+            spec.division_name = enterprise_division
     if enterprise_org:
         project_value = (getattr(spec, "project", None) or "").strip()
         if project_value and project_value.lower() == enterprise_org.lower():
             spec.project = None
-        spec.filters = list(getattr(spec, "filters", []) or []) + [
-            QueryFilter(field="org_name", op="eq", value=enterprise_org)
-        ]
+        if not (getattr(spec, "org_name", None) or "").strip():
+            spec.org_name = enterprise_org
     if enterprise_post:
         project_value = (getattr(spec, "project", None) or "").strip()
         if project_value and project_value.lower() == enterprise_post.lower():
             spec.project = None
-        spec.filters = list(getattr(spec, "filters", []) or []) + [
-            QueryFilter(field="post_name", op="eq", value=enterprise_post)
-        ]
+        if not (getattr(spec, "post_name", None) or "").strip():
+            spec.post_name = enterprise_post
+    _move_project_org_value_to_filter(spec)
 
     # Enterprise hint: read/delegated flags.
     if "阅读" in t or "已读" in t or "未读" in t:
         if "尚未阅读" in t or "未阅读" in t or "未读" in t:
-            spec.filters = list(getattr(spec, "filters", []) or []) + [
-                QueryFilter(field="is_read", op="eq", value=0)
-            ]
+            spec.is_read = 0
         elif "已经被阅读" in t or "已阅读" in t or "已读" in t:
-            spec.filters = list(getattr(spec, "filters", []) or []) + [
-                QueryFilter(field="is_read", op="eq", value=1)
-            ]
+            spec.is_read = 1
     if "委托" in t:
         if "未被委托" in t or "未委托" in t:
-            spec.filters = list(getattr(spec, "filters", []) or []) + [
-                QueryFilter(field="is_delegated", op="eq", value=0)
-            ]
+            spec.is_delegated = 0
         elif "已经被委托" in t or "已被委托" in t or "已委托" in t:
-            spec.filters = list(getattr(spec, "filters", []) or []) + [
-                QueryFilter(field="is_delegated", op="eq", value=1)
-            ]
+            spec.is_delegated = 1
 
     # If the text does not contain an explicit person/task mention, prefer
     # clearing guessed entities so the query can be answered as a list.
@@ -1600,6 +1744,12 @@ def _post_process_intent(spec: TaskQuerySpec, text: str) -> None:
         else:
             spec.limit = limit_val
 
+    if not getattr(spec, "order_by", None):
+        spec.order_by = [
+            OrderBySpec(field="ts", direction=OrderByDirection.desc),
+            OrderBySpec(field="priority", direction=OrderByDirection.asc),
+        ]
+
 
 def parse_task_query_nl(q: str) -> TaskQuerySpec:
     """Entry point: parse natural language into TaskQuerySpec."""
@@ -1647,7 +1797,22 @@ def sanitize_task_query_spec_for_downstream(spec: TaskQuerySpec) -> TaskQuerySpe
     _clear_due_polluted_time_range(cleaned, text)
     _clear_unmentioned_created_range(cleaned, text)
     _normalize_statuses_against_config(cleaned)
+    _clear_scalar_entities_shadowed_by_multi_filters(cleaned)
     return cleaned
+
+
+def _clear_scalar_entities_shadowed_by_multi_filters(spec: TaskQuerySpec) -> None:
+    for field in ("person", "task"):
+        for flt in getattr(spec, "filters", None) or []:
+            if not isinstance(flt, QueryFilter):
+                continue
+            if str(getattr(flt, "field", "") or "").lower() != field:
+                continue
+            op = str(getattr(flt, "op", "") or "").lower()
+            values = getattr(flt, "values", None) or []
+            if op == "in" and len([v for v in values if v not in (None, "")]) > 1:
+                setattr(spec, field, None)
+                break
 
 
 def _rule_based_parse_task_query_nl(q: str) -> TaskQuerySpec:
@@ -1882,6 +2047,9 @@ def build_task_query_plan(spec: TaskQuerySpec) -> Dict[str, Any]:
 
     filters: List[Dict[str, Any]] = []
     group_by: List[str] = []
+    extra = getattr(spec, "extra", None) or {}
+    requested_group_by = str(extra.get("group_by") or "").strip()
+    requested_group_field = _translate_ident(requested_group_by) if requested_group_by and _SAFE_FIELD_RE.match(requested_group_by) else ""
     has_person_filter = any(
         str(getattr(flt, "field", "") or "").lower() == "person"
         for flt in (getattr(spec, "filters", None) or [])
@@ -1893,6 +2061,10 @@ def build_task_query_plan(spec: TaskQuerySpec) -> Dict[str, Any]:
         filters.append({"field": schema.translate_field("task"), "op": "eq", "value": spec.task})
     if spec.project:
         filters.append({"field": schema.translate_field("project"), "op": "eq", "value": spec.project})
+    for field_name in _TASK_QUERY_SCALAR_FILTER_FIELDS:
+        value = getattr(spec, field_name, None)
+        if value not in (None, ""):
+            filters.append({"field": schema.translate_field(field_name), "op": "eq", "value": value})
     if spec.priority is not None:
         filters.append({"field": schema.translate_field("priority"), "op": "eq", "value": spec.priority})
     if spec.tags:
@@ -1978,11 +2150,18 @@ def build_task_query_plan(spec: TaskQuerySpec) -> Dict[str, Any]:
                 pass
 
     if answer_mode == TaskAnswerMode.task_count_by_status:
-        projections: List[str] = [
-            _translate_ident("status"),
-            "COUNT(*) AS task_count",
-        ]
-        group_by = [_translate_ident("status")]
+        if requested_group_field:
+            projections: List[str] = [
+                requested_group_field,
+                "COUNT(*) AS task_count",
+            ]
+            group_by = [requested_group_field]
+        else:
+            projections = [
+                _translate_ident("status"),
+                "COUNT(*) AS task_count",
+            ]
+            group_by = [_translate_ident("status")]
     elif answer_mode == TaskAnswerMode.person_summary_by_project:
         projections = [
             _translate_ident("project"),
@@ -2016,6 +2195,7 @@ def build_task_query_plan(spec: TaskQuerySpec) -> Dict[str, Any]:
             _translate_ident("created_ts"),
             _translate_ident("updated_ts"),
             _translate_ident("status_note"),
+            _translate_ident("description"),
         ]
     elif spec.intent == TaskQueryIntent.person_summary:
         projections = [
@@ -2039,10 +2219,16 @@ def build_task_query_plan(spec: TaskQuerySpec) -> Dict[str, Any]:
         for ob in spec.order_by
     ]
     if answer_mode == TaskAnswerMode.task_count_by_status:
-        sort = [
-            {"field": "task_count", "direction": "DESC"},
-            {"field": _translate_ident("status"), "direction": "ASC"},
-        ]
+        if requested_group_field:
+            sort = [
+                {"field": "task_count", "direction": "DESC"},
+                {"field": requested_group_field, "direction": "ASC"},
+            ]
+        else:
+            sort = [
+                {"field": "task_count", "direction": "DESC"},
+                {"field": _translate_ident("status"), "direction": "ASC"},
+            ]
     elif answer_mode == TaskAnswerMode.person_summary_by_project:
         sort = [
             {"field": _translate_ident("project"), "direction": "ASC"},
