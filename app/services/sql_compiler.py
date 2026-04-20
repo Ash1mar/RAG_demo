@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 import os
+import re
 from typing import Any, Dict, List, Tuple, Optional
 
 from app.services.nl2sql_engine import TaskQuerySpec, TaskQueryIntent, TaskStatus, build_task_query_plan
@@ -16,6 +18,46 @@ class TaskSqlCompileError(Exception):
 class CompiledSql:
     sql: str
     params: Tuple[Any, ...]
+
+
+def _resolve_symbolic_time_param(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    token = value.strip().lower()
+    if not token:
+        return value
+    now = datetime.now(timezone.utc)
+    if token == "now":
+        return int(now.timestamp() * 1000)
+    if token == "start_of_week":
+        start = now - timedelta(days=now.weekday())
+        return int(start.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+    if token == "end_of_week":
+        start = now - timedelta(days=now.weekday())
+        end = start.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=7, seconds=-1)
+        return int(end.timestamp() * 1000)
+    if token == "start_of_month":
+        return int(now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+    if token == "end_of_month":
+        if now.month == 12:
+            next_month = now.replace(year=now.year + 1, month=1, day=1)
+        else:
+            next_month = now.replace(month=now.month + 1, day=1)
+        end = next_month.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(seconds=1)
+        return int(end.timestamp() * 1000)
+    match = re.fullmatch(r"now-(\d+)([dwm])", token)
+    if match:
+        amount = int(match.group(1))
+        unit = match.group(2)
+        days = amount * 7 if unit == "w" else amount * 30 if unit == "m" else amount
+        return int((now - timedelta(days=days)).timestamp() * 1000)
+    match = re.fullmatch(r"now\+(\d+)([dwm])", token)
+    if match:
+        amount = int(match.group(1))
+        unit = match.group(2)
+        days = amount * 7 if unit == "w" else amount * 30 if unit == "m" else amount
+        return int((now + timedelta(days=days)).timestamp() * 1000)
+    return value
 
 
 def _build_params_from_plan(ir: Dict[str, Any]) -> Tuple[Any, ...]:
@@ -35,14 +77,14 @@ def _build_params_from_plan(ir: Dict[str, Any]) -> Tuple[Any, ...]:
         value = f.get("value")
         if op == "between":
             if isinstance(value, (list, tuple)) and len(value) == 2:
-                params.extend(value)
+                params.extend(_resolve_symbolic_time_param(item) for item in value)
         elif op == "in":
             if isinstance(value, (list, tuple)):
                 params.extend(value)
         elif op == "exists":
             continue
         else:
-            params.append(value)
+            params.append(_resolve_symbolic_time_param(value))
 
     # LIMIT is always represented as a positional parameter when present.
     limit = ir.get("limit")

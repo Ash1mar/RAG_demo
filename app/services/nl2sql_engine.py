@@ -838,6 +838,38 @@ def _is_remaining_count_question(text: str) -> bool:
     )
 
 
+def _is_completed_and_incomplete_count_question(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    lower = t.lower()
+    has_done = any(kw in t for kw in ("\u5df2\u5b8c\u6210", "\u505a\u5b8c", "\u5b8c\u6210\u4e86")) or "done" in lower
+    has_todo = any(kw in t for kw in ("\u672a\u5b8c\u6210", "\u6ca1\u5b8c\u6210", "\u8fd8\u6ca1\u505a")) or "todo" in lower
+    asks_count = any(kw in t for kw in ("\u591a\u5c11", "\u51e0\u4e2a", "\u6570\u91cf", "\u7edf\u8ba1")) or "count" in lower
+    asks_split = any(kw in t for kw in ("\u5206\u522b", "\u5404\u81ea", "\u5404\u6709", "\u6309\u72b6\u6001"))
+    return has_done and has_todo and asks_count and asks_split
+
+
+def _is_completed_count_by_person_question(text: str, spec: Optional[TaskQuerySpec] = None) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    lower = t.lower()
+    has_done = any(kw in t for kw in ("\u5df2\u5b8c\u6210", "\u5b8c\u6210", "\u505a\u5b8c")) or "done" in lower
+    has_count = any(kw in t for kw in ("\u6570\u91cf", "\u591a\u5c11", "\u51e0\u4e2a", "\u7edf\u8ba1")) or "count" in lower
+    compares_people = any(kw in t for kw in ("\u6bd4\u8f83", "\u5bf9\u6bd4", "\u5206\u522b", "\u5404\u81ea", "\u5404\u6709"))
+    person_tokens = _extract_person_tokens_from_text(t)
+    if len(person_tokens) < 2 and spec is not None:
+        for flt in getattr(spec, "filters", None) or []:
+            if str(getattr(flt, "field", "") or "").lower() != "person":
+                continue
+            values = getattr(flt, "values", None) or []
+            if len([value for value in values if value]) >= 2:
+                person_tokens = [str(value) for value in values if value]
+                break
+    return has_done and has_count and compares_people and len(person_tokens) >= 2
+
+
 def _looks_like_task_question_fragment(value: Optional[str], raw_query: str = "") -> bool:
     token = (value or "").strip()
     if not token:
@@ -1506,7 +1538,22 @@ def _post_process_intent(spec: TaskQuerySpec, text: str) -> None:
     status_kws = ("已完成", "未完成", "done", "todo", "搞定", "结束")
     status_kws_lower = tuple(kw.lower() for kw in status_kws)
 
-    if _is_remaining_count_question(t):
+    if _is_completed_and_incomplete_count_question(t):
+        spec.intent = TaskQueryIntent.task_status_list
+        spec.answer_mode = TaskAnswerMode.task_count_by_status
+        spec.status = [TaskStatus.DONE, TaskStatus.TODO]
+        spec.task = None
+        _prune_filters_by_field(spec, "task")
+    elif _is_completed_count_by_person_question(t, spec):
+        spec.intent = TaskQueryIntent.task_status_list
+        spec.answer_mode = TaskAnswerMode.task_count_by_status
+        spec.status = [TaskStatus.DONE]
+        spec.task = None
+        extra = getattr(spec, "extra", None) or {}
+        extra["group_by"] = "person"
+        spec.extra = extra
+        _prune_filters_by_field(spec, "task")
+    elif _is_remaining_count_question(t):
         spec.intent = TaskQueryIntent.task_status_list
         spec.answer_mode = TaskAnswerMode.task_count_by_status
         spec.status = [TaskStatus.TODO]

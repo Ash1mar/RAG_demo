@@ -1738,11 +1738,15 @@ class TaskQueryEngine:
                 primary_rows = rows
                 primary_sql = normalized_sql
 
+        answer_rows = _collect_text2sql_answer_rows(executed)
+
         base["text2sql"] = executed
+        if answer_rows:
+            base["text2sql_answer_rows"] = answer_rows
         if primary_sql is not None:
             base["sql"] = primary_sql
             base["params"] = []
-            base["rows"] = primary_rows
+            base["rows"] = answer_rows or primary_rows
 
         base.pop("error", None)
         base.pop("reason", None)
@@ -1753,9 +1757,9 @@ class TaskQueryEngine:
 
         natural_answer: Optional[str] = None
         answer_debug: Dict[str, Any] = {}
-        if primary_rows:
+        if answer_rows:
             try:
-                natural_answer, answer_debug = _generate_text2sql_answer(q, primary_rows, llm_runtime)
+                natural_answer, answer_debug = _generate_text2sql_answer(q, answer_rows, llm_runtime)
             except Text2SQLGenerateError as exc:
                 base["text2sql_answer_error"] = str(exc)
                 if debug_enabled:
@@ -1765,7 +1769,7 @@ class TaskQueryEngine:
                         function="_generate_text2sql_answer",
                         inputs={
                             "question": q,
-                            "rows_for_prompt": primary_rows,
+                            "rows_for_prompt": answer_rows,
                             "runtime": llm_runtime,
                         },
                         output={"error": str(exc)},
@@ -1801,8 +1805,8 @@ class TaskQueryEngine:
 
         if natural_answer:
             base["answer"] = natural_answer
-        elif primary_rows:
-            base["answer"] = _summarize_text2sql_rows(primary_rows)
+        elif answer_rows:
+            base["answer"] = _summarize_text2sql_rows(answer_rows)
         else:
             base["answer"] = "Text2SQL query returned no rows."
 
@@ -2549,6 +2553,30 @@ def _generate_text2sql_answer(
         "response": content,
         "thinking": thinking,
     }
+
+
+def _collect_text2sql_answer_rows(executed: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return the complete row set that should be visible to answer generation."""
+    if not executed:
+        return []
+    if len(executed) == 1:
+        return list(executed[0].get("rows") or [])
+
+    answer_rows: List[Dict[str, Any]] = []
+    for index, item in enumerate(executed, start=1):
+        rows = item.get("rows") or []
+        if not rows:
+            continue
+        description = str(item.get("description") or f"query_{index}")
+        for row in rows:
+            if isinstance(row, dict):
+                enriched = dict(row)
+            else:
+                enriched = {"value": row}
+            enriched.setdefault("_query_index", index)
+            enriched.setdefault("_query_description", description)
+            answer_rows.append(enriched)
+    return answer_rows
 
 
 def _extract_model_thinking(text: Optional[str]) -> Optional[str]:

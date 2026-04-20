@@ -550,6 +550,125 @@ def test_direct_ir_gate_rejects_and_falls_back_to_text2sql(monkeypatch) -> None:
     assert any(item.get("stage") == "direct_ir_llm_gate" for item in payload["debug_trace"])
 
 
+def test_text2sql_answer_uses_all_generated_query_rows(monkeypatch) -> None:
+    class FakeStore:
+        def query(self, sql, params):
+            if "DONE" in sql:
+                return [{"completed_count": 849}]
+            if "TODO" in sql:
+                return [{"pending_count": 9}]
+            return []
+
+    def fake_text2sql_llm(prompt, *, dialect="sqlite"):
+        return (
+            Text2SQLResponseModel(
+                queries=[
+                    Text2SQLQueryModel(
+                        sql=(
+                            "SELECT COUNT(*) AS completed_count FROM task_latest "
+                            "WHERE person = '\u5f20\u624b\u7434' AND status = 'DONE'"
+                        ),
+                        description="completed count",
+                    ),
+                    Text2SQLQueryModel(
+                        sql=(
+                            "SELECT COUNT(*) AS pending_count FROM task_latest "
+                            "WHERE person = '\u5f20\u624b\u7434' AND status = 'TODO'"
+                        ),
+                        description="pending count",
+                    ),
+                ]
+            ),
+            {"provider": "openai", "model": "fake"},
+            {"parsed_json": {"queries": []}, "thinking": None},
+        )
+
+    captured: Dict[str, Any] = {}
+
+    def fake_answer_llm(prompt, runtime):
+        captured["prompt"] = prompt
+        return "\u5f20\u624b\u7434\u5df2\u5b8c\u6210 849 \u4e2a\uff0c\u672a\u5b8c\u6210 9 \u4e2a\u3002"
+
+    monkeypatch.setattr(task_query_module.llm_settings, "enabled", True)
+    monkeypatch.setattr(task_query_module.llm_settings, "provider", "openai")
+    monkeypatch.setattr(task_query_module, "_call_text2sql_llm", fake_text2sql_llm)
+    monkeypatch.setattr(task_query_module, "_call_text2sql_answer_llm", fake_answer_llm)
+
+    q = "\u5f20\u624b\u7434\u5df2\u5b8c\u6210\u548c\u672a\u5b8c\u6210\u4efb\u52a1\u5206\u522b\u6709\u591a\u5c11\uff1f"
+    spec = TaskQuerySpec(
+        intent=TaskQueryIntent.task_status_list,
+        raw_query=q,
+        person="\u5f20\u624b\u7434",
+        status=[TaskStatus.TODO],
+        answer_mode=TaskAnswerMode.task_count_by_status,
+        extra={"nl2sql_source": "llm"},
+    )
+    engine = TaskQueryEngine(tasks_store=FakeStore(), embedder=None, resolver_mode="text2sql")
+    payload = engine._answer_via_text2sql(q, spec, {"debug_trace": []})
+
+    assert payload["answer"] == "\u5f20\u624b\u7434\u5df2\u5b8c\u6210 849 \u4e2a\uff0c\u672a\u5b8c\u6210 9 \u4e2a\u3002"
+    assert {"completed_count": 849, "_query_index": 1, "_query_description": "completed count"} in payload["text2sql_answer_rows"]
+    assert {"pending_count": 9, "_query_index": 2, "_query_description": "pending count"} in payload["text2sql_answer_rows"]
+    assert "completed_count" in captured["prompt"]
+    assert "pending_count" in captured["prompt"]
+
+
+def test_post_process_keeps_completed_and_incomplete_count_statuses() -> None:
+    q = "\u5f20\u624b\u7434\u5df2\u5b8c\u6210\u548c\u672a\u5b8c\u6210\u4efb\u52a1\u5206\u522b\u6709\u591a\u5c11\uff1f"
+    spec = TaskQuerySpec(
+        intent=TaskQueryIntent.task_status_list,
+        raw_query=q,
+        person="\u5f20\u624b\u7434",
+        status=[TaskStatus.TODO],
+        answer_mode=TaskAnswerMode.task_count_by_status,
+    )
+    _post_process_intent(spec, q)
+
+    assert spec.status == [TaskStatus.DONE, TaskStatus.TODO]
+    assert spec.answer_mode == TaskAnswerMode.task_count_by_status
+
+
+def test_post_process_completed_count_comparison_groups_by_person() -> None:
+    q = "\u6bd4\u8f83\u5f20\u624b\u7434\u548c\u5218\u536b\u6c11\u6700\u8fd1\u4e00\u5468\u5b8c\u6210\u4efb\u52a1\u6570\u91cf\u3002"
+    spec = TaskQuerySpec(
+        intent=TaskQueryIntent.task_status_list,
+        raw_query=q,
+        answer_mode=TaskAnswerMode.overdue_count_by_person,
+        time_range=TimeRange(start="now-7d"),
+        filters=[
+            QueryFilter(field="person", op="in", values=["\u5f20\u624b\u7434", "\u5218\u536b\u6c11"]),
+            QueryFilter(field="status", op="in", values=["DONE"]),
+        ],
+        extra={"nl2sql_source": "llm"},
+    )
+    _post_process_intent(spec, q)
+
+    assert spec.answer_mode == TaskAnswerMode.task_count_by_status
+    assert spec.status == [TaskStatus.DONE]
+    assert spec.extra["group_by"] == "person"
+    assert spec.task is None
+
+
+def test_compile_completed_count_comparison_uses_group_by_and_resolves_time() -> None:
+    spec = TaskQuerySpec(
+        intent=TaskQueryIntent.task_status_list,
+        raw_query="compare completed counts",
+        answer_mode=TaskAnswerMode.task_count_by_status,
+        status=[TaskStatus.DONE],
+        time_range=TimeRange(start="now-7d"),
+        filters=[QueryFilter(field="person", op="in", values=["\u5f20\u624b\u7434", "\u5218\u536b\u6c11"])],
+        extra={"group_by": "person"},
+        limit=50,
+    )
+    compiled = compile_tasks_sql(spec, dialect="mssql")
+
+    sql_lower = compiled.sql.lower()
+    assert "person, count(*) as task_count" in sql_lower
+    assert "group by person" in sql_lower
+    assert "now-7d" not in compiled.params
+    assert any(isinstance(param, int) and param > 1_000_000_000_000 for param in compiled.params)
+
+
 def test_strip_model_thinking_removes_reasoning_prefix() -> None:
     assert _strip_model_thinking("<think>draft</think>\u7b54\u6848") == "\u7b54\u6848"
     assert _strip_model_thinking("draft</think>\u7b54\u6848") == "\u7b54\u6848"
